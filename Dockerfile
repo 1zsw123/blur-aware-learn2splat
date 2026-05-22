@@ -1,29 +1,23 @@
 # Learn2Splat — interactive demo for a Hugging Face Space (Docker SDK, GPU).
 #
-# Builds the optgs package + its CUDA extensions and runs demo.py's viser GUI:
-# SfM-initialize a COLMAP scene, then refine the Gaussians with the learned
-# optimizer live in the browser. Mirrors setup.sh, minus conda — the CUDA
-# toolkit ships in the base image.
+# Installs the optgs package + prebuilt CUDA-extension wheels, then runs
+# demo.py's viser GUI: SfM-initialize a COLMAP scene and refine the Gaussians
+# with the learned optimizer live in the browser.
 #
-# Build context = the optgs repo root (see huggingface_space/DEPLOY.md).
+# The CUDA extensions are NOT compiled here — the HF Docker builder runs out of
+# RAM doing it. They are prebuilt into wheels/ on a machine matching this image
+# (Python 3.12, torch 2.7.1+cu128, glibc 2.35); see huggingface_space/DEPLOY.md.
+#
+# Build context = the Space repo root (optgs source + wheels/, see DEPLOY.md).
 # Hardware: pick a GPU in the Space settings — A10G (24 GB) recommended; the
 # GUI holds the dense and sparse checkpoints in VRAM at once.
 
-# CUDA 12.8 devel (nvcc + headers); Ubuntu 22.04 — the OS setup.sh is tested on.
-# A devel base is required: gsplat / nerfacc JIT-compile CUDA on first use, so
-# nvcc must also be present at runtime.
+# CUDA 12.8 + Ubuntu 22.04 — matches the wheels' build environment.
 FROM nvidia/cuda:12.8.0-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1 \
-    # Build CUDA kernels for exactly the A10G (compute 8.6) — no extra arches
-    # and no PTX. The HF Docker builder has limited RAM, and every extra
-    # codegen target pushes a single nvcc compile toward an OOM kill.
-    TORCH_CUDA_ARCH_LIST="8.6" \
-    # Cap parallel nvcc jobs so multi-file extensions (gsplat, nerfacc) don't
-    # OOM the builder.
-    MAX_JOBS=2
+    PIP_NO_CACHE_DIR=1
 
 # Python 3.12 (via deadsnakes) — optgs uses PEP 695 generic syntax that
 # Ubuntu 22.04's stock Python 3.10 cannot parse. Also: build tools, extension
@@ -68,22 +62,15 @@ RUN VISER_INFRA="$(python -c 'import viser.infra._infra as m; print(m.__file__)'
  && sed -i 's/client_version_str = "unknown"/client_version_str = viser.__version__/' "$VISER_INFRA" \
  && grep -q 'client_version_str = viser.__version__' "$VISER_INFRA"
 
-# gsplat + nerfacc — built from git against the torch installed above.
-RUN pip install --no-build-isolation \
-        git+https://github.com/nerfstudio-project/nerfacc \
-        git+https://github.com/nerfstudio-project/gsplat.git
+# Prebuilt CUDA-extension wheels — gsplat, nerfacc, pycolmap, fused-ssim,
+# simple-knn, pointops, fused_knn_attn. Built on a matching machine (see
+# DEPLOY.md) so the HF builder never compiles CUDA and never OOMs.
+COPY --chown=user:user wheels/ ./wheels/
+RUN pip install --no-deps ./wheels/*.whl
 
-# The optgs repo.
+# The optgs repo, then optgs itself (pure Python — editable install).
 COPY --chown=user:user . .
-
-# CUDA-extension submodules, then optgs itself. pycolmap is the pure-Python
-# COLMAP reader (no C++ build); the other four compile CUDA kernels.
-RUN pip install submodules/pycolmap \
- && pip install --no-build-isolation submodules/fused-ssim \
- && pip install --no-build-isolation submodules/simple-knn \
- && pip install --no-build-isolation submodules/pointops \
- && pip install --no-build-isolation submodules/fused_knn_attn \
- && pip install --no-build-isolation --no-deps -e .
+RUN pip install --no-build-isolation --no-deps -e .
 
 # viser serves the GUI here — must equal app_port in README.md.
 EXPOSE 7860

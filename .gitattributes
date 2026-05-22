@@ -39,3 +39,8 @@ submodules/fused-ssim/images/inference_time_4090.png filter=lfs diff=lfs merge=l
 submodules/fused-ssim/images/predicted.jpg filter=lfs diff=lfs merge=lfs -text
 submodules/fused-ssim/images/training_time.png filter=lfs diff=lfs merge=lfs -text
 submodules/fused-ssim/images/training_time_4090.png filter=lfs diff=lfs merge=lfs -text
+wheels/fused_knn_attn_cuda-1.0-cp312-cp312-linux_x86_64.whl filter=lfs diff=lfs merge=lfs -text
+wheels/gsplat-1.5.3-cp312-cp312-linux_x86_64.whl filter=lfs diff=lfs merge=lfs -text
+wheels/nerfacc-0.5.3-cp312-cp312-linux_x86_64.whl filter=lfs diff=lfs merge=lfs -text
+wheels/pointops-1.0-cp312-cp312-linux_x86_64.whl filter=lfs diff=lfs merge=lfs -text
+wheels/simple_knn-0.0.0-cp312-cp312-linux_x86_64.whl filter=lfs diff=lfs merge=lfs -text
