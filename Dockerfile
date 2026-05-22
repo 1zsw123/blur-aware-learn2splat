@@ -17,10 +17,13 @@ FROM nvidia/cuda:12.8.0-devel-ubuntu22.04
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    # Compile the CUDA extensions for every GPU a Space may run on
-    # (T4 7.5 · A100 8.0 · A10G 8.6 · L4/L40S 8.9 · H100 9.0). Trim this to
-    # your chosen GPU to shorten the build.
-    TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 8.9 9.0+PTX"
+    # Build CUDA kernels for the A10G (compute 8.6) only; +PTX keeps them
+    # forward-compatible with newer GPUs via driver JIT. Compiling all
+    # architectures at once OOM-kills the HF builder.
+    TORCH_CUDA_ARCH_LIST="8.6+PTX" \
+    # Cap parallel nvcc jobs — gsplat's kernels are memory-heavy and the HF
+    # Docker builder has limited RAM; an unbounded build gets OOM-killed.
+    MAX_JOBS=2
 
 # Build tools + extension headers (libglm-dev) and the OpenCV runtime libs
 # (libgl1, libglib2.0-0 — optgs's COLMAP loader imports cv2).
