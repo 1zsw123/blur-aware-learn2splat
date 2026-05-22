@@ -75,6 +75,8 @@ RUN pip install --no-build-isolation --no-deps -e .
 # viser serves the GUI here — must equal app_port in README.md.
 EXPOSE 7860
 
-# client mode: viser ships the splats to the browser's WebGL renderer, so the
-# GPU is used only for optimization. viser binds 0.0.0.0 by default.
-CMD ["python", "demo.py", "--with-gui", "client", "--gui-port", "7860"]
+# server mode: the optgs decoder renders frames on the GPU and viser streams
+# them as images — no multi-MB splat-geometry transfer to the browser and no
+# client-side WebGL, which is far more robust behind HF's HTTP/2 proxy.
+# viser binds 0.0.0.0 by default.
+CMD ["python", "demo.py", "--with-gui", "server", "--gui-port", "7860"]
