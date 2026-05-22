@@ -17,12 +17,12 @@ FROM nvidia/cuda:12.8.0-devel-ubuntu22.04
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    # Build CUDA kernels for the A10G (compute 8.6) only; +PTX keeps them
-    # forward-compatible with newer GPUs via driver JIT. Compiling all
-    # architectures at once OOM-kills the HF builder.
-    TORCH_CUDA_ARCH_LIST="8.6+PTX" \
-    # Cap parallel nvcc jobs — gsplat's kernels are memory-heavy and the HF
-    # Docker builder has limited RAM; an unbounded build gets OOM-killed.
+    # Build CUDA kernels for exactly the A10G (compute 8.6) — no extra arches
+    # and no PTX. The HF Docker builder has limited RAM, and every extra
+    # codegen target pushes a single nvcc compile toward an OOM kill.
+    TORCH_CUDA_ARCH_LIST="8.6" \
+    # Cap parallel nvcc jobs so multi-file extensions (gsplat, nerfacc) don't
+    # OOM the builder.
     MAX_JOBS=2
 
 # Python 3.12 (via deadsnakes) — optgs uses PEP 695 generic syntax that
