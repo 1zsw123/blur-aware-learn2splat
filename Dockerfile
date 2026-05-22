@@ -59,6 +59,15 @@ RUN pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 \
 COPY --chown=user:user requirements.txt .
 RUN pip install -r requirements.txt
 
+# HF serves the Space over HTTP/2, and the WebSocket subprotocol viser uses to
+# announce its client version doesn't survive the proxy — so viser's server
+# reads the client version as "unknown" and rejects the connection (the GUI
+# then hangs on "connecting"). Client and server are the same viser build
+# here, so treat an undeterminable client version as a match, not a reject.
+RUN VISER_INFRA="$(python -c 'import viser.infra._infra as m; print(m.__file__)')" \
+ && sed -i 's/client_version_str = "unknown"/client_version_str = viser.__version__/' "$VISER_INFRA" \
+ && grep -q 'client_version_str = viser.__version__' "$VISER_INFRA"
+
 # gsplat + nerfacc — built from git against the torch installed above.
 RUN pip install --no-build-isolation \
         git+https://github.com/nerfstudio-project/nerfacc \
