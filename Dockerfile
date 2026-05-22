@@ -25,10 +25,15 @@ ENV DEBIAN_FRONTEND=noninteractive \
     # Docker builder has limited RAM; an unbounded build gets OOM-killed.
     MAX_JOBS=2
 
-# Build tools + extension headers (libglm-dev) and the OpenCV runtime libs
-# (libgl1, libglib2.0-0 — optgs's COLMAP loader imports cv2).
+# Python 3.12 (via deadsnakes) — optgs uses PEP 695 generic syntax that
+# Ubuntu 22.04's stock Python 3.10 cannot parse. Also: build tools, extension
+# headers (libglm-dev), and the OpenCV runtime libs (libgl1, libglib2.0-0 —
+# optgs's COLMAP loader imports cv2).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3 python3-dev python3-venv \
+        software-properties-common \
+ && add-apt-repository -y ppa:deadsnakes/ppa \
+ && apt-get update && apt-get install -y --no-install-recommends \
+        python3.12 python3.12-dev python3.12-venv \
         git build-essential ninja-build libglm-dev \
         libgl1 libglib2.0-0 ca-certificates \
  && rm -rf /var/lib/apt/lists/*
@@ -42,7 +47,7 @@ ENV HOME=/home/user \
 WORKDIR /home/user/app
 
 # All Python work happens in a venv on PATH (no system-Python writes).
-RUN python3 -m venv /home/user/venv
+RUN python3.12 -m venv /home/user/venv
 ENV PATH=/home/user/venv/bin:$PATH
 RUN pip install --upgrade pip setuptools wheel
 
