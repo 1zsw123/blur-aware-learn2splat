@@ -1,0 +1,61 @@
+defaults:
+  - base
+  - view_sampler: boundedv2_360
+
+name: dl3dv
+roots: [datasets/dl3dv]
+make_baseline_1: false
+augment: true
+
+
+image_shape: [270, 480]
+
+baseline_epsilon: 1e-3
+max_fov: 100.0
+
+skip_bad_shape: true
+near: -1.
+far: -1.
+baseline_scale_bounds: false
+shuffle_val: true
+test_len: -1
+test_chunk_interval: 1
+sort_target_index: true
+sort_context_index: true
+
+train_times_per_scene: 1
+test_times_per_scene: 1
+ori_image_shape: [270, 480]
+overfit_max_views: 148
+use_index_to_load_chunk: false
+
+mix_tartanair: false
+no_mix_test_set: true
+load_depth: false
+center_pose: false
+
+pose_align_first_view: false
+
+scale_extrinsics: 1.
+metric_scale_align_dl3dv: false
+
+# view filtering
+min_views: 0
+max_views: 0
+highres: false
+
+# mix re10k & dl3dv
+mix_re10k: false
+re10k_min_view_dist: 40
+re10k_max_view_dist: 300
+
+# load remaining context views
+load_remain_context: false
+num_remain_context: 8
+
+# random crop in training
+random_crop: false
+min_size: null
+max_size: null
+
+index_name: index.json

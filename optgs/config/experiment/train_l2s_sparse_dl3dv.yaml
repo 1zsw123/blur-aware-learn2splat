@@ -1,0 +1,41 @@
+# @package _global_
+
+defaults:
+  - train_dl3dv
+  - override /meta_trainer/train/replay_buffer_cfg: default
+  - override /loss: [ mse, lpips, deltas ]
+
+loss:
+  mse:
+    weight: 1.0
+  lpips:
+    apply_after_step: 0
+    weight: 0.5
+    perceptual_loss: true
+  deltas:
+    weight: 1
+    exclude_by_norm_grad: true
+    exclude_by_norm_grad_opposite: true
+    eps: 1e-8
+    apply_after_step: 100
+
+meta_trainer:
+  train:
+    loss_on_input_views: true
+    loss_on_input_views_num: 4
+    use_replay_buffer: true
+
+scene_trainer:
+  train_scene_opt: true
+  num_update_steps: 4
+  train_max_refine: 6
+  train_min_refine: 1
+
+meta_optimizer:
+  lr: 1e-4
+  lr_monodepth: 0.0
+
+
+checkpointing:
+  pretrained_initializer: checkpoints/optgs/unified-dl3dv-8views/init/checkpoints/epoch_20-step_100000.ckpt  # resplat inititalizer
+  no_strict_load: false

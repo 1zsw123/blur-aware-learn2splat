@@ -1,0 +1,38 @@
+# @package _global_
+
+defaults:
+  - override /dataset: dl3dv
+  - override /scene_trainer/scene_initializer: null   # overridden by checkpoint (ours) or init_opts.sh
+  - override /scene_trainer/scene_optimizer: null   # overridden by checkpoint (ours) or CLI (baselines)
+  - override /scene_trainer/decoder: gsplat
+  - override /meta_trainer/test/postprocessing: none
+
+mode: test
+
+dataset:
+  roots: [datasets/dl3dv-480p-chunks]
+  near: 0.01
+  far: 200.
+  opencv_pose_format: false
+  image_shape: [256, 448]
+
+scene_trainer:
+  train_scene_init: false
+  train_scene_opt: false
+  opt_batch_strategy: fps
+
+checkpointing:
+  pretrained_model: null
+  pretrained_depth: null
+
+meta_trainer:
+  test:
+    compute_scores: true
+    skip_if_outputs_exist: false
+    save_cameras_json: false
+    save_render_image: false
+    save_gaussian: false
+    eval_initialization: false
+
+output_dir: placeholder
+log_slurm_id: true

@@ -1,0 +1,30 @@
+defaults:
+  - knn_based
+
+name: l2s
+
+# General optimization settings
+opt_scales_before_act: true
+sh_d: 16  # should be the default, but just in case
+
+# Input gradient settings
+input_gradient: true
+input_gradient_normalize: true
+input_gradient_normalize_type: adam
+input_gradient_with_ssim_loss: true
+
+# Freeze zero-grad gaussians ❄️($G_{∇=0})
+update_only_nonzero_grad: true
+
+# state scale
+predict_state_scale: true
+
+# Delta scale
+update_head_scalar_scale: true
+update_head_scalar_scale_act: relu  # should be the default, but just in case
+
+
+
+
+
+

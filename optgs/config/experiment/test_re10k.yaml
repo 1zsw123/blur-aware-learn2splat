@@ -1,0 +1,36 @@
+# @package _global_
+
+defaults:
+  - override /dataset: re10k
+  - override /scene_trainer/scene_initializer: resplat_v1
+  - override /scene_trainer/scene_optimizer: knn_based
+  - override /scene_trainer/decoder: gsplat
+  - override /loss: [mse]
+  - override /meta_trainer/test/postprocessing: none
+
+mode: test
+
+dataset:
+  image_shape: [512, 960]
+  ori_image_shape: [512, 960]
+
+scene_trainer:
+  train_scene_init: false
+  train_scene_opt: false
+  opt_batch_strategy: fps
+
+checkpointing:
+  pretrained_model: null
+  pretrained_depth: null
+
+meta_trainer:
+  test:
+    compute_scores: true
+    skip_if_outputs_exist: true
+    save_cameras_json: false
+    save_render_image: false
+    save_gaussian: false
+    eval_initialization: false
+
+output_dir: placeholder
+log_slurm_id: true

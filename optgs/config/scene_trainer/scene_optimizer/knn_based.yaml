@@ -1,0 +1,210 @@
+defaults:
+  - base
+
+name: knn_based
+
+# iterative refine
+no_render_error: false
+refine_sh_only: false
+num_basic_refine_blocks: 4
+num_refine_blocks: 1
+concat_init_state: false
+replace_init_state: false
+state_channels: 256
+refine_block_rmsnorm: false
+refine_block_layernorm: false
+pt_qk_norm: false
+norm_pt_block: false
+refine_gaussian_multiple: 1
+refine_residual_init_state: false
+clamp_refine_max_scale: 3.0
+clamp_min_scale: 1e-6
+clamp_min_raw_scales: -1e10
+clamp_max_raw_scales: 1e10
+clamp_min_raw_opacities: -7
+clamp_max_raw_opacities: 7
+gaussian_head_multiple: 1
+clamp_min_sh0: -1e10
+clamp_max_sh0: 1e10
+clamp_min_shs: -1e10
+clamp_max_shs: 1e10
+clamp_shs_soft: false
+
+update_attn_proj_channels: 64
+update_no_knn_attn: false
+update_no_tran_block_norm: false
+update_tran_block_act: gelu
+multi_gaussian_scale_smaller: false
+init_gaussian_multiple: 1
+refine_condition_pt_feature: true
+reinit_gaussian_when_refine_multiple: false
+refine_same_num_points: false
+input_error_rgb_no_shuffle: false
+input_error_cache_resnet_feature: false
+
+init_state_wo_features: false
+init_state_type: constant
+init_state_scale: 0
+
+# point transformer
+pt_heads: 1
+
+# refine with mv attention
+refine_with_mv_attn: false
+refine_with_mv_attn_lowres: false
+refine_no_mv_attn: false
+mv_attn_conv_with_norm: false
+refine_mv_shuffle_attn: false
+refine_mv_attn_with_pos_enc: false
+refine_shuffle_attn_no_norm: false
+refine_mv_unimatch_attn: false
+refine_knn_samples: 16
+refine_multi_scale_pt: false
+
+# KNN
+use_fused_attn: true  # fused KNN gather + attention CUDA kernel (faster, less memory)
+prune_invisible_gaussians: false
+knn_idx_update_every: 1
+
+# inputs
+input_alpha: false
+input_depth: false
+input_depth_smooth_error: false
+input_error: false
+
+input_error_add_rgb_feature: false
+input_error_resnet_feature: true
+input_error_no_freeze_resnet_feature: false
+input_error_shallow_resnet_feature: false
+input_error_resnet_feature_layers: 18
+
+# cross attention render error
+input_error_additional_cross_attn: false
+input_error_num_intermediate_views: 8
+
+# add global attention to the rendered error to exchange info across views
+input_error_mv_attn: false
+input_error_mv_attn_blocks: 2
+
+# number of views to render error
+input_error_num_views: 0
+
+# render error based on remaining context views
+input_error_remain_context: false
+input_error_merge_remain_context: false
+input_error_warp_remain_context: false
+input_error_random_num_remain_context: false
+input_error_num_remain_context_test: 0
+
+
+
+# explicit gradient
+input_gradient: false
+input_gradient_log: false
+input_gradient_log_clip_deltas: 0.001
+input_gradient_scale: 1.
+gradient_update_scale: 1.
+input_gradient_with_ssim_loss: false
+input_gradient_same_loss: false
+input_gradient_loss_reduction: mean
+scale_residual_grads: false
+
+window_local_refine: false
+window_global_refine: false
+window_local_global_refine: false
+
+# sliding window update to save training memory
+update_window_size: 0
+local_gaussian_render: false
+
+train_global_update_only: false
+
+# random size refine
+# update more for low resolution, less for high
+random_update_with_size: false
+
+
+use_amp: true
+pt_head_amp: true
+pt_update_amp: true
+
+use_checkpointing: false
+recurrent_use_checkpointing: false
+
+# Debugging
+debug_refine_update_module: true
+
+# Normalizing input
+input_gradient_normalize: false
+input_gradient_normalize_type: layer
+input_normalize_state: false
+input_normalize_gaussians: false
+
+# Scaling
+residual_state: false
+predict_state_scale: false
+predict_state_scale_norm: false
+
+# Update head
+update_head_concat_img: false
+update_head_layer_num: 2
+update_head_act: gelu
+update_head_final_act: identity
+update_head_hidden_dim_matches: "input" # rebuttal version. switch to "output" for submission version
+
+update_head_scale_mag: false
+update_head_scalar_scale: false
+update_head_scalar_scale_act: relu
+
+# Per-parameter-group heads (Feature A): separate heads per param group, each with own normalize+scale
+update_head_per_param_heads: false
+update_head_per_param_hidden_dim: 48  # tuned so total params ≈ baseline head (~81K)
+# Per-parameter scalar scales (Feature B): per-group scalar scales (requires update_head_scalar_scale=true)
+update_head_per_param_scales: false
+
+opt_scales_before_act: false
+
+# Preprocessing the init gaussians
+scale_initial_opacities: 1.0
+sh_d: null
+
+# Deactivate gaussians
+local_prune_zero_radii: false
+local_prune_low_weights: false
+local_prune_low_weights_thresh: -1
+update_only_nonzero_grad: false
+
+# Experiments
+experimental_run: false
+experimental_update:
+  _base: true
+  _means: true
+  _scales: true
+  _quats: true
+  _opacities: true
+  _sh0: true
+  _shN: true
+
+experimental_use_grads: false
+
+experimental_use_norm_grads:
+  _base: false
+  _means: false
+  _scales: false
+  _quats: false
+  _opacities: false
+  _sh0: false
+  _shN: false
+
+experimental_lr:
+  _base: 1
+  _means: 1.6e-4
+  _scales: 5e-3
+  _opacities: 5e-2
+  _quats: 1e-3
+  _sh0: 2.5e-3
+  _shN: 1.25e-4 #  2.5e-3 / 20
+
+# time encoding
+use_time_encoding: false
+time_encoding_max_steps: 2000

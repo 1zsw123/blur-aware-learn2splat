@@ -1,0 +1,22 @@
+defaults:
+  - base
+  - override refiner: default
+
+name: sgd
+
+# Adam optimizer
+betas: [0.9, 0.999]
+eps: 1e-15
+weight_decay: 0.0
+
+# learning rates (gsplat)
+base_lr: 1
+means_lr_init: 1.6e-4
+means_lr_final: 1e-5
+means_lr_delay_mult: 0.01
+means_lr_max_steps: 30000  # should be equal to total optimization steps
+scales_lr: 5e-3
+rotations_lr: 1e-3
+opacities_lr: 5e-2
+sh0s_lr: 2.5e-3
+shNs_lr: 1.25e-4
