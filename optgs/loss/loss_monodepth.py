@@ -1,11 +1,6 @@
 import torch
 
-
-import cv2
-import torch
-
-from optgs.model.encoder.depth_anything_v2.dpt import DepthAnythingV2
-
+from optgs.model.backbones.depth_anything_v2.dpt import DepthAnythingV2
 
 
 def get_monodepth_model():
@@ -16,7 +11,7 @@ def get_monodepth_model():
         'vitg': {'encoder': 'vitg', 'features': 384, 'out_channels': [1536, 1536, 1536, 1536]}
     }
 
-    encoder = 'vitl' # or 'vits', 'vitb', 'vitg'
+    encoder = 'vitl'  # or 'vits', 'vitb', 'vitg'
 
     model = DepthAnythingV2(**model_configs[encoder])
     model.load_state_dict(torch.load(f'pretrained/depth_anything_v2_{encoder}.pth', map_location='cpu'))
@@ -26,17 +21,3 @@ def get_monodepth_model():
         param.requires_grad = False
 
     return model
-
-
-
-def get_monodepth_pred(img, model):
-
-    with torch.no_grad():
-        pass
-
-
-def get_monodepth_loss(pred_depth, img):
-    pass
-
-
-

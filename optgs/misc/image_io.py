@@ -124,7 +124,7 @@ def save_video(images, path, fps=None, iterations=None):
             cv2.putText(frame, f"Iter {iter_num}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
             frames[i] = frame
 
-    # TODO Naama: videos cannot be saved with odd dimensions
+    # NOTE: the encoder cannot save videos with odd frame dimensions
     with imageio.get_writer(str(path), fps=fps) as writer:
         for frame in frames:
             writer.append_data(frame)

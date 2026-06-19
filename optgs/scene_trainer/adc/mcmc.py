@@ -1,19 +1,16 @@
-from dataclasses import dataclass
-from typing import Any, Callable, Literal, Optional, Tuple
 import math
-import torch
+from dataclasses import dataclass
+from typing import Any, Callable, Optional, Tuple
+
 import numpy as np
-from jaxtyping import Float, Bool
-from torch import Tensor
-import torch.nn.functional as F
-from optgs.model.types import Gaussians
 import torch
-from typeguard import value
-from optgs.scene_trainer.gaussian_module import GaussiansModule
-from optgs.scene_trainer.optimizer.layer import AdamInputSmoothing
-import matplotlib.pyplot as plt
+import torch.nn.functional as F
+from torch import Tensor
+
+from optgs.model.types import Gaussians
 from optgs.scene_trainer.adc.base import BaseStrategyCfg, GenericStrategyState
 from optgs.scene_trainer.adc.base import _replace_objects, _add_to_objects
+from optgs.scene_trainer.gaussian_module import GaussiansModule
 
 
 def _make_lazy_cuda_func(name: str) -> Callable:
@@ -25,17 +22,18 @@ def _make_lazy_cuda_func(name: str) -> Callable:
 
     return call_cuda
 
+
 class _QuatScaleToCovarPreci(torch.autograd.Function):
     """Converts quaternions and scales to covariance and precision matrices."""
 
     @staticmethod
     def forward(
-        ctx,
-        quats: Tensor,  # [..., 4],
-        scales: Tensor,  # [..., 3],
-        compute_covar: bool = True,
-        compute_preci: bool = True,
-        triu: bool = False,
+            ctx,
+            quats: Tensor,  # [..., 4],
+            scales: Tensor,  # [..., 3],
+            compute_covar: bool = True,
+            compute_preci: bool = True,
+            triu: bool = False,
     ) -> Tuple[Optional[Tensor], Optional[Tensor]]:
         covars, precis = _make_lazy_cuda_func("quat_scale_to_covar_preci_fwd")(
             quats, scales, compute_covar, compute_preci, triu
@@ -65,6 +63,7 @@ class _QuatScaleToCovarPreci(torch.autograd.Function):
         )
         return v_quats, v_scales, None, None, None
 
+
 @dataclass
 class McmcStrategyState(GenericStrategyState):
     # Add MCMC specific state variables here
@@ -76,29 +75,31 @@ class McmcStrategyState(GenericStrategyState):
 
     @classmethod
     def initialize(cls, device: torch.device) -> "McmcStrategyState":
-        
+
         # from gsplat
         n_max = 51
         binoms = torch.zeros((n_max, n_max))
         for n in range(n_max):
             for k in range(n + 1):
                 binoms[n, k] = math.comb(n, k)
-        
+
         return cls(
             binoms=binoms.to(device)
         )
 
+
 def update_mcmc_strategy_state(
-    adc_state: McmcStrategyState
+        adc_state: McmcStrategyState
 ) -> None:
     """Updates adc_state in place."""
     pass
 
+
 @torch.no_grad()
 def inject_noise_to_position(
-    gaussians: Gaussians | GaussiansModule,
-    scaler: float,
-    scale_cap: float = 1.0,
+        gaussians: Gaussians | GaussiansModule,
+        scaler: float,
+        scale_cap: float = 1.0,
 ):
     if isinstance(gaussians, GaussiansModule):
         raise NotImplementedError("noise injection not implemented for GaussiansModule")
@@ -118,13 +119,13 @@ def inject_noise_to_position(
         # activate
         opacities = torch.sigmoid(opacities)  # [G]
         scales = torch.exp(scales)  # [G, 3]
-    
+
     def _quat_scale_to_covar_preci(
-        quats: Tensor,  # [..., 4],
-        scales: Tensor,  # [..., 3],
-        compute_covar: bool = True,
-        compute_preci: bool = True,
-        triu: bool = False,
+            quats: Tensor,  # [..., 4],
+            scales: Tensor,  # [..., 3],
+            compute_covar: bool = True,
+            compute_preci: bool = True,
+            triu: bool = False,
     ) -> Tuple[Optional[Tensor], Optional[Tensor]]:
         """Converts quaternions and scales to covariance and precision matrices.
 
@@ -154,7 +155,7 @@ def inject_noise_to_position(
         return covars if compute_covar else None, precis if compute_preci else None
 
     # Cap the scales used for the noise covariance only — does NOT change the rendered Gaussian
-    # scales. knn_based's network saturates clamp_refine_max_scale, producing covariances orders
+    # scales. knn_based's network saturates clamp_max_scale, producing covariances orders
     # of magnitude larger than vanilla's Adam-evolved scales; the resulting noise overflows the
     # renderer's tile-binning math and causes a silent CUDA OOB downstream. See BaseStrategyCfg.
     scales_for_noise = scales.clamp(max=scale_cap)
@@ -170,9 +171,9 @@ def inject_noise_to_position(
         return 1 / (1 + torch.exp(-k * (x - x0)))
 
     noise = (
-        torch.randn_like(means)
-        * (op_sigmoid(1 - opacities)).unsqueeze(-1)
-        * scaler
+            torch.randn_like(means)
+            * (op_sigmoid(1 - opacities)).unsqueeze(-1)
+            * scaler
     )
     noise = torch.einsum("bij,bj->bi", covars, noise)
 
@@ -181,6 +182,7 @@ def inject_noise_to_position(
     # the underlying storage. Do NOT reassign gaussians.means here — that would
     # replace the original leaf tensor with a requires_grad=False view (created
     # inside @torch.no_grad), breaking gradient flow on the next iteration.
+
 
 @torch.no_grad()
 def _multinomial_sample(weights: Tensor, n: int, replacement: bool = True) -> Tensor:
@@ -200,7 +202,7 @@ def _multinomial_sample(weights: Tensor, n: int, replacement: bool = True) -> Te
     """
     num_elements = weights.size(0)
 
-    if num_elements <= 2**24:
+    if num_elements <= 2 ** 24:
         # Use torch.multinomial for elements within the limit
         return torch.multinomial(weights, n, replacement=replacement)
     else:
@@ -215,12 +217,13 @@ def _multinomial_sample(weights: Tensor, n: int, replacement: bool = True) -> Te
         # Return the sampled indices on the original device
         return sampled_idxs.to(weights.device)
 
+
 @torch.no_grad()
 def _compute_relocation(
-    opacities: Tensor,  # [N]
-    scales: Tensor,  # [N, 3]
-    ratios: Tensor,  # [N]
-    binoms: Tensor,  # [n_max, n_max]
+        opacities: Tensor,  # [N]
+        scales: Tensor,  # [N, 3]
+        ratios: Tensor,  # [N]
+        binoms: Tensor,  # [n_max, n_max]
 ) -> Tuple[Tensor, Tensor]:
     """Compute new Gaussians from a set of old Gaussians.
 
@@ -259,11 +262,11 @@ def _compute_relocation(
 
 
 def relocate(
-    gaussians: Gaussians | GaussiansModule,
-    smoothers: dict[str, Any],
-    adc_state: McmcStrategyState,
-    min_opacity: float,
-    copy_state: bool = False,
+        gaussians: Gaussians | GaussiansModule,
+        smoothers: dict[str, Any],
+        adc_state: McmcStrategyState,
+        min_opacity: float,
+        copy_state: bool = False,
 ) -> int:
     """Relocates Gaussians based on MCMC strategy.
 
@@ -275,7 +278,7 @@ def relocate(
     Returns:
         int: Number of relocated Gaussians.
     """
-    
+
     if isinstance(gaussians, GaussiansModule):
         raise NotImplementedError("noise injection not implemented for GaussiansModule")
 
@@ -298,13 +301,13 @@ def relocate(
         # activate
         opacities = torch.sigmoid(opacities)  # [G]
         scales = torch.exp(scales)  # [G, 3]
-        
+
     dead_mask = opacities <= min_opacity
     n_gs = dead_mask.sum().item()
     if n_gs > 0:
         # Inplace relocate some dead Gaussians to the lives ones.
         n_relocated = int(n_gs)
-        
+
         dead_indices = dead_mask.nonzero(as_tuple=True)[0]
         alive_indices = (~dead_mask).nonzero(as_tuple=True)[0]
         n = len(dead_indices)
@@ -332,7 +335,7 @@ def relocate(
 
         # replace values (batch dim = 0, Gaussian dim = 1)
         gaussians.means[0, dead_indices] = means[sampled_idxs]
-        gaussians.scales[0, dead_indices] = new_scales        # relocated scale (deactivated if needed)
+        gaussians.scales[0, dead_indices] = new_scales  # relocated scale (deactivated if needed)
         gaussians.opacities[0, dead_indices] = new_opacities  # relocated opacity (deactivated if needed)
         gaussians.rotations_unnorm[0, dead_indices] = rotations_unnorm[sampled_idxs]
         gaussians.harmonics[0, dead_indices] = harmonics[sampled_idxs]
@@ -344,12 +347,13 @@ def relocate(
 
     return n_relocated
 
+
 def add_new(
-    gaussians: Gaussians | GaussiansModule,
-    smoothers: dict[str, Any],
-    adc_state: McmcStrategyState,
-    cap_max: int,
-    min_opacity: float
+        gaussians: Gaussians | GaussiansModule,
+        smoothers: dict[str, Any],
+        adc_state: McmcStrategyState,
+        cap_max: int,
+        min_opacity: float
 ) -> int:
     """Adds new Gaussians based on MCMC strategy.
 
@@ -361,7 +365,7 @@ def add_new(
     Returns:
         int: Number of new Gaussians added.
     """
-    
+
     if isinstance(gaussians, GaussiansModule):
         raise NotImplementedError("noise injection not implemented for GaussiansModule")
 
@@ -384,14 +388,14 @@ def add_new(
         # activate
         opacities = torch.sigmoid(opacities)  # [G]
         scales = torch.exp(scales)  # [G, 3]
-    
+
     current_n_points = means.shape[0]
     n_target = min(cap_max, int(1.05 * current_n_points))
     n_gs = max(0, n_target - current_n_points)
     if n_gs > 0:
         # add new
         n_new = int(n_gs)
-        
+
         eps = torch.finfo(torch.float32).eps
         probs = opacities.flatten()
         sampled_idxs = _multinomial_sample(probs, n_gs, replacement=True)
@@ -402,7 +406,7 @@ def add_new(
             binoms=adc_state.binoms,
         )
         new_opacities = torch.clamp(new_opacities, max=1.0 - eps, min=min_opacity)
-        
+
         # deactivate new opacities/scales for storage if needed
         if not gaussians.stores_activated:
             new_opacities = torch.logit(new_opacities.clamp(min=eps, max=1.0 - eps))
@@ -413,11 +417,11 @@ def add_new(
         new_harmonics = harmonics[sampled_idxs]
 
         # append to existing Gaussians (batch dim = 0, Gaussian dim = 1)
-        gaussians.means            = torch.cat([gaussians.means, new_means.unsqueeze(0)], dim=1)
-        gaussians.scales           = torch.cat([gaussians.scales, new_scales.unsqueeze(0)], dim=1)
-        gaussians.opacities        = torch.cat([gaussians.opacities, new_opacities.unsqueeze(0)], dim=1)
+        gaussians.means = torch.cat([gaussians.means, new_means.unsqueeze(0)], dim=1)
+        gaussians.scales = torch.cat([gaussians.scales, new_scales.unsqueeze(0)], dim=1)
+        gaussians.opacities = torch.cat([gaussians.opacities, new_opacities.unsqueeze(0)], dim=1)
         gaussians.rotations_unnorm = torch.cat([gaussians.rotations_unnorm, new_rotations_unnorm.unsqueeze(0)], dim=1)
-        gaussians.harmonics        = torch.cat([gaussians.harmonics, new_harmonics.unsqueeze(0)], dim=1)
+        gaussians.harmonics = torch.cat([gaussians.harmonics, new_harmonics.unsqueeze(0)], dim=1)
         if gaussians.rotations is not None:
             gaussians.rotations = torch.cat(
                 [gaussians.rotations, F.normalize(new_rotations_unnorm, dim=-1).unsqueeze(0)], dim=1
@@ -429,18 +433,19 @@ def add_new(
 
         # add new entries to smoothers state
         _add_to_objects(n_new, smoothers)
-            
+
     return n_new
+
 
 @torch.no_grad()
 def apply_mcmc_strategy(
-    cfg: BaseStrategyCfg,
-    step: int,
-    gaussians: Gaussians | GaussiansModule,
-    adc_state: McmcStrategyState,
-    smoothers: dict[str, Any],
-    lr: float,
-    # zero_t: bool = False
+        cfg: BaseStrategyCfg,
+        step: int,
+        gaussians: Gaussians | GaussiansModule,
+        adc_state: McmcStrategyState,
+        smoothers: dict[str, Any],
+        lr: float,
+        # zero_t: bool = False
 ) -> tuple[int, int, int, float | None, float | None]:
     """Applies MCMC strategy to the given Gaussian distributions.
 
@@ -452,18 +457,18 @@ def apply_mcmc_strategy(
         smoothers (dict[str, Any]): Optimizer smoothers.
         lr (float): Learning rate for "means" attribute of the GS.
     """
-    
+
     if isinstance(gaussians, GaussiansModule):
         raise NotImplementedError("cloning not implemented for GaussiansModule")
-    
+
     # Densification and Pruning
     nr_cloned, nr_splitted, nr_pruned = 0, 0, 0
-    
+
     # check if should densify/prune
     if (
-        step > cfg.refine_start_iter
-        and step % cfg.refine_every == 0
-        and step % cfg.reset_every >= cfg.pause_refine_after_reset
+            step > cfg.refine_start_iter
+            and step % cfg.refine_every == 0
+            and step % cfg.reset_every >= cfg.pause_refine_after_reset
     ):
         # teleport dead GSs to positions of alive ones
         n_relocated_gs = relocate(gaussians, smoothers, adc_state, cfg.min_opacity, copy_state=cfg.relocate_copy_state)
@@ -472,13 +477,13 @@ def apply_mcmc_strategy(
         n_new_gs = 0
         if step < cfg.refine_stop_iter:
             n_new_gs = add_new(gaussians, smoothers, adc_state, cfg.cap_max, cfg.min_opacity)
-        
+
         torch.cuda.empty_cache()
-        
+
         print(
             f"MCMC @ iter {step}: n_relocated {n_relocated_gs}, n_new_gs {n_new_gs}, total now {gaussians.means.shape[1]}"
         )
-    
+
     # add noise to GSs
     inject_noise_to_position(
         gaussians, scaler=lr * cfg.noise_lr, scale_cap=cfg.noise_scale_cap

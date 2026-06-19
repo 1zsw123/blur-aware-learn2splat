@@ -1,6 +1,5 @@
 import torch.nn as nn
 import torch
-import torch.nn.functional as F
 from torchvision.models import vgg19
 import scipy.io
 import os
@@ -102,8 +101,6 @@ class PerceptualLoss(nn.Module):
         # Extract features
         target_features = self._extract_features(target_img_p)
         pred_features = self._extract_features(pred_img_p)
-        # for x in target_features:
-        #     print(x.shape)
 
         if return_feature:
             return pred_features, target_features

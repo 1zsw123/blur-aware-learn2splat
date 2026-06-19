@@ -1,6 +1,4 @@
-from typing import Literal
-
-from optgs.scene_trainer.optimizer import KnnBasedOptimizer, KnnBasedOptimizerCfg
+from optgs.scene_trainer.optimizer import KnnBasedOptimizer
 
 
 class ResplatOptimizerV1(KnnBasedOptimizer):

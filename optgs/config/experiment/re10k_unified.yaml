@@ -63,16 +63,11 @@ dataset:
   roots: [datasets/re10k]
   near: 0.01
   far: 100.
-  baseline_scale_bounds: false
-  make_baseline_1: false
   train_times_per_scene: 1
   highres: false
   scannet: false
   tartanair: false
   load_depth: false
-  pose_align_first_view: false
-  scale_extrinsics: 1.
-  load_remain_context: false
   pose_align_middle_view: false
   overfit_to_scene: null
   opencv_pose_format: false

@@ -1,29 +1,34 @@
-import importlib
+"""Typed configuration schema and Hydra-to-dataclass loading.
+
+`RootCfg` is the top-level config dataclass (dataset, scene_trainer, meta_trainer, loss, checkpointing,
+...); `load_typed_root_config` converts the raw Hydra `DictConfig` into it via dacite, after running
+`config_migrate` so older checkpoints' configs load. `__post_init__` also resolves the output directory
+for `mode=test`. The per-component schemas live next to their components (e.g.
+`scene_trainer_cfg.py`, `meta_trainer_cfg.py`).
+"""
+
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Optional, Type, TypeVar, Any, Callable
+from typing import Literal, Optional, Type, TypeVar
 
-import hydra
 import torch
 from dacite import Config, from_dict, UnionMatchError
-from hydra.core.global_hydra import GlobalHydra
 from hydra.core.hydra_config import HydraConfig
-from hydra.types import RunMode
 from omegaconf import DictConfig
 from omegaconf import OmegaConf
 from pytorch_lightning.strategies import DDPStrategy, FSDPStrategy
 
 from .config_migrate import migrate, CURRENT_CFG_VERSION
 from .dataset.data_module import DataLoaderCfg, DatasetCfg
-from .global_cfg import set_cfg
 from .loss import LossCfgWrapper
 from .misc.io import CustomPath
 from .misc.io import cyan, read_omega_cfg
 from .misc.checkpointing import find_latest_ckpt
-from .misc.hf_ckpt import maybe_resolve_hf_ref
-from .paths import CKPT_DIR, RESULTS_DIR
-from .scene_trainer.scene_trainer_cfg import SceneTrainerCfg, MetaOptimizerCfg, TestCfg, TrainCfg
+from .misc.hf_ckpt import hf_sibling_config, is_hf_ref, maybe_resolve_hf_ref
+from .paths import CKPT_DIR, RESULTS_DIR, DEBUG
+from .scene_trainer.scene_trainer_cfg import SceneTrainerCfg
+from .meta_trainer.meta_trainer_cfg import MetaOptimizerCfg, TestCfg, TrainCfg
 
 
 # In order to extract filename or dirname from a path in the config
@@ -58,15 +63,28 @@ class CheckpointingCfg:
     resume_update_module: str | None
     load_existing_cfg: bool
 
+    # Checkpoints whose sibling config.yaml carries the model architecture that
+    # mode=test rebuilds from (the optimizer/initializer the Gaussians were
+    # trained with).
+    _ARCH_CHECKPOINTS = ("pretrained_model", "pretrained_optimizer", "pretrained_initializer")
+
     def __post_init__(self):
         # Resolve any Hugging Face Hub references (hf://org/repo/file[@rev]) to
         # local cached paths so all downstream torch.load calls work unchanged.
+        # Rebuilding the model architecture needs both the .ckpt and its sibling
+        # config.yaml, but hf_hub_download pulls only the .ckpt, so fetch the
+        # sibling config.yaml too. It lands in the same checkpoints/ layout as
+        # the resolved .ckpt, so _find_config_for_checkpoint later discovers it
+        # on the local path.
         for attr in ("pretrained_model", "pretrained_optimizer", "pretrained_initializer",
                      "pretrained_monodepth", "pretrained_mvdepth", "pretrained_depth",
                      "pretrained_scale_predictor", "pretrained_depth_teacher",
                      "resume_update_module"):
-            resolved = maybe_resolve_hf_ref(getattr(self, attr))
-            if resolved != getattr(self, attr):
+            ref = getattr(self, attr)
+            if attr in self._ARCH_CHECKPOINTS and is_hf_ref(ref):
+                hf_sibling_config(ref)
+            resolved = maybe_resolve_hf_ref(ref)
+            if resolved != ref:
                 setattr(self, attr, resolved)
 
         for attr in ("pretrained_model", "pretrained_optimizer", "pretrained_initializer"):
@@ -90,6 +108,7 @@ class MetaTrainerCfg:
     eval_index: str | None
     limit_test_batches: int | float
     limit_train_batches: int | float
+    meta_optimizer: MetaOptimizerCfg
     test: TestCfg
     train: TrainCfg
 
@@ -109,9 +128,9 @@ class MetaTrainerCfg:
                         return has_trainable
 
                     dist_strategy = FSDPStrategy(auto_wrap_policy=only_wrap_trainable)
-        if self.train.use_replay_buffer:
-            # When resampling from the replay buffer,
-            # we don't project the condition_features to state, so the update_proj is not used
+        if self.train.use_ckpt_buffer:
+            # When resampling from the ckpt buffer,
+            # we don't project the condition_features to state, so the state_proj is not used
             dist_strategy = "ddp_find_unused_parameters_true"
         return dist_strategy
 
@@ -123,14 +142,13 @@ class RootCfg:
     dataset: DatasetCfg
     data_loader: DataLoaderCfg
     scene_trainer: SceneTrainerCfg
-    meta_optimizer: MetaOptimizerCfg  ## TODO Naama: should we move under meta trainer config?
     checkpointing: CheckpointingCfg
     meta_trainer: MetaTrainerCfg
     loss: list[LossCfgWrapper]
     seed: int
     use_plugins: bool
     output_dir: str
-    version: int | None
+    version: int | float | None  # point versions like 2.1 are floats
     debug_cfg: bool
 
     def __post_init__(self):
@@ -202,12 +220,6 @@ TYPE_HOOKS = {
 T = TypeVar("T")
 
 
-def get_class_by_path(path: str):
-    module_path, class_name = path.rsplit('.', 1)
-    module = importlib.import_module(module_path)
-    return getattr(module, class_name)
-
-
 def _diagnose_union_error(e: UnionMatchError, data: dict, dacite_config: Config) -> str:
     """Try each union member individually and report per-member errors."""
     import dataclasses
@@ -273,32 +285,6 @@ def separate_loss_cfg_wrappers(joined: dict) -> list[LossCfgWrapper]:
     ]
 
 
-def universal_target_hook(cfg: dict, _: Type) -> Any:
-    """Generic hook to construct config objects from `__target__`."""
-    if not isinstance(cfg, dict):
-        return None
-    if "__target__" not in cfg:
-        return None  # Let decite handle it
-
-    cfg_copy = deepcopy(cfg)  # avoid mutating original
-    target = cfg_copy.pop("__target__")
-
-    if isinstance(target, str):
-        target_type = get_class_by_path(target)
-    else:
-        target_type = target
-
-    # Use recursive loading with known additional hooks
-    return load_typed_config(
-        DictConfig(cfg_copy),
-        target_type,
-    )
-
-
-def make_target_hook_for_type(t: Type) -> Callable:
-    return lambda cfg: universal_target_hook(cfg, t)
-
-
 def load_typed_root_config(cfg: DictConfig) -> RootCfg:
     # scene_trainer/scene_optimizer=none loads a full dict from none.yaml;
     # dacite can't match that dict to the None arm of SceneOptimizerCfg | None.
@@ -316,30 +302,17 @@ def load_typed_root_config(cfg: DictConfig) -> RootCfg:
     )
 
 
-def should_run(cfg_dict):
-    if cfg_dict.mode == "test":
-        if cfg_dict.meta_trainer.test.skip_if_outputs_exist:
-            output_dir = cfg_dict.output_dir
-            if not output_dir.exists():
-                return True
-            metrics_path_pattern = output_dir / "metrics" / "target_*_psnr.json"
-            metric_paths = list(metrics_path_pattern.parent.glob(metrics_path_pattern.name))
-            if len(metric_paths) > 0:
-                print(cyan(f"Test metrics already exist at {metric_paths}."))
-                return False
-    return True
-
-
 def setup_cfg(cfg_dict):
     # Get the original config from the output directory, when testing or resuming.
     cfg_dict = merge_config_from_file(cfg_dict)
     eval_cfg = get_eval_cfg(cfg_dict)
     cfg = load_typed_root_config(cfg_dict)
-    # Set global cfg object.
-    set_cfg(cfg_dict)
     # Set up the output directory.
     setup_output_dir(cfg, cfg_dict)
-    return cfg, cfg_dict, eval_cfg  # TODO Naama: why do we need both cfg and cfg_dict?
+    # cfg is the typed config, used for attribute access throughout the code. cfg_dict is the
+    # raw OmegaConf tree: wandb logs it in full, the eval-config and migration helpers operate
+    # on it as nested dicts, and it holds fields outside the typed schema (e.g. profiling).
+    return cfg, cfg_dict, eval_cfg
 
 
 def flatten_wandb(cfg):
@@ -375,6 +348,11 @@ def _apply_cli_overrides(merged_cfg: DictConfig, orig_cli_cfg: DictConfig, raw_o
     print(cyan(f"Re-applying {len(raw_overrides)} CLI overrides onto merged config."))
     OmegaConf.set_struct(merged_cfg, False)
 
+    # Per-key merge decisions are noisy on every run; show them only under a debugger.
+    def _trace(msg: str) -> None:
+        if DEBUG:
+            print(cyan(msg))
+
     # Architecture subtrees: CLI group default fills in *new* fields only;
     # checkpoint values win for fields that already exist.
     ARCH_KEYS = {"scene_optimizer", "scene_initializer"}
@@ -390,7 +368,7 @@ def _apply_cli_overrides(merged_cfg: DictConfig, orig_cli_cfg: DictConfig, raw_o
         if cli_val is None:
             # No direct config path — e.g. +experiment=re10k is a defaults-list override
             # whose effect is already baked into orig_cli_cfg; nothing to apply.
-            print(cyan(f"  Skipping '{key}' (no direct config path in cli)"))
+            _trace(f"  Skipping '{key}' (no direct config path in cli)")
             continue
 
         # For architecture group overrides: fill in missing fields from CLI defaults
@@ -401,7 +379,7 @@ def _apply_cli_overrides(merged_cfg: DictConfig, orig_cli_cfg: DictConfig, raw_o
             dotkey_parts = set(dotkey.split("."))
             if dotkey_parts & CLI_WINS_SUBKEYS:
                 OmegaConf.update(merged_cfg, dotkey, cli_val, merge=False)
-                print(cyan(f"  '{dotkey}': replace from cli (CLI wins)"))
+                _trace(f"  '{dotkey}': replace from cli (CLI wins)")
                 continue
 
             existing_val = OmegaConf.select(merged_cfg, dotkey, default=None)
@@ -414,15 +392,15 @@ def _apply_cli_overrides(merged_cfg: DictConfig, orig_cli_cfg: DictConfig, raw_o
                     if cli_subval is not None:
                         OmegaConf.set_struct(new_val, False)
                         OmegaConf.update(new_val, subkey, cli_subval, merge=False)
-                        print(cyan(f"  '{dotkey}.{subkey}': CLI override applied (CLI wins)"))
+                        _trace(f"  '{dotkey}.{subkey}': CLI override applied (CLI wins)")
                 OmegaConf.update(merged_cfg, dotkey, new_val, merge=False)
-                print(cyan(f"  '{dotkey}': fill-missing from cli (checkpoint values preserved)"))
+                _trace(f"  '{dotkey}': fill-missing from cli (checkpoint values preserved)")
                 continue
 
         # Group overrides and complex values replace the whole subtree;
         # scalars are merged so sibling keys are preserved.
         replace = is_group_override
-        print(cyan(f"  '{dotkey}': {'replace' if replace else 'update'} from cli"))
+        _trace(f"  '{dotkey}': {'replace' if replace else 'update'} from cli")
         OmegaConf.update(merged_cfg, dotkey, cli_val, merge=not replace)
 
     OmegaConf.set_struct(merged_cfg, True)
@@ -548,12 +526,16 @@ def _merge_test_mode(
 ) -> tuple[DictConfig, DictConfig]:
     """
     Test mode: CLI config is the base for all settings (dataset, test flags, etc.).
-    Only optimizer and initializer *architecture* are patched in from checkpoint configs.
+    The optimizer and initializer *architecture* and the decoder are patched in from the
+    checkpoint config, so the model is rebuilt and rendered the way it was trained. An explicit
+    CLI override still wins for any of these via _apply_cli_overrides.
 
     Initializer source priority:
       1. separate initializer_config_path  (pretrained_initializer ckpt with a config file)
-      2. main loaded_cfg                   (optimizer checkpoint's bundled initializer)
-      3. CLI config as-is                  (pretrained_initializer set but has no config file)
+      2. full pretrained_model checkpoint  (it bundles the initializer weights, so its
+                                            architecture must match the checkpoint config)
+      3. CLI config as-is                  (pretrained_optimizer alone carries no initializer
+                                            weights; or pretrained_initializer has no config file)
 
     Returns (merged_cfg, orig_cli_cfg); orig_cli_cfg is the snapshot taken before any
     checkpoint patches so that _apply_cli_overrides can restore explicit CLI values.
@@ -572,17 +554,28 @@ def _merge_test_mode(
         print(cyan("Test mode: patching scene_trainer.scene_optimizer from checkpoint config."))
         OmegaConf.update(merged_cfg, "scene_trainer.scene_optimizer", optimizer_subcfg, merge=True)
 
+    # Patch decoder from checkpoint so rendering uses the rasterizer the Gaussians were trained
+    # for. Merge over the CLI decoder (checkpoint values win) so any field the checkpoint lacks
+    # is filled from the CLI default -- old checkpoints predate some DecoderCfg fields and there
+    # is no decoder migration. An explicit CLI decoder override still wins via _apply_cli_overrides.
+    decoder_subcfg = OmegaConf.select(loaded_cfg, "scene_trainer.decoder", default=None)
+    if decoder_subcfg is not None:
+        print(cyan("Test mode: patching scene_trainer.decoder from checkpoint config (CLI fills missing fields)."))
+        OmegaConf.update(merged_cfg, "scene_trainer.decoder", decoder_subcfg, merge=True)
+
     # Patch initializer architecture (priority order above)
     if initializer_config_path is not None and initializer_config_path.exists():
         _patch_scene_initializer(merged_cfg, initializer_config_path, context="Test mode")
     elif pretrained_initializer is None:
-        pass
-        # TODO Naama
-        # No explicit initializer checkpoint — fall back to the optimizer checkpoint's initializer
-        # initializer_subcfg = OmegaConf.select(loaded_cfg, "scene_trainer.scene_initializer", default=None)
-        # if initializer_subcfg is not None:
-            # print(cyan("Test mode: patching scene_trainer.scene_initializer from checkpoint config."))
-            # OmegaConf.update(merged_cfg, "scene_trainer.scene_initializer", initializer_subcfg, merge=True)
+        # No separate initializer checkpoint. A full pretrained_model bundles the initializer
+        # weights (load_full_model), so its architecture must come from the checkpoint config.
+        # A pretrained_optimizer checkpoint carries no initializer weights, so the CLI
+        # scene_initializer config is kept as-is.
+        if cli_cfg.checkpointing.pretrained_model is not None:
+            initializer_subcfg = OmegaConf.select(loaded_cfg, "scene_trainer.scene_initializer", default=None)
+            if initializer_subcfg is not None:
+                print(cyan("Test mode: patching scene_trainer.scene_initializer from full-model checkpoint config."))
+                OmegaConf.update(merged_cfg, "scene_trainer.scene_initializer", initializer_subcfg, merge=True)
     else:
         print(cyan("pretrained_initializer set but has no config file; using CLI scene_initializer config."))
 
@@ -677,14 +670,8 @@ def setup_output_dir(cfg, cfg_dict):
         output_dir = CustomPath(output_dir)
         output_dir.mkdir(exist_ok=True, parents=True)
 
-    if HydraConfig.get().mode == RunMode.MULTIRUN and output_dir == "placeholder":
-        # Hack to overcome multirun issues
-        # TODO Naama, need to move to post_init of cfg
-        output_dir = CustomPath(hydra.core.hydra_config.HydraConfig.get()["run"]["dir"])
-        print(cyan(f"Multirun detected, setting output_dir to {CustomPath(output_dir):link}"))
-        # save checkoint path to a file for debugging
-        ckpt_path = cfg.checkpointing.pretrained_model or cfg.checkpointing.pretrained_optimizer
-        (output_dir / "ckpt_dir.txt").write_text(str(ckpt_path))
+    # Single point where output_dir is finalized. Downstream code reads cfg.output_dir; the
+    # value is also written into cfg_dict so the saved config.yaml records it. Keep both in sync.
     cfg_dict.output_dir = output_dir
     cfg.output_dir = output_dir
     output_dir.mkdir(exist_ok=True, parents=True)

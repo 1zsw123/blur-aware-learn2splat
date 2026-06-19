@@ -20,6 +20,7 @@ class LossLpipsCfg:
     weight: float
     apply_after_step: int
     perceptual_loss: bool
+    half_res: bool  # downsample to half resolution before LPIPS to save memory
 
 
 @dataclass
@@ -28,6 +29,12 @@ class LossLpipsCfgWrapper:
 
 
 class LossLpips(Loss[LossLpipsCfg, LossLpipsCfgWrapper]):
+    """LPIPS perceptual distance between the rendered and ground-truth views.
+
+    Returns 0 until global_step >= cfg.apply_after_step. Uses VGG-LPIPS, or the custom
+    PerceptualLoss when cfg.perceptual_loss.
+    """
+
     lpips: LPIPS
 
     def __init__(self, cfg: LossLpipsCfgWrapper) -> None:
@@ -48,7 +55,6 @@ class LossLpips(Loss[LossLpipsCfg, LossLpipsCfgWrapper]):
         gt_rgb: Tensor,
         pred_rgb: Tensor,
         valid_depth_mask: Tensor | None,
-        half_res_lpips: bool = False,
         **kwargs,
     ) -> Float[Tensor, ""]:
 
@@ -64,7 +70,7 @@ class LossLpips(Loss[LossLpipsCfg, LossLpipsCfgWrapper]):
         pred = rearrange(pred_rgb, "b v c h w -> (b v) c h w")
         gt = rearrange(gt_rgb, "b v c h w -> (b v) c h w")
 
-        if half_res_lpips:
+        if self.cfg.half_res:
             pred = F.interpolate(pred, scale_factor=0.5, mode="bilinear", align_corners=True)
             gt = F.interpolate(gt, scale_factor=0.5, mode="bilinear", align_corners=True)
 

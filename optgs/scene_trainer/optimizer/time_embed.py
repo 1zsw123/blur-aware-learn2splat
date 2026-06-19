@@ -1,7 +1,6 @@
 # From: https://github.com/ingra14m/Deformable-3D-Gaussians/blob/main/utils/time_utils.py
 
 import torch
-import torch.nn as nn
 
 
 def get_embedder(multires):

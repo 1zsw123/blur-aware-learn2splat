@@ -42,9 +42,10 @@ def legal_check_for_all_scenes(root_dir, target_shape, img_dir):
     # images_4 folder has resolution 270x480
 
     for sub_folder in tqdm(sub_folders, desc="checking scenes..."):
-        # img_dir = os.path.join(sub_folder, "images_8")  # 270x480
-        img_dir = os.path.join(sub_folder, img_dir)  # 540x960
-        if not is_image_shape_matched(Path(img_dir), target_shape):
+        # Use a per-scene variable; reusing img_dir here would clobber the parameter and
+        # build a wrong path for every scene after the first.
+        scene_img_dir = os.path.join(sub_folder, img_dir)  # e.g. <scene>/nerfstudio/images_4
+        if not is_image_shape_matched(Path(scene_img_dir), target_shape):
             print(f"image shape does not match for {sub_folder}")
             continue
         pose_file = os.path.join(sub_folder, "transforms.json")

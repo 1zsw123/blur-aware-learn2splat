@@ -1,3 +1,12 @@
+"""Outer training loop of the two-level pipeline.
+
+`MetaTrainer` is the PyTorch Lightning module that drives meta-learning: it iterates over scenes,
+delegates the per-scene initialize -> optimize -> render work to `SceneTrainer`, computes the losses on
+the rendered novel views, and meta-optimizes the SceneTrainer's parameters. Also handles the few-shot
+ckpt buffer, wandb logging, evaluation (PSNR/SSIM/LPIPS, depth), and test-time output (videos, depth,
+saved Gaussians). The inner per-scene loop lives in `scene_trainer.py`.
+"""
+
 import json
 import math
 import os
@@ -5,10 +14,9 @@ import time
 import warnings
 from collections import defaultdict
 from pathlib import Path
-from typing import Optional, runtime_checkable, Protocol, Literal
+from typing import Optional, runtime_checkable, Protocol
 
 import numpy as np
-import pandas as pd
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -27,11 +35,11 @@ from optgs.dataset import DatasetCfg
 from optgs.dataset.data_module import get_data_shim
 from optgs.dataset.data_types import BatchedExample, BatchedViews
 from optgs.evaluation.depth_metrics import compute_depth_errors
-from optgs.evaluation.metrics import compute_psnr, compute_ssim, compute_rgb_metrics
+from optgs.evaluation.metrics import compute_psnr, compute_rgb_metrics
 from optgs.loss import Loss
 from optgs.loss.loss_depth_smooth import get_smooth_loss
 from optgs.loss.loss_stability import LossStability
-from optgs.meta_trainer.replay_buffer import GaussianEpisodeEntry
+from optgs.meta_trainer.ckpt_buffer import GaussianEpisodeEntry
 from optgs.misc.LocalLogger import LocalLogger, LOG_PATH
 from optgs.misc.batchify import batched_select
 from optgs.misc.benchmarker import Benchmarker
@@ -41,16 +49,16 @@ from optgs.misc.image_io import prep_image, save_video, save_image
 from optgs.misc.io import CustomPath
 from optgs.misc.stablize_camera import render_stabilization_path
 from optgs.misc.step_tracker import StepTracker
-from optgs.model.colmap_utils.convert_to_colmap import save_opencv_camera
-from optgs.model.colmap_utils.extract_sparse_view_extrinsics import extract_sparse_images_bin
 from optgs.model.decoder import get_decoder
+from optgs.model.decoder.decoder import DecoderOutput
 from optgs.model.ply_export import save_gaussian_ply
 from optgs.paths import DEBUG
 from optgs.scene_trainer.initializer.initializer import InitializerOutput, Initializer
 from optgs.scene_trainer.optimizer.optimizer import OptimizerPreviousOutput, OptimizerOutput, Optimizer
 from optgs.scene_trainer.postprocessing import PostProcessing3DGS
 from optgs.scene_trainer.scene_trainer import SceneTrainer  # Use existing SceneTrainer
-from optgs.scene_trainer.scene_trainer_cfg import SceneTrainerCfg, MetaOptimizerCfg, TestCfg, TrainCfg
+from optgs.scene_trainer.scene_trainer_cfg import SceneTrainerCfg
+from optgs.meta_trainer.meta_trainer_cfg import MetaOptimizerCfg, TestCfg, TrainCfg
 from optgs.visualization.annotation import add_label
 from optgs.visualization.camera_trajectory.interpolation import interpolate_extrinsics, interpolate_intrinsics
 from optgs.visualization.camera_trajectory.wobble import generate_wobble, generate_wobble_transformation
@@ -61,12 +69,12 @@ from optgs.visualization.vis_depth import viz_depth_tensor
 
 try:
     from bitsandbytes.optim import AdamW8bit
-except:
+except ImportError:
     pass
 
 try:
     import moviepy.editor as mpy
-except:
+except ImportError:
     import moviepy as mpy
 
 
@@ -83,7 +91,6 @@ class TrajectoryFn(Protocol):
 
 
 slurm_id_logged = False
-debug_count = 0
 
 
 class _SkipStepException(Exception):
@@ -98,7 +105,7 @@ class MetaTrainer(LightningModule):
     Meta-level trainer that handles the outer loop of meta-learning.
 
     This class focuses on:
-    - Meta-level training loop and replay buffer management
+    - Meta-level training loop and ckpt buffer management
     - Delegating scene-level optimization to the existing SceneTrainer
     - Meta-optimization of the SceneTrainer's parameters
     """
@@ -116,16 +123,13 @@ class MetaTrainer(LightningModule):
     def __init__(
             self,
             cfg: RootCfg,
-            meta_optimizer_cfg: MetaOptimizerCfg,
-            test_cfg: TestCfg,
-            train_cfg: TrainCfg,
-            scene_trainer_cfg: SceneTrainerCfg,
             losses: list[Loss],
             step_tracker: StepTracker | None,
             eval_data_cfg: Optional[DatasetCfg] = None,
     ) -> None:
+        # All sub-configs are read from cfg (they were redundant constructor params before).
         super().__init__()
-        self.meta_optimizer_cfg = cfg.meta_optimizer
+        self.meta_optimizer_cfg = cfg.meta_trainer.meta_optimizer
         self.test_cfg = cfg.meta_trainer.test
         self.train_cfg = cfg.meta_trainer.train
         self.step_tracker = step_tracker
@@ -133,14 +137,23 @@ class MetaTrainer(LightningModule):
         self.scene_trainer_cfg = cfg.scene_trainer
         self.meta_trainer_cfg = cfg.meta_trainer
 
+        # Single benchmarker shared with the SceneTrainer so all timings accumulate in one place.
+        self.benchmarker = Benchmarker()
+
+        # The first optimized scene of a test pass pays a one-time GPU warm-up (kernel JIT,
+        # cuDNN autotune, CUDA context). This flag (reset in on_test_epoch_start) lets
+        # _run_optimizer zero that scene's first iteration so reported timings are steady-state.
+        self._timing_warmup_done = False
+
         # Create the existing SceneTrainer that contains all the scene-level logic
         # This includes the initializer, optimizer, decoder, and get_optimized_gaussians method
         self.scene_trainer = SceneTrainer(
-            test_cfg=test_cfg,
-            train_cfg=train_cfg,
-            scene_trainer_cfg=scene_trainer_cfg,
+            test_cfg=self.test_cfg,
+            train_cfg=self.train_cfg,
+            scene_trainer_cfg=self.scene_trainer_cfg,
             decoder=get_decoder(cfg.scene_trainer.decoder, cfg.dataset),
             step_tracker=step_tracker,
+            benchmarker=self.benchmarker,
             eval_data_cfg=eval_data_cfg,
         )
 
@@ -148,40 +161,49 @@ class MetaTrainer(LightningModule):
         self.losses = nn.ModuleList(losses)
 
         # Testing utilities
-        self.benchmarker = Benchmarker()
         self.eval_cnt = 0
 
         if self.test_cfg.compute_scores:
             self.test_step_outputs_target = defaultdict(list)
             self.test_step_outputs_context = defaultdict(list)
 
-        if cfg.mode == "train" and self.train_cfg.use_replay_buffer and self.scene_trainer_cfg.num_update_steps > 0:
+        if cfg.mode == "train" and self.train_cfg.use_ckpt_buffer and self.scene_trainer_cfg.num_update_steps > 0:
             assert self.scene_optimizer is not None
             assert self.scene_optimizer.strategy == "learned"
 
             if getattr(self.scene_optimizer.cfg, 'concat_init_state', False):
-                raise NotImplementedError("Replay buffer with concat_init_state is not supported")
+                raise NotImplementedError("Ckpt buffer with concat_init_state is not supported")
             if getattr(self.scene_optimizer.cfg, 'replace_init_state', False):
-                raise NotImplementedError("Replay buffer with replace_init_state is not supported")
-            from optgs.meta_trainer.replay_buffer import EpisodeReplayBuffer
-            self.buffer = EpisodeReplayBuffer(self.train_cfg.replay_buffer_cfg)
+                raise NotImplementedError("Ckpt buffer with replace_init_state is not supported")
+            from optgs.meta_trainer.ckpt_buffer import EpisodeCkptBuffer
+            self.buffer = EpisodeCkptBuffer(self.train_cfg.ckpt_buffer_cfg)
         else:
             self.buffer = None
 
         self._use_dataloader_batch = True  # default
         self._new_scenes_cnt = -1
         self.gaussian_timestep_list = []
-        self.gaussian_timestep_table = wandb.Table(columns=["epoch", "gaussian_timestep", "count"])
 
         self.promoting_buffer_sample = False
 
-        if self.training:
-            self._inner_iteration_data = []  # Store data for logging inner iterations psnr across meta iterations
+        if self.scene_trainer_cfg.train_scene_init:
+            # Initializer-training path only supports target-only supervision today.
+            assert not self.train_cfg.loss_on_input_views, \
+                "loss_on_input_views=True is not supported when train_scene_init=True"
+        else:
+            # Initializer-depth losses supervise the init's depth predictions; with
+            # train_scene_init=False the initializer runs under no_grad, so these weights are no-ops.
+            assert self.train_cfg.depth_loss_weight == 0, \
+                "depth_loss_weight has no effect when train_scene_init=False"
+            assert self.train_cfg.depth_smooth_loss_weight == 0, \
+                "depth_smooth_loss_weight has no effect when train_scene_init=False"
+            assert self.train_cfg.monodepth_loss_weight == 0, \
+                "monodepth_loss_weight has no effect when train_scene_init=False"
 
     # ==================== Lightning Hooks ====================
 
     def on_before_batch_transfer(self, batch: BatchedExample, dataloader_idx: int) -> BatchedExample:
-        """Decide before device transfer whether this step should draw from the replay buffer or the dataloader."""
+        """Decide before device transfer whether this step should draw from the ckpt buffer or the dataloader."""
         # Decide whether we'll use the buffer
         if self.training and self.buffer is not None and self.buffer.should_sample():
             self._use_dataloader_batch = False
@@ -195,25 +217,15 @@ class MetaTrainer(LightningModule):
         batch["target"] = BatchedViews.from_dict(batch["target"])
         return batch
 
-    def will_move_minibatch_to_device(self, batch):
-        """True when only a sub-batch of views needs to move to device (non-learned init + opt_batch_size < V)."""
-        # TODO Naama: check if used
-        # When we sabsample a minibatch, we can move only it to device
-        return (self.scene_initializer.strategy == "nonlearned" and
-                self.scene_optimizer is not None and
-                self.scene_trainer_cfg.opt_batch_size != batch["context"]["image"].shape[1])
-
     def transfer_batch_to_device(self, batch, device, dataloader_idx):
-        # Only transfer if we're going to use this batch
+        """Skip the device transfer when the upcoming training step will draw from the ckpt buffer.
+
+        `on_before_batch_transfer` sets `_use_dataloader_batch=False` whenever the buffer wins the
+        coin flip; in that case we ignore the dataloader batch entirely and the buffer-sample path
+        moves its own tensors. Validation/test always transfer.
+        """
         if self.training:
-            if self._use_dataloader_batch:
-                should_move = True  # move if using dataloader batch
-                # Also, if the initializer is not learned and the optimizer uses inner batch size, then we also don't want to
-                # move the batch
-                # if self.will_move_minibatch_to_device(batch):
-                #     should_move = False
-            else:
-                should_move = False  # don't move if using buffer sample (we'll move it in the buffer sampling code)
+            should_move = self._use_dataloader_batch  # buffer-sample path moves the batch itself
         else:
             should_move = True  # always move during validation and testing
 
@@ -253,13 +265,7 @@ class MetaTrainer(LightningModule):
                 print(f"Buffer size: {len(self.buffer)}")
 
             if self.logger is not None and isinstance(self.logger, WandbLogger):
-                # counts = Counter(self.gaussian_timestep_list)
-                # for eid, c in counts.items():
-                #     self.gaussian_timestep_table.add_data(self.current_epoch, eid, c)
-
-                # wandb.log({"replay_buffer/event_counts_table": self.gaussian_timestep_table})
-                # log also histogram
-                wandb.log({"replay_buffer/gaussian_timestep_histogram": wandb.Histogram(self.gaussian_timestep_list)})
+                wandb.log({"ckpt_buffer/gaussian_timestep_histogram": wandb.Histogram(self.gaussian_timestep_list)})
 
         if self.buffer is not None:
             self.buffer.clear()
@@ -304,6 +310,7 @@ class MetaTrainer(LightningModule):
 
     def on_test_epoch_start(self):
         """Handle test epoch start."""
+        self._timing_warmup_done = False
         if hasattr(self.scene_trainer, 'on_test_epoch_start'):
             return self.scene_trainer.on_test_epoch_start()
 
@@ -315,12 +322,6 @@ class MetaTrainer(LightningModule):
     def on_test_end(self) -> None:
         out_dir = self.test_cfg.output_path
 
-        # Merge sub-module benchmarkers so all tags land in one file.
-        # scene_trainer.benchmarker holds "initializer" (wall-clock, from init_gaussians_and_render).
-        # optimizer.benchmarker is unused here — decoder/optimizer split is recorded per-scene
-        # in meta_test_step via benchmarker.record() directly on self.benchmarker.
-        self.benchmarker.merge(self.scene_trainer.benchmarker)
-
         # saved_scores = {}
         if self.test_cfg.compute_scores:
             self.benchmarker.dump_memory(out_dir / "peak_memory.json")
@@ -329,15 +330,12 @@ class MetaTrainer(LightningModule):
             for output_dict, input_str in zip([self.test_step_outputs_context, self.test_step_outputs_target],
                                               ["context", "target"]):
                 for metric_name, metric_scores in output_dict.items():
-                    metric_scores = torch.tensor(metric_scores)  # [scenes, update_steps]
-                    if metric_scores.numel() == 0:
+                    if len(metric_scores) == 0 or max(len(row) for row in metric_scores) == 0:
                         continue
-                    metric_scores = metric_scores.float()  # [scenes, update_steps]
-                    update_step_scores = metric_scores.mean(dim=0).tolist()  # [update_steps]
-                    # saved_scores[f"{input_str}_{metric_name}"] = update_step_scores[-1]
-                    print(input_str, metric_name, update_step_scores)
+                    matrix, per_step_mean, scenes_per_step = self._reduce_partial_metric(metric_scores)
+                    print(input_str, metric_name, per_step_mean, "scenes_per_step:", scenes_per_step)
                     with (out_dir / "metrics" / f"{input_str}_{metric_name}.json").open("w") as f:
-                        json.dump(metric_scores.tolist(), f)
+                        json.dump(matrix, f)
 
             self.benchmarker.clear_history()
         else:
@@ -345,21 +343,27 @@ class MetaTrainer(LightningModule):
             self.benchmarker.dump_memory(out_dir / "metrics" / "peak_memory.json")
             self.benchmarker.summarize()
 
+    @staticmethod
+    def _reduce_partial_metric(
+        metric_scores: list[list[float | int]],
+    ) -> tuple[list[list[float]], list[float], list[int]]:
+        """Average a metric's per-scene rows across scenes, tolerating partial scenes.
+
+        Rows hold floats (psnr/ssim/...) or ints (iteration numbers).
+
+        A scene that stopped early has fewer steps, so the rows can be ragged; they are NaN-padded to
+        the longest. Returns (padded matrix [scenes, steps], per-step mean, per-step scene count). The
+        mean is NaN at any step not every scene reached -- flagging it as not comparable rather than
+        averaging the survivors; the count records how many scenes reached each step.
+        """
+        max_steps = max(len(row) for row in metric_scores)
+        padded = [row + [float("nan")] * (max_steps - len(row)) for row in metric_scores]
+        mat = torch.tensor(padded).float()  # [scenes, steps]
+        per_step_mean = mat.mean(dim=0).tolist()
+        scenes_per_step = (~torch.isnan(mat)).sum(dim=0).tolist()
+        return mat.tolist(), per_step_mean, scenes_per_step
+
     # ==================== Training ====================
-
-    def _move_batch_to_device(self, batch: dict) -> dict:
-        """Move a batch dict to the current device."""
-
-        def move_tensor(x):
-            if isinstance(x, Tensor):
-                return x.to(self.device)
-            elif isinstance(x, dict):
-                return {k: move_tensor(v) for k, v in x.items()}
-            elif isinstance(x, list):
-                return [move_tensor(v) for v in x]
-            return x
-
-        return move_tensor(batch)
 
     def training_step(self, batch, batch_idx):
         """
@@ -393,18 +397,31 @@ class MetaTrainer(LightningModule):
         return loss
 
     def meta_training_step(self, scene_batch, batch_idx):
-        """One meta-training step: initialize Gaussians, run optimizer refinement, compute loss, optionally push to replay buffer."""
-        batch_size, init_target_render_output = None, None
+        """One meta-training step: initialize Gaussians, run optimizer refinement, compute loss, optionally push to ckpt buffer."""
         optimizer_output: OptimizerOutput | None = None
 
-        # Prepare input (from dataloader or replay buffer)
+        # Prepare input (from dataloader or ckpt buffer)
         if self._use_dataloader_batch:
             # Use new batch from dataloader
             scene_batch: BatchedExample = self.initializer_data_shim(scene_batch)
 
-            # Get initialization Gaussians
+            # Get initialization Gaussians + renders. Context render is needed only when the
+            # optimizer step loss reads from position 0 of the render lists. Target render is
+            # always produced so the splice in get_optimized_gaussians can align gaussian_list
+            # and target_render_list. Grads on init render are only needed when training the
+            # initializer; same condition gates the depth render.
             try:
-                init_output = self.get_init_gaussians(scene_batch, is_training=self.scene_trainer_cfg.train_scene_init)
+                init_output = self.init_gaussians_and_render(
+                    scene_batch,
+                    visualization_dump={},
+                    render_context=self.scene_trainer_cfg.train_scene_opt,
+                    render_target=True,
+                    grad_enabled=self.scene_trainer_cfg.train_scene_init,
+                    depth_mode='depth' if (
+                            self.train_cfg.render_depth_loss_weight > 0
+                            and self.scene_trainer_cfg.train_scene_init
+                    ) else None,
+                )
             except SkipBatchException as e:
                 self.log("skip_zero_gaussians_batch", 1, prog_bar=True)
                 if self.global_rank == 0:
@@ -412,31 +429,37 @@ class MetaTrainer(LightningModule):
                 raise _SkipStepException(f"SkipBatch(init): {e}")
 
             prev_output = init_output
-
-            # Render the init gaussians for loss calculation (only when training the initializer)
-            if self.scene_trainer_cfg.train_scene_init:
-                batch_size, init_target_render_output = (
-                    self.train_render_output_for_init_gaussians(scene_batch, init_output.gaussians))
-
             curr_inner_iter = 0
             self._new_scenes_cnt += 1
         else:
-            # Resample from replay buffer intermediate optimized Gaussians (only when training the optimizer)
+            # Resample from ckpt buffer intermediate optimized Gaussians (only when training the optimizer)
             assert self.scene_trainer_cfg.train_scene_opt
             assert not self.scene_trainer_cfg.train_scene_init
 
             # Sample from buffer
-            gaussian_episode_entry: GaussianEpisodeEntry = self.buffer.sample(device=self.device,
-                                                                              leave_batch_fn=self.will_move_minibatch_to_device)
+            gaussian_episode_entry: GaussianEpisodeEntry = self.buffer.sample(device=self.device)
 
-            # Adjust sample
             scene_batch = gaussian_episode_entry.batch
-            prev_output = OptimizerPreviousOutput(gaussians=gaussian_episode_entry.gaussians,
-                                                  state=gaussian_episode_entry.state)
             curr_inner_iter = gaussian_episode_entry.t
 
-            # Simulate init_output for logging (no training of the init_model in this case)
-            init_output = InitializerOutput(gaussians=gaussian_episode_entry.gaussians)
+            # Ckpt-buffer path: resume optimization from a buffered intermediate state instead of a
+            # fresh initialization (no initializer model runs -- train_scene_init=False). prev_output
+            # holds the gaussians + optimizer state to resume from; we pre-render its views so
+            # get_optimized_gaussians can place them at iteration 0 of the optimizer output.
+            prev_output = OptimizerPreviousOutput(
+                gaussians=gaussian_episode_entry.gaussians,
+                state=gaussian_episode_entry.state,
+            )
+            self.scene_trainer.render_init_views(
+                scene_batch, prev_output,
+                render_context=True, render_target=True, grad_enabled=False,
+            )
+
+            # Resuming from the buffer means there is no separate initializer output, so reuse
+            # prev_output as init_output: it already holds the rendered resume views, which
+            # _log_init_metrics reads to log the step-0 PSNR. The initializer loss is not computed
+            # when only the optimizer is trained, so nothing else is taken from it.
+            init_output = prev_output
 
         # Log the current timestep for analysis
         self.gaussian_timestep_list.append(curr_inner_iter)
@@ -446,8 +469,8 @@ class MetaTrainer(LightningModule):
             # During optimization, we render the context and target images for:
             # 1. error/gradients calculation
             # 2. loss calculation
-            # Although it is not necessary, we also render the init target image again for loss calculation
-            # In the case or training both initializer and optimizer, this is redundant.
+            # The init render at position 0 of the optimizer_output lists comes from the
+            # splice in get_optimized_gaussians (see SceneTrainer._insert_init_into_output).
 
             try:
                 optimizer_output: OptimizerOutput = self.get_optimized_gaussians(scene_batch, prev_output,
@@ -474,8 +497,8 @@ class MetaTrainer(LightningModule):
         init_gaussians = init_output.gaussians
 
         try:
-            total_loss = self.train_calc_total_loss(scene_batch, optimizer_output, init_gaussians,
-                                                    init_target_render_output, init_output.depths)
+            total_loss = self._calc_total_loss(scene_batch, optimizer_output, init_gaussians,
+                                               init_output)
         except (torch.cuda.OutOfMemoryError, torch.OutOfMemoryError) as e:
             self.log("skip_oom_batch", 1, prog_bar=True)
             print(
@@ -499,66 +522,83 @@ class MetaTrainer(LightningModule):
                      f"t meta {self.global_step} t inner {optimizer_output.t}")
             raise _SkipStepException("NaN/Inf loss")
 
-        # Push back to buffer
         if self.buffer is not None and self.buffer.should_push(new_sample=self._use_dataloader_batch,
                                                                t=curr_inner_iter):
-            push = True
-            if self.train_cfg.replay_buffer_cfg.simulate_ahead:
-                min_steps = self.train_cfg.replay_buffer_cfg.simulate_ahead_min_steps
-                cfg_max_steps = self.train_cfg.replay_buffer_cfg.simulate_ahead_max_steps
-
-                if self.train_cfg.replay_buffer_cfg.simulate_ahead_grow > 0:
-                    t_meta = self.global_step
-                    T_grow = self.train_cfg.replay_buffer_cfg.simulate_ahead_grow
-                    max_steps = min_steps + (cfg_max_steps - min_steps) * min(1.0, t_meta / T_grow)
-                    max_steps = int(max_steps)
-                else:
-                    max_steps = cfg_max_steps
-
-                if min_steps == max_steps:
-                    steps = min_steps
-                else:
-                    steps = np.random.randint(low=min_steps, high=max_steps + 1)
-                with torch.no_grad():
-                    # Set eval mode
-                    self.eval()
-                    self.scene_optimizer.save_every.set_all_tags(False)
-                    self.promoting_buffer_sample = True
-
-                    try:
-                        optimizer_output = self.get_optimized_gaussians(scene_batch, optimizer_output.last_prev_output,
-                                                                        curr_iter=optimizer_output.t,
-                                                                        num_update_steps=steps,
-                                                                        disable_tqdm=True)
-                        last_gaussians = optimizer_output.last_prev_output.gaussians
-                    # catching multiple errors
-                    except (ValueError, SkipBatchException) as e:
-                        warn(f"Skipping pushing batch {batch_idx} to buffer due to {e}.")
-                        push = False
-                    self.train()
-                    self.scene_optimizer.save_every.set_all_tags(True)
-                    self.promoting_buffer_sample = False
-
-                    # assert len(optimizer_output.target_render_list) == 0  # no rendering needed
-
-            if optimizer_output.last_prev_output.state.state is not None:
-                with torch.no_grad():
-                    state_norm = optimizer_output.last_prev_output.state.state.norm(dim=1).mean()
-                if state_norm > 500:
-                    warnings.warn(f"Pushing sample norm state {state_norm} {optimizer_output.t} {self.global_step}")
-            if push:
-                self.buffer.push(GaussianEpisodeEntry(t=optimizer_output.t,
-                                                      batch=scene_batch,
-                                                      gaussians=last_gaussians,
-                                                      state=optimizer_output.last_prev_output.state,
-                                                      id=self._new_scenes_cnt), to_cpu=True)
-
-                self.log("replay_buffer/size", len(self.buffer.buffer))
-                if self.train_cfg.replay_buffer_cfg.simulate_ahead:
-                    self.log("replay_buffer/simulate_ahead", steps)
-                self.log("replay_buffer/stored_step", optimizer_output.t)
+            self._maybe_push_to_ckpt_buffer(scene_batch, batch_idx, optimizer_output, last_gaussians)
 
         return total_loss
+
+    def _maybe_push_to_ckpt_buffer(self, scene_batch, batch_idx, optimizer_output, last_gaussians):
+        """Optionally roll out the optimizer, then push the current sample to the ckpt buffer.
+
+        Called only when `self.buffer.should_push(...)` already returned True. The rollout
+        branch runs extra optimizer iterations under torch.no_grad to produce a "more mature"
+        sample to push (controlled by ckpt_buffer_cfg.rollout*); it may reassign
+        `optimizer_output` and `last_gaussians` locally for the push.
+        """
+        push = True
+        steps = None
+        if self.train_cfg.ckpt_buffer_cfg.rollout:
+            steps = self._sample_rollout_steps()
+            with torch.no_grad():
+                # Set eval mode
+                self.eval()
+                self.scene_optimizer.save_every.set_all_tags(False)
+                self.promoting_buffer_sample = True
+
+                try:
+                    optimizer_output = self.get_optimized_gaussians(scene_batch, optimizer_output.last_prev_output,
+                                                                    curr_iter=optimizer_output.t,
+                                                                    num_update_steps=steps,
+                                                                    disable_tqdm=True)
+                    last_gaussians = optimizer_output.last_prev_output.gaussians
+                # catching multiple errors
+                except (ValueError, SkipBatchException) as e:
+                    warn(f"Skipping pushing batch {batch_idx} to buffer due to {e}.")
+                    push = False
+                self.train()
+                self.scene_optimizer.save_every.set_all_tags(True)
+                self.promoting_buffer_sample = False
+
+        if optimizer_output.last_prev_output.state.state is not None:
+            with torch.no_grad():
+                state_norm = optimizer_output.last_prev_output.state.state.norm(dim=1).mean()
+            if state_norm > 500:
+                warnings.warn(f"Pushing sample norm state {state_norm} {optimizer_output.t} {self.global_step}")
+
+        if push:
+            self.buffer.push(GaussianEpisodeEntry(t=optimizer_output.t,
+                                                  batch=scene_batch,
+                                                  gaussians=last_gaussians,
+                                                  state=optimizer_output.last_prev_output.state,
+                                                  id=self._new_scenes_cnt), to_cpu=True)
+
+            self.log("ckpt_buffer/size", len(self.buffer.buffer))
+            if self.train_cfg.ckpt_buffer_cfg.rollout:
+                self.log("ckpt_buffer/rollout", steps)
+            self.log("ckpt_buffer/stored_step", optimizer_output.t)
+
+    def _sample_rollout_steps(self) -> int:
+        """Sample the number of extra optimizer iterations to run before pushing to the buffer.
+
+        Range is [rollout_min_steps, rollout_max_steps]; when rollout_grow > 0
+        the upper bound grows linearly from min_steps up to max_steps over `rollout_grow`
+        meta-steps.
+        """
+        cfg = self.train_cfg.ckpt_buffer_cfg
+        min_steps = cfg.rollout_min_steps
+        cfg_max_steps = cfg.rollout_max_steps
+
+        if cfg.rollout_grow > 0:
+            t_meta = self.global_step
+            t_grow = cfg.rollout_grow
+            max_steps = int(min_steps + (cfg_max_steps - min_steps) * min(1.0, t_meta / t_grow))
+        else:
+            max_steps = cfg_max_steps
+
+        if min_steps == max_steps:
+            return min_steps
+        return int(np.random.randint(low=min_steps, high=max_steps + 1))
 
     def train_logging(self, batch, optimizer_output, gaussians, total_loss):
         self.log("loss/total", total_loss)
@@ -637,7 +677,6 @@ class MetaTrainer(LightningModule):
                 # Stability loss is applied on all intermediate outputs
                 # Will be calculated outside of the inner steps loop
                 continue
-            # TODO Naama review
             loss = loss_fn(
                 render_output,
                 gaussians,
@@ -646,9 +685,6 @@ class MetaTrainer(LightningModule):
                 pred_rgb=pred_rgb,
                 gt_image=all_gt_rgb,
                 valid_depth_mask=valid_depth_mask,
-                l1_loss=self.train_cfg.l1_loss,
-                clamp_large_error=self.train_cfg.train_ignore_large_loss,
-                half_res_lpips=self.train_cfg.half_res_lpips_loss,
             )
 
             loss_tag = f"{tag}_" + loss_fn.name
@@ -659,169 +695,159 @@ class MetaTrainer(LightningModule):
 
         return total_loss
 
-    def train_calc_total_loss(self, batch, optimizer_output: OptimizerOutput | None, init_gaussians,
-                              init_target_render_output, pred_depths):
-        """Accumulate total training loss: init + optimizer steps + depth + monodepth losses."""
-        total_loss = 0
-        valid_depth_mask = None
+    def _calc_total_loss(self, batch, optimizer_output: OptimizerOutput | None, init_gaussians,
+                         init_output):
+        """Accumulate total training loss: initializer (RGB + depth) OR optimizer steps (RGB + Gaussians),
+         plus render-depth losses.
 
-        target_gt_rgb = batch["target"]["image"]
+        For now, either the initializer or the optimizer is active per run (train_scene_init OR train_scene_opt).
+        The render-depth losses apply to whichever module produced the final target render, 
+        so they are independent of the init/opt path.
+        """
+        total_loss = 0
+        valid_depth_mask = None  # It is always None, but possible, but depending on the dataset, it can be re-activated.
         t = optimizer_output.t if optimizer_output is not None else 0
 
-        # Log and calculate loss of init
+        # Init loss (RGB + initializer-depth) and step-0 logging
+        self._log_init_metrics(batch, init_output)
         if self.scene_trainer_cfg.train_scene_init:
-            total_loss += self._calc_init_loss(init_gaussians, init_target_render_output, target_gt_rgb,
-                                               valid_depth_mask)
-        else:
-            # Still log init psnr, but init_target_render_output is None
-            self._log_init_metrics_from_optimizer(batch, optimizer_output)
+            total_loss += self._calc_init_loss(batch, init_gaussians, init_output, valid_depth_mask)
 
-        # Log and calculate loss of intermediate outputs during refinement
+        # Log and calculate loss of intermediate outputs of the optimizer steps
         if self.scene_trainer_cfg.train_scene_opt:
             total_loss += self._calc_opt_loss(batch, optimizer_output, t, valid_depth_mask)
 
-        # More loss on the last prediction
+        # Render-depth losses, applied to whichever module produced the final target render
         assert self.scene_trainer_cfg.train_scene_init ^ self.scene_trainer_cfg.train_scene_opt
         last_target_decoder_output = optimizer_output.target_render_list[
-            -1] if optimizer_output is not None else init_target_render_output
+            -1] if optimizer_output is not None else init_output.target_render
 
-        # render depth loss
         if self.train_cfg.render_depth_loss_weight > 0:
-            # [B, V, H, W]
-            near = batch["target"]["near"][..., None, None]  # [B, V, 1, 1]
-            far = batch["target"]["far"][..., None, None]
+            total_loss = total_loss + self._calc_render_depth_loss(batch, last_target_decoder_output)
 
-            target_gt_depth = batch["target"]["depth"]
-            render_depth = last_target_decoder_output.depth
-
-            valid = (target_gt_depth >= near) & (target_gt_depth <= far) & (render_depth >= near) & (
-                    render_depth <= far)
-
-            render_depth_loss = self.train_cfg.render_depth_loss_weight * (
-                    torch.log(target_gt_depth[valid]) - torch.log(render_depth[valid])).abs().mean()
-
-            self.log(f"loss/render_depth", render_depth_loss)
-            total_loss = total_loss + render_depth_loss
-
-        # depth loss
-        if self.train_cfg.depth_loss_weight > 0:
-            near = batch["context"]["near"][..., None, None]  # [B, V, 1, 1]
-            far = batch["context"]["far"][..., None, None]
-
-            depth_gt = batch['context']["depth"]  # [B, V, H, W]
-
-            valid = (depth_gt >= near) & (depth_gt <= far)
-
-            # in case there is no valid gt depth (loss will be nan)
-            if valid.max() > 0.5:
-                # log or inverse depth loss
-                if self.train_cfg.log_depth_loss:
-                    depth_loss = (
-                            torch.log(pred_depths[valid]) - torch.log(depth_gt[valid])).abs().mean()
-                else:
-                    depth_loss = (
-                            1. / pred_depths[valid] - 1. / depth_gt[valid]).abs().mean()
-
-                depth_loss = self.train_cfg.depth_loss_weight * depth_loss
-
-                self.log(f"loss/depth", depth_loss)
-                total_loss = total_loss + depth_loss
-
-        # depth smooth loss
-        if self.train_cfg.depth_smooth_loss_weight > 0:
-            imgs = batch["context"]["image"].flatten(0, 1)  # [BV, 3, H, W]
-
-            depth = pred_depths.flatten(0, 1).unsqueeze(1)
-
-            disp = 1. / depth
-            if self.train_cfg.depth_smooth_loss_nonorm:
-                norm_disp = disp
-            else:
-                mean_disp = disp.mean(2, True).mean(3, True)
-                norm_disp = disp / (mean_disp + 1e-7)
-
-            # resize to depth's resolution
-            if imgs.shape[-2:] != norm_disp.shape[-2:]:
-                imgs = F.interpolate(imgs, size=norm_disp.shape[-2:], mode='bilinear', align_corners=True)
-
-            depth_smooth_loss = get_smooth_loss(norm_disp, imgs)
-
-            depth_smooth_loss = self.train_cfg.depth_smooth_loss_weight * depth_smooth_loss
-
-            self.log(f"loss/depth_smooth", depth_smooth_loss)
-            total_loss = total_loss + depth_smooth_loss
-        # depth smooth loss for novel views
         if self.train_cfg.depth_smooth_loss_weight_nvs > 0:
-            imgs = batch["target"]["image"].flatten(0, 1)  # [BV, 3, H, W]
+            total_loss = total_loss + self._calc_depth_smooth_loss_nvs(batch, last_target_decoder_output)
 
-            depth = last_target_decoder_output.depth.flatten(0, 1).unsqueeze(1)
-
-            disp = 1. / depth.clamp(min=1e-3, max=1000.)
-            if self.train_cfg.depth_smooth_loss_nonorm:
-                norm_disp = disp
-            else:
-                mean_disp = disp.mean(2, True).mean(3, True)
-                norm_disp = disp / (mean_disp + 1e-7)
-
-            depth_smooth_loss_nvs = get_smooth_loss(norm_disp, imgs)
-
-            depth_smooth_loss_nvs = self.train_cfg.depth_smooth_loss_weight_nvs * depth_smooth_loss_nvs
-
-            self.log(f"loss/depth_smooth_nvs", depth_smooth_loss_nvs)
-            total_loss = total_loss + depth_smooth_loss_nvs
-        # monodepth loss
-        if self.train_cfg.monodepth_loss_weight > 0:
-            imgs = batch["context"]["image"].flatten(0, 1)  # [BV, 3, H, W]
-
-            pred_disp = 1. / pred_depths.flatten(0, 1).clamp(min=1e-2)  # [BV, H, W]
-
-            # resize to max size 518
-            max_width = 518
-
-            ori_h, ori_w = imgs.shape[-2:]
-
-            # resize the max size to 518
-            assert ori_h <= ori_w
-            if ori_w != max_width:
-                new_h = int(ori_h * max_width / ori_w) // 14 * 14  # make sure divisible by 14
-                new_w = max_width
-                imgs = F.interpolate(imgs, size=(new_h, new_w), mode='bilinear', align_corners=True)
-
-            # normalize images
-            imgs = torchvision.transforms.Normalize(
-                mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225],
-            )(imgs)
-
-            # monodepth prediction: disparity
-            with torch.no_grad():
-                monodepth_pred = self.pretrained_monodepth(imgs)
-
-            monodepth_pred = F.interpolate(monodepth_pred.unsqueeze(1), size=(ori_h, ori_w), mode='nearest').squeeze(
-                1)  # [BV, H, W]
-
-            def normalize_disp(disp):
-                median = disp.median(dim=-1, keepdim=True)[0]  # [BV]
-                var = (disp - median).abs().mean(dim=-1, keepdim=True)
-
-                return (disp - median) / (var + 1e-6)
-
-            norm_pred_disp = normalize_disp(pred_disp.flatten(1, 2))
-            norm_mono_disp = normalize_disp(monodepth_pred.flatten(1, 2))
-
-            monodepth_loss = (norm_pred_disp - norm_mono_disp).abs().mean()
-
-            monodepth_loss = self.train_cfg.monodepth_loss_weight * monodepth_loss
-
-            self.log(f"loss/monodepth", monodepth_loss)
-            total_loss = total_loss + monodepth_loss
         return total_loss
 
+    def _calc_render_depth_loss(self, batch, last_target_decoder_output):
+        """Log-depth L1 between the optimizer's last target render and target-view GT depth."""
+        near = batch["target"]["near"][..., None, None]  # [B, V, 1, 1]
+        far = batch["target"]["far"][..., None, None]
+        target_gt_depth = batch["target"]["depth"]
+        render_depth = last_target_decoder_output.depth
+
+        valid = (target_gt_depth >= near) & (target_gt_depth <= far) & (render_depth >= near) & (
+                render_depth <= far)
+
+        loss = self.train_cfg.render_depth_loss_weight * (
+                torch.log(target_gt_depth[valid]) - torch.log(render_depth[valid])).abs().mean()
+        self.log(f"loss/render_depth", loss)
+        return loss
+
+    def _calc_depth_loss(self, batch, pred_depths):
+        """L1 between initializer-predicted context depths and GT (log-space or inverse-space)."""
+        near = batch["context"]["near"][..., None, None]  # [B, V, 1, 1]
+        far = batch["context"]["far"][..., None, None]
+        depth_gt = batch['context']["depth"]  # [B, V, H, W]
+
+        valid = (depth_gt >= near) & (depth_gt <= far)
+
+        # in case there is no valid gt depth (loss will be nan)
+        if valid.max() <= 0.5:
+            return 0
+
+        if self.train_cfg.log_depth_loss:
+            depth_loss = (torch.log(pred_depths[valid]) - torch.log(depth_gt[valid])).abs().mean()
+        else:
+            depth_loss = (1. / pred_depths[valid] - 1. / depth_gt[valid]).abs().mean()
+
+        depth_loss = self.train_cfg.depth_loss_weight * depth_loss
+        self.log(f"loss/depth", depth_loss)
+        return depth_loss
+
+    def _calc_depth_smooth_loss(self, batch, pred_depths):
+        """Edge-aware disparity smoothness on the initializer's context-view depth predictions."""
+        imgs = batch["context"]["image"].flatten(0, 1)  # [BV, 3, H, W]
+        depth = pred_depths.flatten(0, 1).unsqueeze(1)
+
+        disp = 1. / depth
+        if self.train_cfg.depth_smooth_loss_nonorm:
+            norm_disp = disp
+        else:
+            mean_disp = disp.mean(2, True).mean(3, True)
+            norm_disp = disp / (mean_disp + 1e-7)
+
+        # resize to depth's resolution
+        if imgs.shape[-2:] != norm_disp.shape[-2:]:
+            imgs = F.interpolate(imgs, size=norm_disp.shape[-2:], mode='bilinear', align_corners=True)
+
+        loss = self.train_cfg.depth_smooth_loss_weight * get_smooth_loss(norm_disp, imgs)
+        self.log(f"loss/depth_smooth", loss)
+        return loss
+
+    def _calc_depth_smooth_loss_nvs(self, batch, last_target_decoder_output):
+        """Edge-aware disparity smoothness on the optimizer's last target render (novel views)."""
+        imgs = batch["target"]["image"].flatten(0, 1)  # [BV, 3, H, W]
+        depth = last_target_decoder_output.depth.flatten(0, 1).unsqueeze(1)
+
+        disp = 1. / depth.clamp(min=1e-3, max=1000.)
+        if self.train_cfg.depth_smooth_loss_nonorm:
+            norm_disp = disp
+        else:
+            mean_disp = disp.mean(2, True).mean(3, True)
+            norm_disp = disp / (mean_disp + 1e-7)
+
+        loss = self.train_cfg.depth_smooth_loss_weight_nvs * get_smooth_loss(norm_disp, imgs)
+        self.log(f"loss/depth_smooth_nvs", loss)
+        return loss
+
+    def _calc_monodepth_loss(self, batch, pred_depths):
+        """Median-/MAD-normalized disparity match against a pretrained monocular depth network (e.g. DAv2)."""
+        imgs = batch["context"]["image"].flatten(0, 1)  # [BV, 3, H, W]
+        pred_disp = 1. / pred_depths.flatten(0, 1).clamp(min=1e-2)  # [BV, H, W]
+
+        # resize the longer side to 518 (must be divisible by 14 for DAv2)
+        max_width = 518
+        ori_h, ori_w = imgs.shape[-2:]
+
+        # resize the max size to 518
+        assert ori_h <= ori_w
+        if ori_w != max_width:
+            new_h = int(ori_h * max_width / ori_w) // 14 * 14  # make sure divisible by 14
+            new_w = max_width
+            imgs = F.interpolate(imgs, size=(new_h, new_w), mode='bilinear', align_corners=True)
+
+        # normalize images
+        imgs = torchvision.transforms.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225],
+        )(imgs)
+
+        # monodepth prediction: disparity
+        with torch.no_grad():
+            monodepth_pred = self.pretrained_monodepth(imgs)
+
+        monodepth_pred = F.interpolate(monodepth_pred.unsqueeze(1), size=(ori_h, ori_w), mode='nearest').squeeze(
+            1)  # [BV, H, W]
+
+        def normalize_disp(disp):
+            median = disp.median(dim=-1, keepdim=True)[0]  # [BV]
+            var = (disp - median).abs().mean(dim=-1, keepdim=True)
+            return (disp - median) / (var + 1e-6)
+
+        norm_pred_disp = normalize_disp(pred_disp.flatten(1, 2))
+        norm_mono_disp = normalize_disp(monodepth_pred.flatten(1, 2))
+
+        loss = self.train_cfg.monodepth_loss_weight * (norm_pred_disp - norm_mono_disp).abs().mean()
+        self.log(f"loss/monodepth", loss)
+        return loss
+
     def _calc_opt_loss(self, batch, optimizer_output, t, valid_depth_mask):
-        """Compute loss over all optimizer refinement steps for both target and context views."""
+        """Compute loss over all optimizer steps for both target and context views."""
         opt_loss = 0
         assert optimizer_output is not None
-        refine_step_num = len(optimizer_output.context_render_list) - 1  # first render is initialization
+        step_num = len(optimizer_output.context_render_list) - 1  # first render is initialization
 
         # (tag, loss_enabled, loss_num)  — render/index lists accessed via optimizer_output methods
         view_loss_cfg = [
@@ -829,7 +855,8 @@ class MetaTrainer(LightningModule):
             ("context", self.train_cfg.loss_on_input_views, self.train_cfg.loss_on_input_views_num),
         ]
 
-        for i in range(refine_step_num):
+        # Compute loss of each optimizer step separately
+        for i in range(step_num):
             for tag, loss_enabled, loss_num in view_loss_cfg:
                 render_list = optimizer_output.get_render_list(tag)
                 index_list = optimizer_output.get_index_list(tag)
@@ -837,8 +864,9 @@ class MetaTrainer(LightningModule):
                 all_gt_rgb = batch[tag]["image"]
 
                 if index_list:
+                    # index_list[0] is the init render index; steps start at [1].
                     # opt_batch_size < V_all: optimizer rendered a subset of views this step
-                    train_idx = index_list[i]  # [B, V_rendered] — from scene_trainer.opt_batch_size
+                    train_idx = index_list[i + 1]  # [B, V_rendered] — from scene_trainer.opt_batch_size
                     curr_gt_rgb = batched_select(all_gt_rgb, train_idx)  # [B, V_rendered, C, H, W]
                 else:
                     curr_gt_rgb = all_gt_rgb
@@ -850,9 +878,11 @@ class MetaTrainer(LightningModule):
                     # error_idx: subsample rendered views down to loss_num for the loss computation
                     error_idx = torch.randperm(actual_v, device=curr_gt_rgb.device)[:num_loss]
                     error_idx = error_idx.unsqueeze(0).expand(b, -1)
-                    opt_loss += self.compute_losses(optimizer_output.gaussian_list[i], i, refine_step_num,
+                    opt_loss += self.compute_losses(optimizer_output.gaussian_list[i + 1], i, step_num,
                                                     render_list[i + 1], curr_gt_rgb, valid_depth_mask,
                                                     error_idx=error_idx, all_gt_rgb=all_gt_rgb, tag=tag)
+
+        # Compute a stability loss over all optimizer steps
         if any(isinstance(loss, LossStability) for loss in self.losses):
             stability_loss_fn = next(loss for loss in self.losses if isinstance(loss, LossStability))
             stability_loss = stability_loss_fn(optimizer_output, batch)
@@ -861,21 +891,55 @@ class MetaTrainer(LightningModule):
 
         return opt_loss
 
-    def _log_init_metrics_from_optimizer(self, batch, optimizer_output):
-        assert optimizer_output is not None
-        for tag, is_target in [("context", False), ("target", True)]:
-            render_list = optimizer_output.get_render_list(tag)
-            index_list = optimizer_output.get_index_list(tag)
-            all_gt_rgb = batch[tag]["image"]
-            # Using the first optimization step indices (which was used for rendering during optimization)
-            curr_gt_rgb = batched_select(all_gt_rgb, index_list[0]) if index_list else all_gt_rgb
-            self._log_train_metrics(0, render_list[0].color, curr_gt_rgb, tag=tag)
+    def _log_init_metrics(self, batch, init_output):
+        """Log step-0 PSNR for the starting Gaussians, before any optimizer step runs.
 
-    def _calc_init_loss(self, init_gaussians, init_target_render_output, target_gt_rgb, valid_depth_mask):
-        assert not self.train_cfg.loss_on_input_views
-        self._log_train_metrics(0, init_target_render_output.color, target_gt_rgb, tag="target")
-        # TODO Naama: train init model on context+target?
-        return self.compute_losses(init_gaussians, 0, 1, init_target_render_output, target_gt_rgb, valid_depth_mask)
+        The starting Gaussians are either a fresh initialization or a state resumed from the ckpt
+        buffer. PSNR is logged for whichever views were rendered into init_output: target only when
+        training the initializer, both context and target when training the optimizer. When only a
+        subset of views was rendered, its view index selects the matching GT views to compare against.
+        """
+        for tag in ("context", "target"):
+            render = init_output.get_render(tag)
+            if render is None:
+                continue
+            index = init_output.get_render_index(tag)
+            all_gt_rgb = batch[tag]["image"]
+            curr_gt_rgb = batched_select(all_gt_rgb, index) if index is not None else all_gt_rgb
+            self._log_train_metrics(0, render.color, curr_gt_rgb, tag=tag)
+
+    def _calc_init_loss(self, batch, init_gaussians, init_output, valid_depth_mask):
+        """Compute the initializer loss: target-view RGB plus the initializer-depth losses.
+
+        Active only in the `train_scene_init=True` path (init has gradients). Step-0 PSNR is logged
+        separately by `_log_init_metrics`. The target-only RGB invariant (loss_on_input_views=False)
+        and the depth-loss weights are checked in __init__. The depth losses supervise the initializer's 
+        context-view depth predictions (`init_output.depths`).
+        """
+        
+        # RGB loss
+        loss = self.compute_losses(
+            init_gaussians, 0, 1, init_output.target_render, batch["target"]["image"], valid_depth_mask
+        )
+        
+        # Depth supervision
+        pred_depths = init_output.depths
+        any_depth_loss = (
+                self.train_cfg.depth_loss_weight > 0
+                or self.train_cfg.depth_smooth_loss_weight > 0
+                or self.train_cfg.monodepth_loss_weight > 0
+        )
+        assert not any_depth_loss or pred_depths is not None, (
+            "depth loss weights are > 0 but the initializer produced no pred_depths; "
+            "check that the initializer outputs depths"
+        )
+        if self.train_cfg.depth_loss_weight > 0:
+            loss += self._calc_depth_loss(batch, pred_depths)
+        if self.train_cfg.depth_smooth_loss_weight > 0:
+            loss += self._calc_depth_smooth_loss(batch, pred_depths)
+        if self.train_cfg.monodepth_loss_weight > 0:
+            loss += self._calc_monodepth_loss(batch, pred_depths)
+        return loss
 
     def _log_train_metrics(self, i, pred, gt, tag, t=-1):
         psnr = compute_psnr(
@@ -887,22 +951,6 @@ class MetaTrainer(LightningModule):
         if self.global_step < (100000 if DEBUG else 10) and self.global_rank == 0:
             print(
                 f"Training step {self.global_step}, inner step {t} i {i} train psnr {psnr.mean().item()}")
-
-    def train_render_output_for_init_gaussians(self, batch, gaussians):
-        b, v, _, h, w = batch["context"]["image"].shape
-        assert gaussians.means.size(0) == batch["target"]["extrinsics"].size(0), \
-            "num_scales must be 1; multi-scale depth supervision is not supported"
-        batch_size = batch["target"]["extrinsics"].size(0)
-        output = self.scene_decoder.forward(
-            gaussians,
-            batch["target"]["extrinsics"],
-            batch["target"]["intrinsics"],
-            batch["target"]["near"],
-            batch["target"]["far"],
-            (h, w),
-            depth_mode='depth' if self.train_cfg.render_depth_loss_weight > 0 else None,
-        )
-        return batch_size, output
 
     # ==================== Meta Optimizer Configuration ====================
 
@@ -966,215 +1014,192 @@ class MetaTrainer(LightningModule):
 
     @torch.no_grad()
     def meta_test_step(self, scene_batch: BatchedExample, batch_idx: int):
-        """Run the full test pipeline for one scene: initialize, optimize, then evaluate and save."""
-        if self.test_cfg.scenes_filter is not None and scene_batch['scene'][0] not in self.test_cfg.scenes_filter:
-            print(f"Scenes filter: {self.test_cfg.scenes_filter}")
-            print(f"Skipping scene {scene_batch['scene'][0]} (not in scenes_filter)")
+        """Run the full test pipeline for one scene: initialize, optimize, post-process, then save+eval each phase."""
+        if self._should_skip_scene(scene_batch):
             return
 
         output_path = self.test_cfg.output_path
-
-        if output_path is not None and self.test_cfg.skip_if_outputs_exist:
-            optimizer_name = self.scene_trainer.optimizer.__class__.__name__.lower() if self.scene_trainer.optimizer is not None else "no_optimizer"
-            target_metric_path = output_path / optimizer_name / "metrics" / f"{scene_batch['scene'][0]}" / f"target_{optimizer_name}.json"
-            context_metric_path = output_path / optimizer_name / "metrics" / f"{scene_batch['scene'][0]}" / f"context_{optimizer_name}.json"
-            should_eval_context = self.test_cfg.eval_context_views
-            should_eval_target = True  # always evaluate target views
-
-            skip_target = (should_eval_target and target_metric_path.exists()) or not should_eval_target
-            skip_context = (should_eval_context and context_metric_path.exists()) or not should_eval_context
-
-            if skip_target and skip_context:
-                print(
-                    f"Metrics for scene {scene_batch['scene'][0]} already exist at {target_metric_path} and {context_metric_path}. Skipping...")
-                return
-
         rule(f"Testing scene {batch_idx}: {scene_batch['scene'][0]}")
 
-        # input (context and target)
+        # Prepare batch. Two distinct steps, kept separate on purpose: the data shim is the
+        # universal patch-crop (applied on every path, training included), while
+        # eval_preprocessing is eval-only depth-range/scale setup (training omits it).
         batch: BatchedExample = self.initializer_data_shim(scene_batch)
-
-        # Process batch for experiments, e.g., add noise (skip if not needed)
         if self.test_cfg.experimental_add_noise_to_images:
             batch = self.experimental_process_batch(batch)
+        self.scene_initializer.eval_preprocessing(batch, self.train_cfg)
 
-        # Save cameras as JSON (before optimization, cameras are fixed)
+        # Cameras
         if self.test_cfg.save_cameras_json:
-            scene_name = batch["scene"][0]
-            relevant_keys = ["extrinsics", "intrinsics"]
-            context_info = {key: batch["context"][key][0].cpu().tolist() for key in relevant_keys}
-            target_info = {key: batch["target"][key][0].cpu().tolist() for key in relevant_keys}
-            resolution = list(batch["context"]["image"].shape[-2:])
-            cameras_data = {
-                "scene": scene_name,
-                "context": context_info,
-                "target": target_info,
-                "resolution": resolution,
-            }
-            cameras_dir = output_path / "cameras"
-            cameras_dir.mkdir(parents=True, exist_ok=True)
-            cameras_path = cameras_dir / f"{scene_name}_cameras.json"
-            with open(cameras_path, "w") as f:
-                json.dump(cameras_data, f, indent=4)
-            print(f"Saved cameras JSON to {cameras_path}")
-
-        # Save cameras as NPZ in the exact form fed to the rasterizer:
-        #   viewmats = inverse(extrinsics)  (world-to-camera, [V,4,4])
-        #   Ks       = intrinsics * diag(W, H, 1)  (pixel-space, [V,3,3])
-        # Mirrors GSplatDecoderSplattingCUDA.forward (gsplat_decoder_splatting_cuda.py:137-140).
+            self.test_save_cameras_json(batch, output_path)
         if self.test_cfg.save_cameras_npz:
-            scene_name = batch["scene"][0]
-            cameras_dir = output_path / "cameras"
-            cameras_dir.mkdir(parents=True, exist_ok=True)
-            npz_data = {"scene": scene_name}
-            for input_str in ("context", "target"):
-                view = batch[input_str]
-                extrinsics = view["extrinsics"][0]  # [V, 4, 4] cam-to-world
-                intrinsics = view["intrinsics"][0]  # [V, 3, 3] normalized
-                h, w = view["image"].shape[-2:]
-                viewmats = extrinsics.inverse()  # [V, 4, 4] world-to-cam
-                scale = intrinsics.new_tensor([[w], [h], [1]])
-                Ks = intrinsics * scale  # [V, 3, 3] pixel-space
-                npz_data[f"{input_str}_viewmats"] = viewmats.cpu().numpy()
-                npz_data[f"{input_str}_Ks"] = Ks.cpu().numpy()
-                npz_data[f"{input_str}_image_shape"] = np.array([h, w], dtype=np.int64)
-            cameras_npz_path = cameras_dir / f"{scene_name}_cameras.npz"
-            np.savez(cameras_npz_path, **npz_data)
-            print(f"Saved renderer-ready cameras NPZ to {cameras_npz_path}")
+            self.test_save_cameras_npz(batch, output_path)
 
-        self.scene_initializer.preprocessing(batch, self.train_cfg)
+        # Init phase
+        init_output = self._run_init_phase(batch, batch_idx, output_path)
 
-        # Infer Gaussians.
+        # Optimizer phase
+        optimizer_output = None
+        if self.scene_trainer.optimizer is not None:
+            try:
+                optimizer_output, scene_timing_metrics = self._run_optimizer(batch, init_output)
+            # An out-of-memory error is recoverable: free the cache and skip just this scene so the
+            # rest of the test set still runs. Any other RuntimeError -- a real bug, or a fatal CUDA
+            # error like an illegal memory access that leaves the GPU context unusable -- is left to
+            # propagate, since skipping the scene would only hide it.
+            except torch.OutOfMemoryError as e:
+                warn(f'ran out of memory before optimization started, skipping scene: {e}')
+                torch.cuda.empty_cache()
+                return
+            except SkipBatchException as e:
+                warn(f'skipping scene due to SkipBatch before optimization started: {e}')
+                return
 
-        # init
-        scene_name = batch["scene"][0]
+            # Init is already spliced into position 0 of optimizer_output lists by
+            # SceneTrainer.get_optimized_gaussians (see _insert_init_into_output).
+            self._eval_and_save(
+                self.scene_trainer.optimizer,
+                batch,
+                batch_idx,
+                optimizer_output,
+                output_path,
+                extra_scene_metrics=scene_timing_metrics,
+            )
+
+        # Post-processing phase
+        self._run_postprocess_phase(batch, batch_idx, optimizer_output, init_output, output_path)
+
+    def _should_skip_scene(self, scene_batch: BatchedExample) -> bool:
+        """True if scenes_filter excludes this scene, or skip_if_outputs_exist and metric JSONs already exist."""
+        scene_name = scene_batch['scene'][0]
+        if self.test_cfg.scenes_filter is not None and scene_name not in self.test_cfg.scenes_filter:
+            print(f"Scenes filter: {self.test_cfg.scenes_filter}")
+            print(f"Skipping scene {scene_name} (not in scenes_filter)")
+            return True
+
+        output_path = self.test_cfg.output_path
+        if output_path is None or not self.test_cfg.skip_if_outputs_exist:
+            return False
+
+        optimizer_name = (
+            self.scene_trainer.optimizer.__class__.__name__.lower()
+            if self.scene_trainer.optimizer is not None else "no_optimizer"
+        )
+        target_metric_path = output_path / optimizer_name / "metrics" / scene_name / f"target_{optimizer_name}.json"
+        context_metric_path = output_path / optimizer_name / "metrics" / scene_name / f"context_{optimizer_name}.json"
+
+        # Target views are always evaluated; context only when eval_context_views is set.
+        skip_target = target_metric_path.exists()
+        skip_context = context_metric_path.exists() or not self.test_cfg.eval_context_views
+
+        if skip_target and skip_context:
+            print(
+                f"Metrics for scene {scene_name} already exist at {target_metric_path} and {context_metric_path}. Skipping..."
+            )
+            return True
+        return False
+
+    def _run_init_phase(self, batch: BatchedExample, batch_idx: int, output_path: Path) -> InitializerOutput:
+        """Run the initializer (with full-V context + target rendering) and optionally eval+save it."""
         init_output: InitializerOutput = self.init_gaussians_and_render(
             batch,
             visualization_dump={},
             render_context=True,
             render_target=True,
             grad_enabled=False,
-            cached_data_path=Path(os.path.join("cache", "edgs", scene_name)),  # for EDGS only for now  # TODO Naame: review
         )
-
         if self.test_cfg.eval_initialization:
             print("\nEvaluating initialization...")
+            self._eval_and_save(self.scene_initializer, batch, batch_idx, init_output, output_path)
+        return init_output
 
-            # Evaluate and save initialization
-            self._eval_and_save(
-                self.scene_initializer,
-                batch,
-                batch_idx,
-                init_output,
-                output_path
-            )
+    @staticmethod
+    def _zero_first_iter_warmup(timer: Benchmarker) -> None:
+        """Zero the first optimization iteration's timing in `timer` (one-time GPU warm-up:
+        kernel JIT, cuDNN autotune, CUDA context). Zeros both the total ("iter") and render
+        ("decoder") entries so the derived update time (iter - decoder) stays consistent."""
+        times = timer.execution_times  # flushes pending CUDA events
+        for tag in ("iter", "decoder"):
+            if times.get(tag):
+                times[tag][0] = 0.0
 
-        # Optimization
-        if self.scene_trainer.optimizer is None:
-            optimizer_output = None
-        else:
-            # run optimizer
-            torch.cuda.reset_peak_memory_stats()
-            try:
-                optimizer_output = self.get_optimized_gaussians(
-                    batch,
-                    init_output,
-                    output_path=output_path / self.scene_trainer.optimizer.__class__.__name__.lower(),
-                    scene_name=scene_name,
-                    debug_dict=defaultdict(list),
-                )
-            except (torch.OutOfMemoryError, RuntimeError) as e:
-                warn('ran out of memory during optimization. Skipping scene.')
-                torch.cuda.empty_cache()
-                return None
-            except SkipBatchException as e:
-                warn(f'skipping scene due to SkipBatch during optimization: {e}')
-                return None
+    def _run_optimizer(self, batch: BatchedExample, init_output: InitializerOutput) -> tuple[OptimizerOutput, dict]:
+        """Run the optimizer for one scene; record per-scene CUDA timings + peak VRAM.
 
-            peak_vram_mb = torch.cuda.max_memory_allocated() / (1024 ** 2)
-            self.benchmarker.record("peak_vram_mb", peak_vram_mb)
+        Raises torch.OutOfMemoryError/RuntimeError on OOM and SkipBatchException on a
+        deliberate skip — the orchestrator catches both and drops the scene.
+        Returns (optimizer_output, scene_timing_metrics) where the dict is keyed by
+        peak_vram_mb / decoder_ms / optimizer_ms / optimizer_net_ms / scene_start_ms and
+        will be written into target_*.json / context_*.json by `_eval_and_save`.
+        optimizer_net = on_scene_start + all iteration steps; excludes save-every renders
+        (which happen after iter_end.record() and are therefore not in iter_time_log).
+        The first optimized scene of the pass has its first iteration zeroed as GPU warm-up.
+        """
+        scene_name = batch["scene"][0]
+        output_path = self.test_cfg.output_path
 
-            # Record per-scene timing from CUDA event logs (all in ms).
-            # optimizer_net = on_scene_start + all iteration steps. Excludes save-every renders
-            # (which happen after iter_end.record() and are therefore not in iter_time_log).
-            opt = self.scene_trainer.optimizer
-            decoder_ms = sum(opt.decoder_time_log)
-            optimizer_ms = sum(opt.optimizer_time_log)
-            optimizer_net_ms = opt.scene_start_ms + decoder_ms + optimizer_ms
-            self.benchmarker.record("decoder", decoder_ms)
-            self.benchmarker.record("optimizer", optimizer_ms)
-            self.benchmarker.record("optimizer_net", optimizer_net_ms)
-            print(
-                f"[timing] scene={scene_name} "
-                f"scene_start={opt.scene_start_ms:.0f}ms "
-                f"decoder={decoder_ms:.0f}ms "
-                f"optimizer={optimizer_ms:.0f}ms "
-                f"optimizer_net={optimizer_net_ms:.0f}ms "
-                f"peak_vram={peak_vram_mb:.0f}MB"
-            )
-            opt.decoder_time_log.clear()
-            opt.optimizer_time_log.clear()
-
-            # Collected here; written into target_*.json / context_*.json by _eval_and_save below.
-            _scene_timing_metrics = {
-                "peak_vram_mb": peak_vram_mb,
-                "decoder_ms": decoder_ms,
-                "optimizer_ms": optimizer_ms,
-                "optimizer_net_ms": optimizer_net_ms,
-                "scene_start_ms": opt.scene_start_ms,
-            }
-
-        #
-        plot_phases = []  # (label, metrics_dict) for combined plotting
-
-        if optimizer_output is not None:
-            # Init is already spliced into position 0 of optimizer_output lists by
-            # SceneTrainer.get_optimized_gaussians (see _insert_init_into_output).
-
-            # Run evaluation and saving
-            opt_metrics = self._eval_and_save(
-                self.scene_trainer.optimizer,
-                batch,
-                batch_idx,
-                optimizer_output,
-                output_path,
-                extra_scene_metrics=_scene_timing_metrics,
-            )
-            opt_label = self.scene_trainer.optimizer.__class__.__name__.lower()
-            plot_phases.append((opt_label, opt_metrics))
-
-            # updates, parameters and gradients visualizations
-            # self.debugging(optimizer_output, output_path, batch["scene"][0])
-
-        # Post-processing
-        postprocessed_output = self.test_postprocess_gaussians(
+        torch.cuda.reset_peak_memory_stats()
+        optimizer_output = self.get_optimized_gaussians(
             batch,
-            gaussians=optimizer_output.gaussian_list[-1] if optimizer_output is not None else init_output.gaussians,
-            visualization_dump={}
+            init_output,
+            output_path=output_path / self.scene_trainer.optimizer.__class__.__name__.lower(),
+            scene_name=scene_name,
+            debug_dict=defaultdict(list),
+            # Test path: if a scene fails mid-optimization, keep+score the steps that completed
+            # rather than dropping the whole scene.
+            allow_partial_on_skip=True,
         )
 
-        # Evaluate and save post-processing
-        if postprocessed_output is not None:
-            pp_metrics = self._eval_and_save(
-                self.scene_trainer.postprocess,
-                batch,
-                batch_idx,
-                postprocessed_output,
-                output_path
-            )
-            pp_label = self.scene_trainer.postprocess.__class__.__name__.lower()
-            plot_phases.append((pp_label, pp_metrics))
+        peak_vram_mb = torch.cuda.max_memory_allocated() / (1024 ** 2)
+        self.benchmarker.record("peak_vram_mb", peak_vram_mb)
 
-        # Combined metrics plot (optimizer + postprocessing)
-        if plot_phases:
-            pass
-            # self._plot_combined_metrics(
-            #     output_path=output_path,
-            #     scene_name=scene_name,
-            #     phases=plot_phases,
-            # )
+        opt = self.scene_trainer.optimizer
+        if not self._timing_warmup_done:
+            # First optimized scene of the pass: zero its first iteration (one-time GPU
+            # warm-up). The per-step time curve reads the same timer, so it stays consistent.
+            self._zero_first_iter_warmup(opt.benchmarker)
+            self._timing_warmup_done = True
+        decoder_ms = sum(opt.decoder_time_log)
+        optimizer_ms = sum(opt.optimizer_time_log)
+        optimizer_net_ms = opt.scene_start_ms + decoder_ms + optimizer_ms
+        self.benchmarker.record("decoder", decoder_ms)
+        self.benchmarker.record("optimizer", optimizer_ms)
+        self.benchmarker.record("optimizer_net", optimizer_net_ms)
+        print(
+            f"[timing] scene={scene_name} "
+            f"scene_start={opt.scene_start_ms:.0f}ms "
+            f"decoder={decoder_ms:.0f}ms "
+            f"optimizer={optimizer_ms:.0f}ms "
+            f"optimizer_net={optimizer_net_ms:.0f}ms "
+            f"peak_vram={peak_vram_mb:.0f}MB"
+        )
+
+        scene_timing_metrics = {
+            "peak_vram_mb": peak_vram_mb,
+            "decoder_ms": decoder_ms,
+            "optimizer_ms": optimizer_ms,
+            "optimizer_net_ms": optimizer_net_ms,
+            "scene_start_ms": opt.scene_start_ms,
+        }
+        return optimizer_output, scene_timing_metrics
+
+    def _run_postprocess_phase(
+            self,
+            batch: BatchedExample,
+            batch_idx: int,
+            optimizer_output: OptimizerOutput | None,
+            init_output: InitializerOutput,
+            output_path: Path,
+    ) -> None:
+        """Run optional post-processing on the final Gaussians and eval+save it."""
+        gaussians = optimizer_output.gaussian_list[-1] if optimizer_output is not None else init_output.gaussians
+        postprocessed_output = self.test_postprocess_gaussians(batch, gaussians=gaussians, visualization_dump={})
+        if postprocessed_output is not None:
+            self._eval_and_save(self.scene_trainer.postprocess, batch, batch_idx, postprocessed_output, output_path)
 
     def experimental_process_batch(self, batch: BatchedExample) -> BatchedExample:
+        """Add Gaussian noise (std=experimental_add_noise_to_images_std) to both context and target
+        images, retaining the originals under `clean_image` for evaluation."""
         noise_std = self.test_cfg.experimental_add_noise_to_images_std
         for key in ["context", "target"]:
             images = batch[key]["image"]  # [B, V, 3, H, W]
@@ -1185,13 +1210,61 @@ class MetaTrainer(LightningModule):
             batch[key]["clean_image"] = images  # keep clean images for evaluation
         return batch
 
+    def _run_eval_pipeline(
+            self,
+            batch: BatchedExample,
+            *,
+            benchmark: bool = False,
+    ) -> tuple[BatchedExample, InitializerOutput, DecoderOutput, OptimizerOutput | None]:
+        """Run the shared single-scene eval pipeline: data-shim + preprocessing, initialize,
+        render the init target view, then optionally optimize.
+
+        Returns (batch, init_output, final_target_render, optimizer_output). `batch` is the
+        shimmed batch (callers must rebind). The init target render is attached to `init_output`,
+        so when an optimizer runs, get_optimized_gaussians places it first in
+        `optimizer_output.target_render_list` (position 0), followed by the per-step renders --
+        the same layout the train and test paths use. When no optimizer runs (num_update_steps == 0,
+        which is exactly when the optimizer is None) the init render is read back from
+        `init_output.target_render`. `final_target_render` is the
+        init render when no optimizer ran, else `optimizer_output.target_render_list[-1]`.
+        When `benchmark` is True the initializer and decoder calls are timed into the shared
+        `self.benchmarker` for the test-set runtime report; validation leaves it False so its
+        timings don't pollute that report. Raises SkipBatchException if the initializer or
+        optimizer signals a skip.
+        """
+        batch = self.initializer_data_shim(batch)
+        self.scene_initializer.eval_preprocessing(batch, self.train_cfg)
+        assert batch["target"]["image"].shape[0] == 1
+
+        depth_mode = 'depth' if self.train_cfg.eval_render_depth or self.train_cfg.viz_render_depth else None
+        # Initialize and render the target view. Kept on the GPU (to_cpu=False) since it feeds the
+        # optimizer below and is placed first in target_render_list. The init render's decoder timer
+        # is gated on `benchmark` so it only contributes to the test-set runtime report.
+        init_output = self.init_gaussians_and_render(
+            batch,
+            visualization_dump={},
+            render_context=False,
+            render_target=True,
+            grad_enabled=False,
+            depth_mode=depth_mode,
+            benchmark_decoder=benchmark,
+            to_cpu=False,
+        )
+
+        optimizer_output = None
+        final_target_render = init_output.get_render("target")
+        if self.scene_optimizer is not None:
+            # Total optimization time. This includes the renders interleaved between update steps;
+            # the per-iteration decoder/update split lives in the optimizer's own CUDA-event logs.
+            with self.benchmarker.time("optimization", disable=not benchmark):
+                optimizer_output = self.get_optimized_gaussians(batch, init_output)
+            final_target_render = optimizer_output.target_render_list[-1]
+
+        return batch, init_output, final_target_render, optimizer_output
+
     @torch.no_grad()
     @rank_zero_only
     def validation_step(self, scene_batch: BatchedExample, batch_idx: int):
-        scene_batch: BatchedExample = self.initializer_data_shim(scene_batch)
-
-        self.scene_initializer.preprocessing(scene_batch, self.train_cfg)
-
         if self.global_rank == 0:
             print(
                 f"validation step {self.global_step}; "
@@ -1200,49 +1273,74 @@ class MetaTrainer(LightningModule):
                 f"target = {scene_batch['target']['index'].tolist()}"
             )
 
-        # Render Gaussians.
-        b, v, _, h, w = scene_batch["context"]["image"].shape
-        assert b == 1
-
+        # Running evaluation
         try:
-            initializer_output = self.get_init_gaussians(scene_batch, is_training=False)
+            scene_batch, initializer_output, last_output, _ = self._run_eval_pipeline(scene_batch)
         except SkipBatchException as e:
-            warn(f"Skipping validation for scene {scene_batch['scene'][0]} due to error in initialization: {e}")
+            warn(f"Skipping validation for scene {scene_batch['scene'][0]} due to error: {e}")
             return
 
-        output_softmax = self.scene_decoder.forward_target(
-            initializer_output.gaussians, scene_batch, (h, w),
-            depth_mode='depth' if self.train_cfg.eval_render_depth or self.train_cfg.viz_render_depth else None,
+
+        # RGB metrics.
+        last_rgb = last_output.color[0]
+        last_rgb = last_rgb.to(scene_batch["target"]["image"].device)
+        rgb_gt = scene_batch["target"]["image"][0]
+        scores = self._score_renders([last_rgb], rgb_gt, metrics=["psnr", "ssim"])[0]
+        self.log("val/psnr", scores["psnr"])
+        self.log("val/ssim", scores["ssim"])
+
+        # Depth
+        self._log_validation_depth_viz(scene_batch, initializer_output, last_output)
+
+
+        # Summary image
+        # Subsample context images when there are too many to fit comfortably side-by-side
+        n_ctx = scene_batch["context"]["image"][0].shape[0]
+        stride = 4 if n_ctx > 16 else (2 if n_ctx > 8 else 1)
+        viz_input = scene_batch["context"]["image"][0][::stride]
+        tag = "Context" if stride == 1 else f"Context (1/{stride})"
+
+        comparison = self._build_comparison_image(
+            initializer_output, viz_input, tag, rgb_gt, last_rgb, stride
         )
 
-        # refine
-        debug_dict = {}
-        if self.scene_optimizer is not None:
-            try:
-                optimizer_output = self.get_optimized_gaussians(
-                    scene_batch,
-                    initializer_output,
-                    debug_dict=debug_dict
-                )
-            except SkipBatchException as e:
-                warn(f"Skipping validation for scene {scene_batch['scene'][0]} due to error: {e}")
-                return
-            render_output = optimizer_output.target_render_list
-            output_softmax = render_output[-1]
+        self.logger.log_image(
+            "comparison",
+            [prep_image(add_border(comparison))],
+            step=self.global_step,
+            caption=scene_batch["scene"],
+        )
 
-        rgb_softmax = output_softmax.color[0]
+        if not self.train_cfg.no_log_projections:
+            # Render projections and construct projection image.
+            projections = hcat(
+                *render_projections(
+                    initializer_output.gaussians,
+                    256,
+                    extra_label="(Prediction)",
+                )[0]
+            )
+            self.logger.log_image(
+                "projection",
+                [prep_image(add_border(projections))],
+                step=self.global_step,
+            )
 
-        # Move prediction back to device
-        rgb_softmax = rgb_softmax.to(scene_batch["target"]["image"].device)
+        # Run video validation step.
+        if not self.train_cfg.no_viz_video:
+            self.render_video_interpolation(scene_batch)
+            if self.train_cfg.extended_visualization:
+                self.render_video_interpolation_exaggerated(scene_batch)
 
-        # Compute validation metrics.
-        rgb_gt = scene_batch["target"]["image"][0]
-        for tag, rgb in zip(("val",), (rgb_softmax,)):
-            psnr = compute_psnr(rgb_gt, rgb)
-            self.log(f"val/psnr_{tag}", psnr)
-            ssim = compute_ssim(rgb_gt, rgb)
-            self.log(f"val/ssim_{tag}", ssim)
-
+    def _log_validation_depth_viz(
+            self,
+            scene_batch: BatchedExample,
+            initializer_output: InitializerOutput,
+            last_output: DecoderOutput,
+    ) -> None:
+        """Log the standalone validation depth images: the initializer's predicted context
+        depth ("depth", when viz_depth_separate) and the final target-render depth
+        ("render_depth", when eval_render_depth/viz_render_depth)."""
         # viz depth
         if initializer_output.depths is not None and self.train_cfg.viz_depth_separate:
             # only visualize predicted depth
@@ -1289,7 +1387,7 @@ class MetaTrainer(LightningModule):
 
         # viz rendered depth
         if self.train_cfg.eval_render_depth or self.train_cfg.viz_render_depth:
-            render_depth = output_softmax.depth[0]  # [V, H, W]
+            render_depth = last_output.depth[0]  # [V, H, W]
             input_images = scene_batch["target"]["image"][0]  # [N, 3, H, W]
             concat = self._make_depth_viz(1.0 / render_depth.clamp(min=0.01, max=1000.), input_images)
 
@@ -1300,65 +1398,20 @@ class MetaTrainer(LightningModule):
                 caption=scene_batch["scene"],
             )
 
-        # Subsample context images when there are too many to fit comfortably side-by-side
-        n_ctx = scene_batch["context"]["image"][0].shape[0]
-        stride = 4 if n_ctx > 16 else (2 if n_ctx > 8 else 1)
-        viz_input = scene_batch["context"]["image"][0][::stride]
-        tag = "Context" if stride == 1 else f"Context (1/{stride})"
-
-        comparison = self._build_comparison_image(
-            initializer_output, viz_input, tag, rgb_gt, rgb_softmax, stride
-        )
-
-        self.logger.log_image(
-            "comparison",
-            [prep_image(add_border(comparison))],
-            step=self.global_step,
-            caption=scene_batch["scene"],
-        )
-
-        if not self.train_cfg.no_log_projections:
-            # Render projections and construct projection image.
-            projections = hcat(
-                *render_projections(
-                    initializer_output.gaussians,
-                    256,
-                    extra_label="(Prediction)",
-                )[0]
-            )
-            self.logger.log_image(
-                "projection",
-                [prep_image(add_border(projections))],
-                step=self.global_step,
-            )
-
-            # Draw cameras.
-            # cameras = hcat(*render_cameras(batch, 256))
-            # self.logger.log_image(
-            #     "cameras", [prep_image(add_border(cameras))], step=self.global_step
-            # )
-
-        # Run video validation step.
-        if not self.train_cfg.no_viz_video:
-            self.render_video_interpolation(scene_batch)
-            # self.render_video_wobble(batch)
-            if self.train_cfg.extended_visualization:
-                self.render_video_interpolation_exaggerated(scene_batch)
-
     def _build_comparison_image(
             self,
             initializer_output: InitializerOutput,
             viz_input: Tensor,
             tag: str,
             rgb_gt: Tensor,
-            rgb_softmax: Tensor,
+            rgb_pred: Tensor,
             stride: int,
     ) -> Tensor:
         """Build the side-by-side comparison image for validation logging."""
         cols = [
             add_label(vcat(*viz_input), tag),
             add_label(vcat(*rgb_gt), "Target (Ground Truth)"),
-            add_label(vcat(*rgb_softmax), "Target (Prediction)"),
+            add_label(vcat(*rgb_pred), "Target (Prediction)"),
         ]
 
         if not self.train_cfg.viz_depth_separate and initializer_output.depths is not None:
@@ -1391,252 +1444,247 @@ class MetaTrainer(LightningModule):
 
     @rank_zero_only
     def run_full_test_sets_eval(self) -> None:
-        """Run evaluation on the full test set during training (rank-zero only). Logs PSNR/SSIM to wandb table."""
+        """Run evaluation on the full test set during training (rank-zero only).
+
+        Iterates the test dataloader, accumulates per-iteration RGB metrics (psnr/ssim/lpips)
+        and optional depth metrics (init-depth + render-depth) into scores_dict, then logs:
+          (1) a per-meta-step inner-iteration PSNR series for the wandb dashboard,
+          (2) the averaged metrics under test/<metric>,
+          (3) the averaged initializer/decoder/optimization runtime in ms (first
+              eval_time_skip_steps batches are excluded as warmup), and
+          (4) a per-inner-step PSNR summary line + total wall-clock.
+        """
         print(
-            f"Validation step at global step {self.global_step}. Running evaluation on {self.train_cfg.eval_data_length} test sets...")
+            f"Validation step at global step {self.global_step}. "
+            f"Running evaluation on {self.train_cfg.eval_data_length} test sets..."
+        )
         start_t = time.time()
 
-        pred_depths = None
-        depth_gt = None
-
-        full_testsets = self.trainer.datamodule.test_dataloader(
-            dataset_cfg=self.eval_data_cfg
-        )
-        scores_dict = defaultdict(lambda: defaultdict(list))
-
+        full_testsets = self.trainer.datamodule.test_dataloader(dataset_cfg=self.eval_data_cfg)
+        scores_dict = defaultdict(list)
         self.benchmarker.clear_history()
-        time_skip_first_n_steps = min(
-            self.train_cfg.eval_time_skip_steps, len(full_testsets)
-        )
-        time_skip_steps_dict = {"encoder": 0, "decoder": 0}
+
+        time_skip_first_n_steps = min(self.train_cfg.eval_time_skip_steps, len(full_testsets))
+        time_skip_steps_dict = {"initializer": 0, "decoder": 0, "optimization": 0}
+
         for batch_idx, batch in tqdm(
                 enumerate(full_testsets),
                 total=min(len(full_testsets), self.train_cfg.eval_data_length),
         ):
             if batch_idx >= self.train_cfg.eval_data_length:
                 break
+            self._eval_one_test_batch(
+                batch, batch_idx, scores_dict, time_skip_steps_dict, time_skip_first_n_steps,
+            )
 
-            batch = self.transfer_batch_to_device(batch, self.device, dataloader_idx=0)
-            batch = self.on_after_batch_transfer(batch, dataloader_idx=batch_idx)
-            batch = self.initializer_data_shim(batch)
+        self._log_inner_iteration_table(scores_dict)
+        self._summarize_test_scores(scores_dict, time_skip_steps_dict, start_t)
 
-            # use gt depth range instead of a fixed one
-            self.scene_initializer.preprocessing(batch, self.train_cfg)
+    def _eval_one_test_batch(
+            self,
+            batch,
+            batch_idx: int,
+            scores_dict: dict,
+            time_skip_steps_dict: dict,
+            time_skip_first_n_steps: int,
+    ) -> None:
+        """Evaluate one test-set batch and append metrics into `scores_dict` in-place.
 
-            # Render Gaussians.
-            b, v, _, h, w = batch["target"]["image"].shape
-            assert b == 1
-            if batch_idx < time_skip_first_n_steps:
-                time_skip_steps_dict["encoder"] += 1
-                time_skip_steps_dict["decoder"] += v
+        Counts initializer/decoder calls into `time_skip_steps_dict` only for the warmup window
+        (`batch_idx < time_skip_first_n_steps`) so the final timing summary can trim them.
+        Skips the batch on SkipBatchException from initialization or optimization.
+        """
+        batch = self.transfer_batch_to_device(batch, self.device, dataloader_idx=0)
+        batch = self.on_after_batch_transfer(batch, dataloader_idx=batch_idx)
 
-            with self.benchmarker.time("encoder"):
-                init_output = self.get_init_gaussians(batch, is_training=False)
+        v = batch["target"]["image"].shape[1]
+        if batch_idx < time_skip_first_n_steps:
+            time_skip_steps_dict["initializer"] += 1
+            time_skip_steps_dict["decoder"] += v
+            time_skip_steps_dict["optimization"] += 1
 
-            with self.benchmarker.time("decoder", num_calls=v):
-                output_probabilistic = self.scene_decoder.forward_target(
-                    init_output.gaussians, batch, (h, w),
-                    depth_mode='depth' if self.train_cfg.eval_render_depth or self.train_cfg.viz_render_depth else None,
-                )
+        try:
+            batch, init_output, final_render, optimizer_output = self._run_eval_pipeline(
+                batch, benchmark=True)
+        except SkipBatchException as e:
+            warn(f'Skipping batch due to SkipBatch: {e}')
+            return
 
-            init_rgb = output_probabilistic.color[0]
+        # RGBs
+        # target_render_list holds the init render first (position 0), then one render per
+        # optimizer step. When no optimizer runs (num_update_steps == 0) there is no list, so
+        # score the init render alone at step 0.
+        if optimizer_output is not None:
+            rgbs = [render.color[0] for render in optimizer_output.target_render_list]
+            steps = self.scene_optimizer.save_every.get_iterations(len(rgbs))
+        else:
+            rgbs = [init_output.target_render.color[0]]
+            steps = [0]
 
-            # refine
-            if self.scene_optimizer is not None:
-                try:
-                    optimizer_output = self.get_optimized_gaussians(batch, init_output)
-                except SkipBatchException as e:
-                    warn(f'Skipping batch due to SkipBatch during optimization: {e}')
-                    continue
-                render_output = optimizer_output.target_render_list
-                output_probabilistic = render_output[-1]
+        rgb_gt = batch["target"]["image"][0]
+        self._accumulate_rgb_metrics(rgbs, rgb_gt, steps, scores_dict)
+        
+        # Depths
+        # Two distinct depth metrics: init-depth scores the initializer's context-view
+        # prediction (pred_depths); render-depth scores the final target render's depth
+        # (init's target render, or the optimizer's last render).
+        pred_depths = init_output.depths
+        depth_gt = batch["context"].get("depth")
+        if pred_depths is not None and depth_gt is not None and depth_gt.max() > 0:
+            self._accumulate_init_depth_metrics(pred_depths, depth_gt, batch, scores_dict)
+        target_depth_gt = batch["target"].get("depth")
+        if self.train_cfg.eval_render_depth and target_depth_gt is not None and target_depth_gt.max() > 0:
+            self._accumulate_render_depth_metrics(final_render, batch, scores_dict)
 
-            rgbs = [init_rgb]
-            if self.scene_trainer_cfg.num_update_steps > 0:
-                rgbs += [render.color[0] for render in render_output]
-            tags = ["probabilistic"] * len(rgbs)
+    @staticmethod
+    def _score_renders(
+            renders: list[Tensor],
+            rgb_gt: Tensor,
+            metrics: list[str],
+            iter_batch_size: int = -1,
+    ) -> list[dict[str, float]]:
+        """Compute RGB metrics for each render in `renders` against `rgb_gt`.
 
-            if self.train_cfg.eval_deterministic:
-                gaussians_deterministic = self.encoder(
-                    batch["context"],
-                    self.global_step,
-                    deterministic=True,
-                )
-                output_deterministic = self.scene_decoder.forward(
-                    gaussians_deterministic,
-                    batch["target"]["extrinsics"],
-                    batch["target"]["intrinsics"],
-                    batch["target"]["near"],
-                    batch["target"]["far"],
-                    (h, w),
-                )
-                rgbs.append(output_deterministic.color[0])
-                tags.append("deterministic")
+        Returns a list parallel to `renders`; each entry maps metric name to a Python float.
+        `lpips` is unpacked into separate `alex_lpips`/`vgg_lpips` entries so callers can
+        treat all metrics uniformly.
+        """
+        per_render: list[dict[str, float]] = []
+        for rgb in renders:
+            raw = compute_rgb_metrics(rgb, rgb_gt, metrics=metrics, iter_batch_size=iter_batch_size)
+            flat: dict[str, float] = {}
+            for name, score in raw.items():
+                if name == "lpips":
+                    alex, vgg = score
+                    flat["alex_lpips"] = alex.item()
+                    flat["vgg_lpips"] = vgg.item()
+                else:
+                    flat[name] = score.item()
+            per_render.append(flat)
+        return per_render
 
-            # Compute validation metrics.
-            rgb_gt = batch["target"]["image"][0]
-            if self.scene_optimizer is not None:
-                steps = self.scene_optimizer.save_every.get_iterations(len(rgbs))
-            else:
-                steps = [0]
-            for i, (tag, rgb) in enumerate(zip(tags, rgbs)):
-                # Move prediction back to device
-                rgb = rgb.to(batch["target"]["image"].device)
-                metric_scores: dict = compute_rgb_metrics(
-                    rgb, rgb_gt,
-                    metrics=["psnr", "ssim", "lpips"],
-                    iter_batch_size=-1,
-                )
-                for name, score in metric_scores.items():
-                    if name == "lpips":
-                        # tuple of (alex, vgg)
-                        scores_dict[f"alex_lpips_{steps[i]}"][tag].append(score[0].item())
-                        scores_dict[f"vgg_lpips_{steps[i]}"][tag].append(score[1].item())
-                    else:
-                        scores_dict[f"{name}_{steps[i]}"][tag].append(score.item())
-                    # log the last step metrics to compare between runs
-                    if i == len(rgbs) - 1:
-                        if name == "lpips":
-                            # tuple of (alex, vgg)
-                            scores_dict[f"alex_lpips"][tag].append(score[0].item())
-                            scores_dict[f"vgg_lpips"][tag].append(score[1].item())
-                        else:
-                            scores_dict[f"{name}"][tag].append(score.item())
+    def _accumulate_rgb_metrics(self, rgbs: list, rgb_gt, steps: list[int], scores_dict: dict) -> None:
+        """For each refinement checkpoint k, compute psnr/ssim/lpips(alex,vgg) and append into
+        scores_dict[f"{metric}_{steps[k]}"]. Also mirror the last step's value under the
+        unsuffixed `metric` key for between-run comparison."""
+        per_render = self._score_renders(rgbs, rgb_gt, metrics=["psnr", "ssim", "lpips"])
+        for i, scores in enumerate(per_render):
+            is_last = (i == len(per_render) - 1)
+            for name, val in scores.items():
+                scores_dict[f"{name}_{steps[i]}"].append(val)
+                if is_last:
+                    scores_dict[name].append(val)
 
-            # compute depth metrics
-            if pred_depths is not None and depth_gt is not None and depth_gt.max() > 0:
-                assert pred_depths is not None and depth_gt is not None
+    @staticmethod
+    def _compute_init_depth_metrics(pred_depths, depth_gt, batch) -> dict[str, float]:
+        """abs_rel / rmse / a1 between the initializer's context-view depth prediction and GT.
+        Depth is upsampled to context-image resolution to match GT if the initializer downsampled."""
+        pred_depths = pred_depths[0]  # [V, H, W]
+        if pred_depths.shape[1:] != batch["context"]["image"].shape[-2:]:
+            pred_depths = F.interpolate(
+                pred_depths.unsqueeze(1),
+                size=batch["context"]["image"].shape[-2:],
+                mode="bilinear",
+                align_corners=True,
+            ).squeeze(1)
+        depth_gt = depth_gt[0]  # [V, H, W]
+        near = batch["context"]["near"][..., None, None][0]  # [V, 1, 1]
+        far = batch["context"]["far"][..., None, None][0]
+        valid = (depth_gt >= near) & (depth_gt <= far)
 
-                pred_depths = pred_depths[0]  # [V, H, W]
+        all_metrics = compute_depth_errors(
+            depth_gt[valid].detach().cpu().numpy(),
+            pred_depths[valid].detach().cpu().numpy(),
+        )
+        return {"abs_rel": all_metrics[0], "rmse": all_metrics[2], "a1": all_metrics[4]}
 
-                # gaussian downsample
-                if pred_depths.shape[1:] != batch["context"]["image"].shape[-2:]:
-                    pred_depths = F.interpolate(
-                        pred_depths.unsqueeze(1),
-                        size=batch["context"]["image"].shape[-2:],
-                        mode="bilinear",
-                        align_corners=True,
-                    ).squeeze(1)
+    def _accumulate_init_depth_metrics(self, pred_depths, depth_gt, batch, scores_dict: dict) -> None:
+        """Append init-depth metrics (abs_rel/rmse/a1) for one scene into scores_dict."""
+        for name, val in self._compute_init_depth_metrics(pred_depths, depth_gt, batch).items():
+            scores_dict[name].append(val)
 
-                depth_gt = depth_gt[0]  # [V, H, W]
+    @staticmethod
+    def _accumulate_render_depth_metrics(target_render, batch, scores_dict: dict) -> None:
+        """render_abs_rel / render_rmse / render_a1 between the final target-render depth and GT.
 
-                near = batch["context"]["near"][...,
-                None, None][0]  # [V, 1, 1]
-                far = batch["context"]["far"][..., None, None][0]  # [V, 1, 1]
+        The render depth comes from whichever module produced the final target render: the
+        initializer's target render, or the optimizer's last step if an optimizer ran.
+        
+        (`pred_depths` is the initializer's context-view prediction)
+        """
+        render_depth = target_render.depth[0]  # [V, H, W]
+        depth_gt = batch["target"]["depth"][0]  # [V, H, W]
+        near = batch["target"]["near"][..., None, None][0]  # [V, 1, 1]
+        far = batch["target"]["far"][..., None, None][0]
+        valid = (depth_gt >= near) & (depth_gt <= far)
 
-                valid = (depth_gt >= near) & (depth_gt <= far)
+        all_metrics = compute_depth_errors(
+            depth_gt[valid].detach().cpu().numpy(),
+            render_depth[valid].detach().cpu().numpy(),
+        )
+        scores_dict["render_abs_rel"].append(all_metrics[0])
+        scores_dict["render_rmse"].append(all_metrics[2])
+        scores_dict["render_a1"].append(all_metrics[4])
 
-                all_metrics = compute_depth_errors(depth_gt[valid].detach().cpu().numpy(),
-                                                   pred_depths[valid].detach().cpu().numpy())
-                scores_dict["abs_rel"]["probabilistic"].append(all_metrics[0])
-                scores_dict["rmse"]["probabilistic"].append(all_metrics[2])
-                scores_dict["a1"]["probabilistic"].append(all_metrics[4])
+    def _log_inner_iteration_table(self, scores_dict: dict) -> None:
+        """Log a per-meta-step PSNR-vs-inner-iteration series under test/psnr/meta_<global_step>,
+        so wandb can render the optimization trajectory for the current meta step.
 
-            # compute rendered depth metrics
-            if self.train_cfg.eval_render_depth:
-                render_depth = output_probabilistic.depth
-                target_depth_gt = batch["target"]["depth"]
+        Picks the step-suffixed psnr_<k> entries out of scores_dict and logs (inner_step, mean psnr).
+        """
+        if not (hasattr(self.logger, 'experiment') and self.logger.experiment is not None):
+            return
 
-                pred_depths = render_depth[0]  # [V, H, W]
-                depth_gt = target_depth_gt[0]  # [V, H, W]
+        # Step-suffixed metrics look like "psnr_0", "psnr_1", ...; collect (inner_step, mean psnr).
+        series = []
+        for score_tag, scores in scores_dict.items():
+            if '_' not in score_tag or not score_tag.split('_')[-1].isdigit():
+                continue
+            metric_name, step_str = score_tag.rsplit('_', 1)
+            if metric_name != "psnr":
+                continue
+            if scores:
+                series.append((int(step_str), sum(scores) / len(scores)))
 
-                near = batch["target"]["near"][..., None, None][0]  # [V, 1, 1]
-                far = batch["target"]["far"][..., None, None][0]  # [V, 1, 1]
+        if len(series) <= 1:
+            return
 
-                valid = (depth_gt >= near) & (depth_gt <= far)
+        try:
+            run = self.logger.experiment
+            run.define_metric("inner_iteration")
+            run.define_metric(f"test/psnr/meta_{self.global_step}", step_metric="inner_iteration")
+            for inner_step, value in series:
+                run.log({
+                    "inner_iteration": inner_step,
+                    f"test/psnr/meta_{self.global_step}": value,
+                })
+        except Exception as e:
+            warn(f"Could not create automatic charts: {e}")
 
-                all_metrics = compute_depth_errors(depth_gt[valid].detach().cpu().numpy(),
-                                                   pred_depths[valid].detach().cpu().numpy())
+    def _summarize_test_scores(self, scores_dict: dict, time_skip_steps_dict: dict, start_t: float) -> None:
+        """Average each metric across batches, log under test/<metric>, log per-tag avg runtimes
+        (trimming the first time_skip_steps_dict[tag] entries as warmup), and print the per-step
+        PSNR summary + total wall-clock."""
+        for score_tag, cur_scores in scores_dict.items():
+            if len(cur_scores) > 0:
+                self.log(f"test/{score_tag}", sum(cur_scores) / len(cur_scores))
 
-                scores_dict["render_abs_rel"]["probabilistic"].append(all_metrics[0])
-                scores_dict["render_rmse"]["probabilistic"].append(all_metrics[2])
-                scores_dict["render_a1"]["probabilistic"].append(all_metrics[4])
-
-        # summarise scores and log to logger
-        # Create wandb table for inner iteration visualization
-        # For now, log only psnr
-        if hasattr(self.logger, 'experiment') and self.logger.experiment is not None:
-            # Extract metrics that have step numbers (e.g., "psnr_0", "psnr_1", etc.)
-            inner_iteration_data = []
-            for score_tag, methods in scores_dict.items():
-                # Check if this is a step-specific metric (e.g., "psnr_0", "psnr_1", etc.)
-                if '_' in score_tag and score_tag.split('_')[-1].isdigit():
-                    metric_name, step_str = score_tag.rsplit('_', 1)
-                    inner_step = int(step_str)
-
-                    if metric_name not in ["psnr"]:
-                        continue
-
-                    for method_tag, cur_scores in methods.items():
-                        if len(cur_scores) > 0:
-                            cur_mean = sum(cur_scores) / len(cur_scores)
-                            inner_iteration_data.append({
-                                'meta_iteration': self.global_step,
-                                'inner_iteration': inner_step,
-                                'metric_name': metric_name,
-                                'method': method_tag,
-                                'value': cur_mean
-                            })
-
-            # Log the table if we have inner iteration data
-            if inner_iteration_data:
-                try:
-                    # Rewrite the chart (wandb cannot append to the current figure (?))
-                    df = pd.DataFrame(inner_iteration_data)
-                    df["meta_iteration_str"] = df["meta_iteration"].astype(str)
-                    metric_to_plot = "psnr"
-                    df_metric = df[df["metric_name"] == metric_to_plot]
-
-                    table = wandb.Table(dataframe=df_metric)
-
-                    # self.logger.experiment.log({f"{metric_to_plot}_line": wandb.plot.line(
-                    #     table,
-                    #     x="inner_iteration",
-                    #     y="value",
-                    #     title=f"{metric_to_plot} per inner iteration",
-                    #     stroke="meta_iteration_str",
-                    # )})
-
-                    # Plot psnr for current meta iteration in a separate chart
-                    # run = self.logger.experiment
-                    current_meta = self.global_step
-
-                    df_current = df_metric[df_metric["meta_iteration"] == current_meta]
-
-                    if len(df_current) > 1:
-                        run = self.logger.experiment
-                        run.define_metric("inner_iteration")
-                        run.define_metric(f"test/psnr/meta_{current_meta}", step_metric="inner_iteration")
-                        for _, row in df_current.iterrows():
-                            run.log({
-                                "inner_iteration": row["inner_iteration"],
-                                f"test/psnr/meta_{current_meta}": row["value"],
-                            })
-
-                except Exception as e:
-                    warn(f"Could not create automatic charts: {e}")
-                    # Fallback: just log the table
-                    pass
-
-        # Keep the original logging
-        for score_tag, methods in scores_dict.items():
-            for method_tag, cur_scores in methods.items():
-                if len(cur_scores) > 0:
-                    cur_mean = sum(cur_scores) / len(cur_scores)
-                    self.log(f"test/{score_tag}", cur_mean)
-        # summarise run time
         for tag, times in self.benchmarker.execution_times.items():
-            times = times[int(time_skip_steps_dict[tag]):]
-            print(f"{tag}: {len(times)} calls, avg. {np.mean(times)} seconds per call")
+            times = times[int(time_skip_steps_dict.get(tag, 0)):]  # drop the warmup calls
+            if len(times) == 0:
+                continue
+            print(f"{tag}: {len(times)} calls, avg. {np.mean(times):.1f} ms per call")
             self.log(f"test/runtime_avg_{tag}", np.mean(times))
         self.benchmarker.clear_history()
 
         overall_eval_time = time.time() - start_t
-        psnr_list = [scores_dict[f"psnr_{i}"]["probabilistic"] for i in
-                     range(self.scene_trainer_cfg.num_update_steps + 1)]
-        psnr_list = [sum(pnsr) / len(pnsr) for pnsr in psnr_list if len(pnsr) > 0]
-        psnr_str = ", ".join(f"psnr_{i}: {np.mean(pnsr):.3f}" for i, pnsr in enumerate(psnr_list))
-        example_num = len(scores_dict['psnr_0']['probabilistic'])
+        # Keep the step index i tied to its psnr_<i> label; skip steps that recorded no scores.
+        psnr_str = ", ".join(
+            f"psnr_{i}: {sum(scores) / len(scores):.3f}"
+            for i in range(self.scene_trainer_cfg.num_update_steps + 1)
+            if (scores := scores_dict[f"psnr_{i}"])
+        )
+        example_num = len(scores_dict['psnr_0'])
         print(f"Eval total time cost: {overall_eval_time:.3f}s, {psnr_str}, example_num: {example_num} ")
         self.log("test/runtime_all", overall_eval_time)
 
@@ -1738,8 +1786,9 @@ class MetaTrainer(LightningModule):
         elif isinstance(module, (Optimizer, PostProcessing3DGS)):
             nr_gaussians_log = module.nr_gaussians_log
             nr_nonzero_grads_log = module.nr_nonzero_grad_log
+            # The one-time GPU warm-up is already zeroed at its source (the first optimized
+            # scene's first iteration, in _run_optimizer), so the timer is read as-is here.
             iter_time_log = module.iter_time_log
-            iter_time_log[0] = 0.0
         else:
             raise ValueError(f"Unknown module type: {type(module)}")
 
@@ -1747,41 +1796,34 @@ class MetaTrainer(LightningModule):
         output_dict = self.test_step_outputs_context if input_str == "context" else self.test_step_outputs_target
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        for i, step in tqdm(enumerate(iterations), desc=f"Evaluating {input_str}", total=len(iterations)):
+        renders = [renders_list[i].color[0] for i in range(len(iterations))]  # each (V, 3, H, W)
+        per_render = self._score_renders(
+            renders, rgb_gt,
+            metrics=self.test_cfg.compute_scores_metrics,
+            iter_batch_size=self.test_cfg.metrics_batch_size,
+        )
+
+        for i, nr_iter in tqdm(enumerate(iterations), desc=f"Evaluating {input_str}", total=len(iterations)):
             is_last = (i == len(iterations) - 1)
-            nr_iter = iterations[i]
             # j: index into per-step logs; last step uses nr_iter-1 because logs are 0-indexed up to nr_iter
             j = nr_iter - 1 if is_last else nr_iter
-            iter_rgb = renders_list[i].color[0]  # (V, 3, H, W)
+            scores = dict(per_render[i])
 
-            scores: dict = compute_rgb_metrics(
-                iter_rgb,
-                rgb_gt,
-                metrics=self.test_cfg.compute_scores_metrics,
-                iter_batch_size=self.test_cfg.metrics_batch_size,
-            )
-
-            if nr_gaussians_log is not None:
+            if nr_gaussians_log:
                 assert j <= len(nr_gaussians_log), f"{j}, {len(nr_gaussians_log)}"
-                scores["gaussians"] = torch.tensor(nr_gaussians_log[j])
+                scores["gaussians"] = nr_gaussians_log[j]
 
-            if nr_nonzero_grads_log is not None and nr_nonzero_grads_log:
+            if nr_nonzero_grads_log:
                 assert j <= len(nr_nonzero_grads_log), f"{j}, {len(nr_nonzero_grads_log)}"
-                scores["nonzero_grads"] = torch.tensor(nr_nonzero_grads_log[j])
+                scores["nonzero_grads"] = nr_nonzero_grads_log[j]
 
-            if iter_time_log is not None:
+            if iter_time_log:
                 assert j <= len(iter_time_log), f"{j}, {len(iter_time_log)}"
-                scores["time"] = torch.tensor(sum(iter_time_log[:j + 1]))
+                scores["time"] = sum(iter_time_log[:j + 1])
 
-            for name, score in scores.items():
-                if name == "lpips":
-                    output_dict[f"{module_name}_alex_lpips"][-1].append(score[0].item())
-                    output_dict[f"{module_name}_vgg_lpips"][-1].append(score[1].item())
-                else:
-                    output_dict[f"{module_name}_{name}"][-1].append(score.item())
+            for name, val in scores.items():
+                output_dict[f"{module_name}_{name}"][-1].append(val)
             output_dict[f"{module_name}_iterations"][-1].append(nr_iter)
-
-            del iter_rgb
 
         # Save per-scene metrics to JSON
         last_scene_metrics = {key: vals[-1] for key, vals in output_dict.items()}
@@ -1801,8 +1843,8 @@ class MetaTrainer(LightningModule):
             output: OptimizerOutput | InitializerOutput,
             output_path: Path,
             extra_scene_metrics: dict | None = None,
-    ) -> dict:
-        """Evaluate and save results. Returns collected metrics dict (keyed by module_name_metric)."""
+    ) -> None:
+        """Evaluate and save renders/depths/scores for one module's output (init / optimizer / postprocess)."""
         module_name = module.__class__.__name__.lower()
 
         output_path = CustomPath(output_path / module_name)
@@ -1843,6 +1885,16 @@ class MetaTrainer(LightningModule):
             else:
                 raise ValueError(f"Unknown output type: {type(output)}")
 
+        # Score the initializer's predicted context-view depth against the GT depth (initialization
+        # quality, one value per scene).
+        if isinstance(module, Initializer) and self.test_cfg.compute_scores:
+            pred_depths = output.depths
+            depth_gt = batch["context"].get("depth")
+            if pred_depths is not None and depth_gt is not None and depth_gt.max() > 0:
+                for name, val in self._compute_init_depth_metrics(pred_depths, depth_gt, batch).items():
+                    # one row per scene (length-1, like the init's other per-scene metrics)
+                    self.test_step_outputs_context[f"{module_name}_{name}"].append([float(val)])
+
         input_strs = ["target"]
         if self.test_cfg.eval_context_views:
             input_strs.insert(0, "context")
@@ -1850,8 +1902,19 @@ class MetaTrainer(LightningModule):
         depth_vmin, depth_vmax = self._compute_depth_range(output, input_strs, module)
         error_vmax = self._compute_error_vmax(output, input_strs, module, batch)
 
+        # Save the initializer's predicted input-view (context) depth — distinct from the rendered
+        # depth saved in the loop below. Only the initializer carries a predicted depth.
+        if (self.test_cfg.save_init_pred_depth and isinstance(output, InitializerOutput)
+                and output.depths is not None):
+            ctx_indices = batch["context"]["index"][0]
+            self.test_save_pred_depth(output.depths[0], ctx_indices, output_path, scene_name, "context",
+                                      vmin=depth_vmin, vmax=depth_vmax)
+
         for input_str in input_strs:
-            indices = batch[input_str]["index"][0]  # (V,)  # TODO Naama: bug when using opt bs > 0
+            # Full-V frame indices for filename labelling. Safe to use even when
+            # opt_batch_size < V because Optimizer._save_post_update_renders always
+            # renders the full V views at test time.
+            indices = batch[input_str]["index"][0]  # (V,)
             renders_list, iterations = self._get_renders_list(output, input_str, module)
             if renders_list is None:
                 continue
@@ -1890,36 +1953,6 @@ class MetaTrainer(LightningModule):
             if self.test_cfg.save_gt_depth and depth_gt is not None:
                 self.test_save_gt_depth(depth_gt, indices, output_path, scene_name, input_str,
                                         vmin=depth_vmin, vmax=depth_vmax)
-
-            # save video
-            # TODO Naama: reorganize video rendering
-            # Note: when video mode is enabled this returns early, skipping score computation.
-            if module is not None and self.test_cfg.save_video and isinstance(output, OptimizerOutput):
-                # Generate only for the first view in the batch
-                # Generate a video with optimization trajectory for the first view (using ffmpeg)
-                if input_str == "target":
-                    if self.test_cfg.save_video_fixed_view:
-                        self.render_supp_videos(batch, h, input_str, iterations, output.gaussian_list, output_path,
-                                                scene_name, v, w, fixed_view_video=True, video_type="fixed_view")
-                    if self.test_cfg.save_video_fixed_iteration:
-                        for t in self.test_cfg.save_video_fixed_iteration_indices:
-                            self.render_supp_videos(batch, h, input_str, iterations, output.gaussian_list, output_path,
-                                                    scene_name, v, w,
-                                                    fixed_view_video=self.test_cfg.save_video_fixed_iteration_render_fixed_view,
-                                                    # render a fixed view until the required iteration
-                                                    fixed_iteration_video=True,
-                                                    fixed_iteration_indices=[t],
-                                                    video_type="fixed_iteration")
-                    if self.test_cfg.save_video_combined:
-                        self.render_supp_videos(batch, h, input_str, iterations, output.gaussian_list, output_path,
-                                                scene_name, v, w,
-                                                fixed_view_video=True,
-                                                fixed_iteration_video=True,
-                                                fixed_iteration_indices=self.test_cfg.save_video_combined_iterations,
-                                                fixed_iteration_length=self.test_cfg.save_video_combined_fixed_iteration_length,
-                                                video_type="combined")
-                return
-
             # Compute scores
             if self.test_cfg.compute_scores:
                 print("\nComputing scores...")
@@ -1929,137 +1962,58 @@ class MetaTrainer(LightningModule):
                     extra_scene_metrics=extra_scene_metrics,
                 )
 
-        # Merge metrics from target (and context if evaluated) for combined plotting
-        all_metrics = {}
-        if self.test_cfg.compute_scores:
-            for key, vals in self.test_step_outputs_target.items():
-                if vals:
-                    all_metrics[key] = vals[-1]
-            for key, vals in self.test_step_outputs_context.items():
-                if vals:
-                    all_metrics[key] = vals[-1]
-        return all_metrics
-
-    @staticmethod
-    def _plot_combined_metrics(
-            output_path: Path,
-            scene_name: str,
-            phases: list[tuple[str, dict]],
-    ):
-        """Create a combined metrics plot for optimizer + postprocessing per scene.
-
-        Args:
-            output_path: Root output directory.
-            scene_name: Name of the current scene.
-            phases: List of (label, metrics_dict) tuples in order. Each metrics_dict
-                    has keys like "{label}_psnr", "{label}_iterations", etc.
-        """
-        try:
-            MetaTrainer._plot_combined_metrics_impl(output_path, scene_name, phases)
-        except Exception as e:
-            warn(f"[plot] failed to create combined metrics plot: {e}")
-            import traceback
-            traceback.print_exc()
-
-    @staticmethod
-    def _plot_combined_metrics_impl(
-            output_path: Path,
-            scene_name: str,
-            phases: list[tuple[str, dict]],
-    ):
-        from matplotlib import pyplot as plt
-
-        # Filter out phases with no data
-        phases = [(label, data) for label, data in phases if data]
-        if not phases:
-            print("[plot] No metrics data available, skipping combined plot.")
-            return
-
-        plot_metrics = ["psnr", "ssim", "alex_lpips", "vgg_lpips", "gaussians"]
-
-        # Build combined series for each metric
-        plots = []  # (title, x_values_list, y_values_list, labels_list, divider_x)
-        for metric in plot_metrics:
-            combined_x = []
-            combined_y = []
-            combined_labels = []
-            x_offset = 0
-            divider_x = None
-
-            for phase_idx, (label, data) in enumerate(phases):
-                iter_key = f"{label}_iterations"
-                metric_key = f"{label}_{metric}"
-
-                iterations = data.get(iter_key, [])
-                values = data.get(metric_key, [])
-
-                if not iterations or not values:
-                    continue
-
-                n = min(len(iterations), len(values))
-                xs = [x_offset + iterations[j] for j in range(n)]
-                ys = values[:n]
-
-                combined_x.append(xs)
-                combined_y.append(ys)
-                combined_labels.append(label)
-
-                if phase_idx < len(phases) - 1 and xs:
-                    divider_x = xs[-1]
-                    x_offset = divider_x
-
-            if combined_x:
-                plots.append((metric, combined_x, combined_y, combined_labels, divider_x))
-
-        if not plots:
-            print("[plot] No plottable metrics found, skipping combined plot.")
-            return
-
-        fig, axes = plt.subplots(len(plots), 1, figsize=(10, 3.5 * len(plots)), squeeze=False)
-        axes = axes[:, 0]
-
-        # Metrics where lower is better
-        lower_is_better = {"alex_lpips", "vgg_lpips"}
-
-        for ax, (metric_name, x_lists, y_lists, labels, divider_x) in zip(axes, plots):
-            for xs, ys, label in zip(x_lists, y_lists, labels):
-                ax.plot(xs, ys, marker=".", markersize=3, label=label)
-            if divider_x is not None:
-                ax.axvline(x=divider_x, color="gray", linestyle="--", linewidth=1, alpha=0.7)
-
-            # Find and annotate the best value across all phases
-            all_ys = [v for ys in y_lists for v in ys]
-            if all_ys:
-                if metric_name in lower_is_better:
-                    best_val = min(all_ys)
-                else:
-                    best_val = max(all_ys)
-                ax.axhline(y=best_val, color="red", linestyle=":", linewidth=1, alpha=0.6)
-                ax.text(
-                    1.0, best_val, f" best={best_val:.4f}",
-                    transform=ax.get_yaxis_transform(),
-                    va="bottom", ha="right", fontsize=7, color="red",
-                )
-
-            ax.set_title(metric_name)
-            ax.set_xlabel("iteration")
-            ax.set_ylabel(metric_name)
-            ax.legend(fontsize=8)
-            ax.grid(True, alpha=0.3)
-
-        fig.suptitle(f"Scene: {scene_name}", fontsize=12, y=1.0)
-        fig.tight_layout()
-
-        plot_dir = output_path / "plots" / scene_name
-        plot_dir.mkdir(parents=True, exist_ok=True)
-        save_path = plot_dir / "combined_metrics.png"
-        plt.savefig(save_path, dpi=150, bbox_inches="tight")
-        plt.close(fig)
-        print(f"Saved combined metrics plot to {save_path}")
+        # Save the optimization videos for the target view (one mp4 per enabled mode).
+        if module is not None and self.test_cfg.save_video and isinstance(output, OptimizerOutput):
+            self._save_optimization_videos(batch, output, module, h, v, w, scene_name, output_path)
 
     # region ==================== Save Results Methods =======================
     @staticmethod
+    def test_save_cameras_json(batch: BatchedExample, output_path: Path) -> None:
+        """Save raw extrinsics/intrinsics (cam-to-world, normalized) for context + target as JSON."""
+        scene_name = batch["scene"][0]
+        cameras_dir = output_path / "cameras"
+        cameras_dir.mkdir(parents=True, exist_ok=True)
+        relevant_keys = ["extrinsics", "intrinsics"]
+        cameras_data = {
+            "scene": scene_name,
+            "context": {key: batch["context"][key][0].cpu().tolist() for key in relevant_keys},
+            "target": {key: batch["target"][key][0].cpu().tolist() for key in relevant_keys},
+            "resolution": list(batch["context"]["image"].shape[-2:]),
+        }
+        cameras_path = cameras_dir / f"{scene_name}_cameras.json"
+        with open(cameras_path, "w") as f:
+            json.dump(cameras_data, f, indent=4)
+        print(f"Saved cameras JSON to {cameras_path}")
+
+    @staticmethod
+    def test_save_cameras_npz(batch: BatchedExample, output_path: Path) -> None:
+        """Save cameras in renderer-ready form: viewmats=inverse(extrinsics) (world-to-cam),
+        Ks=intrinsics * diag(W, H, 1) (pixel-space). Mirrors
+        GSplatDecoderSplattingCUDA.forward (gsplat_decoder_splatting_cuda.py:137-140).
+        """
+        scene_name = batch["scene"][0]
+        cameras_dir = output_path / "cameras"
+        cameras_dir.mkdir(parents=True, exist_ok=True)
+        npz_data = {"scene": scene_name}
+        for input_str in ("context", "target"):
+            view = batch[input_str]
+            extrinsics = view["extrinsics"][0]  # [V, 4, 4] cam-to-world
+            intrinsics = view["intrinsics"][0]  # [V, 3, 3] normalized
+            h, w = view["image"].shape[-2:]
+            viewmats = extrinsics.inverse()  # [V, 4, 4] world-to-cam
+            scale = intrinsics.new_tensor([[w], [h], [1]])
+            Ks = intrinsics * scale  # [V, 3, 3] pixel-space
+            npz_data[f"{input_str}_viewmats"] = viewmats.cpu().numpy()
+            npz_data[f"{input_str}_Ks"] = Ks.cpu().numpy()
+            npz_data[f"{input_str}_image_shape"] = np.array([h, w], dtype=np.int64)
+        cameras_npz_path = cameras_dir / f"{scene_name}_cameras.npz"
+        np.savez(cameras_npz_path, **npz_data)
+        print(f"Saved renderer-ready cameras NPZ to {cameras_npz_path}")
+
+    @staticmethod
     def test_save_rendered_images(renders_list: list, indices, output_path, scene_name, input_str):
+        """Save the per-view optimization trajectory as <output>/images/<scene>/color_<input_str>/<index>.png,
+        with iterations concatenated along width. Also dumps the last iteration separately."""
         out_dir = output_path / "images" / scene_name / f"color_{input_str}"
         for i, index in tqdm(enumerate(indices), desc=f"Saving {input_str} images"):
             color = []
@@ -2075,6 +2029,7 @@ class MetaTrainer(LightningModule):
 
     @staticmethod
     def test_save_last_rendered_images(renders_list: list, indices, output_path, scene_name, input_str):
+        """Save only the final-iteration render per view at <output>/images/<scene>/last/color_<input_str>/<index>.png."""
         out_dir = output_path / "images" / scene_name / "last" / f"color_{input_str}"
         out_dir.mkdir(parents=True, exist_ok=True)
         for i, index in tqdm(enumerate(indices), desc=f"Saving {input_str} last images"):
@@ -2087,7 +2042,9 @@ class MetaTrainer(LightningModule):
 
     @staticmethod
     def test_save_gt_images(rgb_gt, indices, output_path, scene_name, input_str):
-        out_dir = output_path / "images" / scene_name / f"color_{input_str}"
+        """Save GT images alongside the last render at <output>/images/<scene>/last/color_<input_str>/<index>_gt.png."""
+        out_dir = output_path / "images" / scene_name / "last" / f"color_{input_str}"
+        out_dir.mkdir(parents=True, exist_ok=True)
         for index, gt in tqdm(zip(indices, rgb_gt), desc=f"Saving {input_str} GT images"):
             save_image(gt, out_dir / f"{index:06d}_gt.png")
 
@@ -2095,14 +2052,18 @@ class MetaTrainer(LightningModule):
     def test_save_rendered_depth(renders_list: list, indices, output_path, scene_name, input_str,
                                  vmin: float = 0.0,
                                  vmax: float = 1.0):
-        out_dir = output_path / "images" / scene_name / f"depth_{input_str}"
-        for i, index in tqdm(enumerate(indices), desc=f"Saving {input_str} depths"):
+        """Save the rendered-depth trajectory (depth rasterized from the Gaussians) as colormapped PNGs at
+        <output>/images/<scene>/rendered_depth_<input_str>/<index>.png, iterations concatenated along width.
+        This is the rendered depth, not the initializer's predicted depth. vmin/vmax control the per-scene
+        depth normalization."""
+        out_dir = output_path / "images" / scene_name / f"rendered_depth_{input_str}"
+        for i, index in tqdm(enumerate(indices), desc=f"Saving {input_str} rendered depths"):
             depth = []
             for iter_renders in renders_list:
-                iter_depths = iter_renders.depth  # (1, V, 3, H, W)
+                iter_depths = iter_renders.depth  # (1, V, H, W)
                 assert iter_depths is not None, "Depths not found in renders."
-                iter_depths = iter_depths[0]  # (V, 3, H, W)
-                depth.append(iter_depths[i])
+                iter_depths = iter_depths[0]  # (V, H, W)
+                depth.append(iter_depths[i])  # (H, W)
             depth = torch.cat(depth, dim=-1)  # concat along width
             color = viz_depth_tensor(depth, return_numpy=False, as_uint8=False, vmin=vmin, vmax=vmax)
             save_image(color, out_dir / f"{index:06d}.png")
@@ -2110,17 +2071,36 @@ class MetaTrainer(LightningModule):
             del color
 
     @staticmethod
+    def test_save_pred_depth(pred_depths, indices, output_path, scene_name, input_str,
+                             vmin: float = 0.0, vmax: float = 1.0):
+        """Save the initializer's predicted input-view depth (the encoder/monodepth estimate used to place
+        Gaussians) as colormapped PNGs at <output>/images/<scene>/pred_depth_<input_str>/<index>.png.
+        Distinct from the rendered depth above; uses the same vmin/vmax for comparability."""
+        out_dir = output_path / "images" / scene_name / f"pred_depth_{input_str}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for i, index in tqdm(enumerate(indices), desc=f"Saving {input_str} pred depths"):
+            color = viz_depth_tensor(pred_depths[i], return_numpy=False, as_uint8=False, vmin=vmin, vmax=vmax)
+            save_image(color, out_dir / f"{index:06d}.png")
+            del color
+
+    @staticmethod
     def test_save_gt_depth(depth_gt, indices, output_path, scene_name, input_str, vmin: float = 0.0,
                            vmax: float = 1.0):
-        out_dir = output_path / "images" / scene_name / f"depth_{input_str}"
+        """Save GT depth colormapped under <output>/images/<scene>/rendered_depth_<input_str>/<index>_gt.png
+        using the same vmin/vmax as the rendered depths."""
+        out_dir = output_path / "images" / scene_name / f"rendered_depth_{input_str}"
+        depth_gt = depth_gt[0]  # (B, V, H, W) -> (V, H, W); iterate views, not the batch dim
         for index, gt in tqdm(zip(indices, depth_gt), desc=f"Saving {input_str} GT depths"):
-            color = viz_depth_tensor(gt, return_numpy=False, as_uint8=False, vmin=vmin, vmax=vmax)
+            color = viz_depth_tensor(gt, return_numpy=False, as_uint8=False, vmin=vmin, vmax=vmax)  # gt is (H, W)
             save_image(color, out_dir / f"{index:06d}_gt.png")
 
     @staticmethod
     def test_save_rendered_errors(renders_list: list, rgb_gt, indices, output_path, scene_name, input_str,
                                   vmin: float = 0.0,
                                   vmax: float = 1.0):
+        """Save per-view RGB-error magma maps at <output>/images/<scene>/error_<input_str>/<index>.png,
+        iterations concatenated along width. vmin/vmax come from the per-scene 99th-percentile error
+        computed in `_compute_error_vmax` for consistent visualization."""
         # rgb_gt is (V, 3, H, W). Looping per view (outer) and per iteration (inner)
         # keeps only one view's iterations in memory at a time.
         out_dir = output_path / "images" / scene_name / f"error_{input_str}"
@@ -2135,64 +2115,11 @@ class MetaTrainer(LightningModule):
             save_image(color, out_dir / f"{index:06d}.png")
             del iter_rgbs, error_maps, error_map
 
-    def save_colmap_test_train_views(self, batch, h, w):
-        # load the distortion parameters from the original colmap data
-        assert self.test_cfg.ori_colmap_data_path is not None
-        (scene_name,) = batch["scene"]
-        output_path = self.test_cfg.output_path
-        # training views
-        input_images = batch["context"]["image"][0]  # [V, 3, H, W]
-        index = batch["context"]["index"][0]
-        for idx, color in zip(index, input_images):
-            # NOTE: the original image id starts from 1
-            save_image(color, output_path / scene_name / "images_train" / f"frame_{idx + 1:05d}.png")
-        # testing views
-        target_images = batch["target"]["image"][0]  # [V, 3, H, W]
-        index = batch["target"]["index"][0]
-        for idx, color in zip(index, target_images):
-            # NOTE: the original image id starts from 1
-            save_image(color, output_path / scene_name / "images_test" / f"frame_{idx + 1:05d}.png")
-        # save the camera intrinsics
-        intrinsics = batch["context"]["intrinsics"][0][0].clone()  # [3, 3]
-        # need to rescale to the image size
-        intrinsics[0, :] *= w
-        intrinsics[1, :] *= h
-        # distortion parameters
-        json_path = os.path.join(self.test_cfg.ori_colmap_data_path, scene_name, "nerfstudio", "transforms.json")
-        assert os.path.exists(json_path), f"Cannot find {json_path}"
-        sparse_save_dir = output_path / scene_name / "sparse" / "0"
-        sparse_save_dir_train = output_path / scene_name / "sparse_train" / "0"
-        # save to cameras.bin
-        save_opencv_camera(intrinsics.cpu().numpy(), json_path, sparse_save_dir, image_size=(w, h))
-        save_opencv_camera(intrinsics.cpu().numpy(), json_path, sparse_save_dir_train, image_size=(w, h))
-        # extract extrinsics from the dense view images.bin
-        dense_view_extrinsics = os.path.join(self.test_cfg.ori_colmap_data_path, scene_name,
-                                             "nerfstudio/colmap/sparse/0")
-        selected_train_ids = [idx + 1 for idx in batch["context"]["index"][0].tolist()]
-        selected_test_ids = [idx + 1 for idx in batch["target"]["index"][0].tolist()]
-        selected_ids = selected_train_ids + selected_test_ids
-        # also save the sparse features and points3D
-        extract_sparse_images_bin(dense_view_extrinsics, sparse_save_dir, selected_ids, keep_features=False)
-        # only for training views: reconstruct the sparse point cloud only from training views
-        extract_sparse_images_bin(dense_view_extrinsics, sparse_save_dir_train, selected_train_ids)
-        return
-
-    def compute_depth_scores(self, batch, depth_gt, init_pred_depths):
-        pred_depths = init_pred_depths[0]  # [V, H, W]
-        depth_gt = depth_gt[0]  # [V, H, W]
-        near = batch["context"]["near"][...,
-        None, None][0]  # [V, 1, 1]
-        far = batch["context"]["far"][..., None, None][0]  # [V, 1, 1]
-        valid = (depth_gt >= near) & (depth_gt <= far)
-        all_metrics = compute_depth_errors(depth_gt[valid].detach().cpu().numpy(),
-                                           pred_depths[valid].detach().cpu().numpy())
-        print(all_metrics)
-        self.test_step_outputs_target[f"abs_rel"].append(
-            float(all_metrics[0]))
-        self.test_step_outputs_target[f"rmse"].append(float(all_metrics[2]))
-        self.test_step_outputs_target[f"a1"].append(float(all_metrics[4]))
-
     def init_output_dict_for_new_scene(self, input_str, tag=None):
+        """Append an empty per-iteration sublist to test_step_outputs_<input_str> for every metric we
+        will collect (psnr, ssim, lpips×2, iterations, time, gaussians, nonzero_grads). Called once at
+        the start of each scene's evaluation; `tag` (e.g. module class name) prefixes each key so
+        init / optimizer / postprocess buckets don't collide."""
         tag = "" if tag is None else f"{tag}_"
 
         if input_str == "target":
@@ -2217,67 +2144,148 @@ class MetaTrainer(LightningModule):
     # endregion
 
     # region ==================== Video Rendering Methods ====================
-    def render_supp_videos(self, batch, h, input_str, all_iterations, gaussian_list, output_path, scene_name,
-                           v, w, fixed_view_video=False, fixed_iteration_video=False,
-                           fixed_iteration_indices=None,
-                           fixed_iteration_length=-1,
-                           video_type=None):
-        out_dir = output_path / "supp_videos" / scene_name
-        out_dir.mkdir(parents=True, exist_ok=True)
-        combined_iterations = []
+    def _save_optimization_videos(
+            self, batch, output, module, h, v, w, scene_name, output_path,
+    ) -> None:
+        """Render and save the enabled optimization videos for the target view.
 
-        view = self.test_cfg.save_video_fixed_view_index
+        Each enabled mode writes one mp4 (plus a matching per-frame iteration-label JSON) to
+        videos/<scene>:
+        - save_video_optim: the chosen view (save_video_view_index) rendered at every save checkpoint.
+        - save_video_orbit: at each step in save_video_orbit_steps, a full camera orbit around the
+          scene, optionally preceded by the per-checkpoint frames (save_video_orbit_with_optim).
+        - save_video_optim_orbit: the per-checkpoint frames with a short orbit spliced in at
+          save_video_optim_orbit_steps (spanning view -> view + save_video_orbit_span).
+        """
+        _, iterations = self._get_renders_list(output, "target", module)
+        gaussian_list = output.gaussian_list
 
-        all_frames = []
+        if self.test_cfg.save_video_optim:
+            self.render_optim_video(
+                batch, h, v, w, "target", iterations, gaussian_list, scene_name, output_path,
+            )
+        if self.test_cfg.save_video_orbit:
+            for t in self.test_cfg.save_video_orbit_steps:
+                self.render_orbit_video(
+                    batch, h, v, w, "target", iterations, gaussian_list, scene_name, output_path,
+                    orbit_step=t,
+                    with_optim=self.test_cfg.save_video_orbit_with_optim,
+                )
+        if self.test_cfg.save_video_optim_orbit:
+            self.render_optim_orbit_video(
+                batch, h, v, w, "target", iterations, gaussian_list, scene_name, output_path,
+                orbit_steps=self.test_cfg.save_video_optim_orbit_steps,
+                orbit_span=self.test_cfg.save_video_orbit_span,
+            )
 
-        duplicate = self.test_cfg.save_video_fixed_view_duplicate  # to focus on the optimization steps
+    def render_optim_video(
+            self, batch, h, v, w, input_str, all_iterations, gaussian_list, scene_name, output_path,
+    ) -> None:
+        """For each save-checkpoint, render only `save_video_view_index` and append it
+        (duplicated `save_video_frame_repeat` times so the optimization trajectory at
+        that single view stands out)."""
+        view = self.test_cfg.save_video_view_index
+        duplicate = self.test_cfg.save_video_frame_repeat
 
-        if fixed_iteration_length > 0:
-            start = view
-            end = view + fixed_iteration_length
-        else:
-            start = None
-            end = None
-
+        all_frames, combined_iterations = [], []
         for i, t in enumerate(all_iterations):
-            # Render only the view
-            if fixed_view_video:
-                decoder_output = self.test_render_videos_views(batch, gaussian_list[i], h, v, w, input_str,
-                                                               start=view, end=view + 1)
-                frames_t = decoder_output.color[0].detach().cpu()  # (1, 3, H, W)
-                assert frames_t.shape[0] == 1, f"{frames_t.shape}"
-                all_frames += [frames_t[0]] * duplicate  # (3, H, W)
+            decoder_output = self.test_render_videos_views(
+                batch, gaussian_list[i], h, v, w, input_str, start=view, end=view + 1,
+            )
+            frame = decoder_output.color[0].detach().cpu()  # (1, 3, H, W)
+            assert frame.shape[0] == 1, f"{frame.shape}"
+            all_frames += [frame[0]] * duplicate  # (3, H, W)
+            combined_iterations.extend([t] * duplicate)
+
+        self._save_video_file(input_str, "optim", all_frames, combined_iterations,
+                              scene_name, output_path)
+
+    def render_orbit_video(
+            self, batch, h, v, w, input_str, all_iterations, gaussian_list, scene_name, output_path,
+            orbit_step: int, with_optim: bool,
+    ) -> None:
+        """At one chosen iteration, orbit the camera around the scene; optionally also append
+        the per-iteration fixed-view frames leading up to it."""
+        view = self.test_cfg.save_video_view_index
+        duplicate = self.test_cfg.save_video_frame_repeat
+
+        all_frames, combined_iterations = [], []
+        for i, t in enumerate(all_iterations):
+            if with_optim:
+                decoder_output = self.test_render_videos_views(
+                    batch, gaussian_list[i], h, v, w, input_str, start=view, end=view + 1,
+                )
+                frame = decoder_output.color[0].detach().cpu()
+                all_frames += [frame[0]] * duplicate
                 combined_iterations.extend([t] * duplicate)
 
-            if fixed_iteration_video:
-                if t in fixed_iteration_indices:
-                    # Render a trajectory around the scene
-                    decoder_output = self.test_render_videos_views(batch, gaussian_list[i], h, v, w, input_str,
-                                                                   start=start, end=end)
-                    frames_t = decoder_output.color[0].detach().cpu()  # (num_frames, 3, H, W)
-                    for i in range(3):  # forward and backward
-                        for frame in frames_t:
-                            all_frames += [frame] * 3
-                        for frame in frames_t.flip(0):
-                            all_frames += [frame] * 3
-                    combined_iterations.extend(['orbit'] * frames_t.shape[0] * 2)
-                    if fixed_iteration_video and not fixed_view_video:
-                        break  # no need to continue
+            if t == orbit_step:
+                decoder_output = self.test_render_videos_views(
+                    batch, gaussian_list[i], h, v, w, input_str, start=None, end=None,
+                )
+                self._collect_orbit_frames(decoder_output, all_frames, combined_iterations)
+                if not with_optim:
+                    break  # nothing more to render
 
-        if video_type == "combined":
-            save_str = f"_combined_{view}"
-        elif video_type == "fixed_view":
-            save_str = f"_fixed_view_{view}"
-        elif video_type == "fixed_iteration":
-            assert len(fixed_iteration_indices) == 1, f"{fixed_iteration_indices}"
-            save_str = f"_fixed_iteration_{fixed_iteration_indices[0]}"
-        else:
-            raise ValueError
+        self._save_video_file(input_str, f"orbit_{orbit_step}",
+                              all_frames, combined_iterations, scene_name, output_path)
+
+    def render_optim_orbit_video(
+            self, batch, h, v, w, input_str, all_iterations, gaussian_list, scene_name, output_path,
+            orbit_steps, orbit_span: int,
+    ) -> None:
+        """Render the per-iteration fixed-view trajectory; at the given iterations also splice
+        in a short orbit (rendered from view → view+orbit_span)."""
+        view = self.test_cfg.save_video_view_index
+        duplicate = self.test_cfg.save_video_frame_repeat
+        orbit_start = view if orbit_span > 0 else None
+        orbit_end = view + orbit_span if orbit_span > 0 else None
+
+        all_frames, combined_iterations = [], []
+        for i, t in enumerate(all_iterations):
+            decoder_output = self.test_render_videos_views(
+                batch, gaussian_list[i], h, v, w, input_str, start=view, end=view + 1,
+            )
+            frame = decoder_output.color[0].detach().cpu()
+            all_frames += [frame[0]] * duplicate
+            combined_iterations.extend([t] * duplicate)
+
+            if t in orbit_steps:
+                decoder_output = self.test_render_videos_views(
+                    batch, gaussian_list[i], h, v, w, input_str, start=orbit_start, end=orbit_end,
+                )
+                self._collect_orbit_frames(decoder_output, all_frames, combined_iterations)
+
+        self._save_video_file(input_str, "optim_orbit", all_frames, combined_iterations,
+                              scene_name, output_path)
+
+    @staticmethod
+    def _collect_orbit_frames(decoder_output, all_frames: list, combined_iterations: list) -> None:
+        """Append a forward+backward camera-orbit sweep (3 repeats, 3x temporal duplication per frame)."""
+        frames_t = decoder_output.color[0].detach().cpu()  # (num_frames, 3, H, W)
+        for _ in range(3):  # repeat forward + backward 3 times
+            for frame in frames_t:
+                all_frames += [frame] * 3
+            for frame in frames_t.flip(0):
+                all_frames += [frame] * 3
+        combined_iterations.extend(['orbit'] * frames_t.shape[0] * 2)
+
+    @staticmethod
+    def _save_video_file(input_str: str, save_str: str, all_frames: list, combined_iterations: list,
+                         scene_name: str, output_path: Path) -> None:
+        """Write the mp4 and the matching per-frame iteration-label JSON to videos/<scene>."""
+        out_dir = output_path / "videos" / scene_name
+        out_dir.mkdir(parents=True, exist_ok=True)
         save_video(all_frames, out_dir / f"{input_str}_{save_str}.mp4")
-        with (open(out_dir / f"{input_str}_{save_str}_iterations.json", 'w')) as f:
+        with open(out_dir / f"{input_str}_{save_str}_iterations.json", 'w') as f:
             json.dump(combined_iterations, f, indent=4)
 
     def test_render_videos_views(self, batch, gaussians, h, v, w, input_str="target", poses=None, start=None, end=None):
+        """Render the Gaussians along a camera path and return the decoder output.
+
+        The path is the input_str views' poses (optionally camera-stabilized) or the explicit `poses`;
+        rendering is split into chunks of test_cfg.render_chunk_size when that is set.
+        """
         gaussians = gaussians.to(batch["target"]["image"].device)
         with self.benchmarker.time("decoder", num_calls=v):
             if poses is None:
@@ -2334,32 +2342,8 @@ class MetaTrainer(LightningModule):
         return output
 
     @rank_zero_only
-    def render_video_wobble(self, batch: BatchedExample) -> None:
-        # Two views are needed to get the wobble radius.
-        _, v, _, _ = batch["context"]["extrinsics"].shape
-        if v != 2:
-            return
-
-        def trajectory_fn(t):
-            origin_a = batch["context"]["extrinsics"][:, 0, :3, 3]
-            origin_b = batch["context"]["extrinsics"][:, 1, :3, 3]
-            delta = (origin_a - origin_b).norm(dim=-1)
-            extrinsics = generate_wobble(
-                batch["context"]["extrinsics"][:, 0],
-                delta * 0.25,
-                t,
-            )
-            intrinsics = repeat(
-                batch["context"]["intrinsics"][:, 0],
-                "b i j -> b v i j",
-                v=t.shape[0],
-            )
-            return extrinsics, intrinsics
-
-        return self.render_video_generic(batch, trajectory_fn, "wobble", num_frames=60)
-
-    @rank_zero_only
     def render_video_interpolation(self, batch: BatchedExample) -> None:
+        """Log a video interpolating the camera between the two context views (or context->target when there is one context view)."""
         _, v, _, _ = batch["context"]["extrinsics"].shape
 
         def trajectory_fn(t):
@@ -2387,6 +2371,7 @@ class MetaTrainer(LightningModule):
 
     @rank_zero_only
     def render_video_interpolation_exaggerated(self, batch: BatchedExample) -> None:
+        """Log a context-view interpolation video with an added exaggerated wobble transform along the path (needs 2 context views)."""
         # Two views are needed to get the wobble radius.
         _, v, _, _ = batch["context"]["extrinsics"].shape
         if v != 2:
@@ -2441,14 +2426,11 @@ class MetaTrainer(LightningModule):
             smooth: bool = True,
             loop_reverse: bool = True,
     ) -> None:
+        """Render num_frames of the init Gaussians along the trajectory_fn camera path and log an
+        RGB+depth video to wandb under video/{name}."""
         if self.train_cfg.no_log_video:
             return
-        # Render probabilistic estimate of scene.
-        gaussians_prob = self.encoder(batch["context"], self.global_step, False)
-        # gaussians_det = self.encoder(batch["context"], self.global_step, True)
-
-        if isinstance(gaussians_prob, dict):
-            gaussians_prob = gaussians_prob["gaussians"]
+        gaussians = self.get_init_gaussians(batch, is_training=False).gaussians
 
         t = torch.linspace(0, 1, num_frames, dtype=torch.float32, device=self.device)
         if smooth:
@@ -2468,12 +2450,12 @@ class MetaTrainer(LightningModule):
 
         near = repeat(batch["context"]["near"][:, 0], "b -> b v", v=num_frames)
         far = repeat(batch["context"]["far"][:, 0], "b -> b v", v=num_frames)
-        output_prob = self.scene_decoder.forward(
-            gaussians_prob, extrinsics, intrinsics, near, far, (h, w), "depth"
+        output = self.scene_decoder.forward(
+            gaussians, extrinsics, intrinsics, near, far, (h, w), "depth"
         )
         rgb_pred = [
             vcat(rgb, depth)
-            for rgb, depth in zip(output_prob.color[0], depth_map(output_prob.depth[0]))
+            for rgb, depth in zip(output.color[0], depth_map(output.depth[0]))
         ]
 
         images = [

@@ -108,7 +108,7 @@ def prune(
     if isinstance(gaussians, GaussiansModule):
         raise NotImplementedError("pruning not implemented for GaussiansModule")
 
-    # TODO Naama: check if we can avoid squeezing and unsqueezing
+    # NOTE: ADC runs per-Gaussian at batch size 1, so the batch dim is squeezed off here and added back after.
     # get all params and remove batch dim
     means = gaussians.means.squeeze(0)  # [G, 3]
     scales = gaussians.scales.squeeze(0)  # [G, 3]

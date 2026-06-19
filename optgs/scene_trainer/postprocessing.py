@@ -1,4 +1,12 @@
-from dataclasses import dataclass, field
+"""Test-time 3DGS post-processing applied after the learned optimizer.
+
+`PostProcessing3DGS` runs extra vanilla-3DGS refinement on the optimized Gaussians at test time: a torch
+Adam/SGD optimizer descends the parameters directly (built as a `GaussiansModule`), optionally with
+adaptive density control (clone/split/prune). This is the `meta_trainer.test.postprocessing` step and
+also provides the standalone 3DGS baseline numbers; it is off by default.
+"""
+
+from dataclasses import dataclass
 from typing import List
 import tqdm as tqdm
 import numpy as np
@@ -7,9 +15,9 @@ from torch import Tensor
 import math
 from pytorch_optimizer import load_optimizer
 from torch.optim.lr_scheduler import LambdaLR
-import torch.nn.functional as F
 from einops import rearrange
 from optgs.evaluation.metrics import compute_rgb_metrics
+from optgs.misc.benchmarker import Benchmarker
 from optgs.misc.io import FrequencyScheduler
 from optgs.scene_trainer.gaussian_module import GaussiansModule, gaussians2module, module2gaussians
 from optgs.model.types import Gaussians
@@ -19,7 +27,7 @@ from optgs.misc.detaching_cpu_list import DetachingCPUList
 from optgs.dataset.camera_datasets.camera import get_scene_scale
 from optgs.misc.general_utils import get_expon_lr_func
 from fused_ssim import fused_ssim
-from optgs.model.decoder.decoder import Decoder, DecoderOutput
+from optgs.model.decoder.decoder import DecoderOutput
 
 
 @dataclass
@@ -134,21 +142,42 @@ class PostProcessing3DGS:
         self.cfg = cfg
         self.save_every = save_every
 
-        # Timing
-        self.iter_start = torch.cuda.Event(enable_timing=True)
-        self.iter_end = torch.cuda.Event(enable_timing=True)
+        # Per-iteration timing + stats. benchmarker.time("iter") records CUDA events with a deferred
+        # sync, so the loop is not stalled every step; the *_log properties read back from it.
+        self.benchmarker = Benchmarker()
 
         self.reset_logs()
 
     def reset_logs(self):
-        self.radii_max_log = []
-        self.grads_max_log = []
-        self.nr_cloned_log = []
-        self.nr_splitted_log = []
-        self.nr_pruned_log = []
-        self.nr_gaussians_log = []
-        self.nr_nonzero_grad_log = []
-        self.iter_time_log = []
+        # All per-iteration logs (timings + counts) live in self.benchmarker; one clear resets them.
+        self.benchmarker.clear_history()
+
+    @property
+    def iter_time_log(self) -> list[float]:
+        """Total ms per post-processing iteration (from benchmarker.time("iter"))."""
+        return self.benchmarker.execution_times["iter"]
+
+    # Per-iteration stats, stored in self.benchmarker next to the timings (one entry per step).
+    # Counts are ints, so the element type is float | int (see Optimizer for the same pattern).
+    @property
+    def nr_gaussians_log(self) -> list[float | int]:
+        return self.benchmarker.execution_times["gaussians"]
+
+    @property
+    def nr_nonzero_grad_log(self) -> list[float | int]:
+        return self.benchmarker.execution_times["nonzero_grads"]
+
+    @property
+    def nr_cloned_log(self) -> list[float | int]:
+        return self.benchmarker.execution_times["cloned"]
+
+    @property
+    def nr_splitted_log(self) -> list[float | int]:
+        return self.benchmarker.execution_times["splitted"]
+
+    @property
+    def nr_pruned_log(self) -> list[float | int]:
+        return self.benchmarker.execution_times["pruned"]
 
     def _calc_loss(
         self, context, output_renderer: DecoderOutput
@@ -316,9 +345,9 @@ class PostProcessing3DGS:
                 changed = True
                 print(f"Opacity reset @ iter {step}")
 
-        self.nr_cloned_log.append(nr_cloned)
-        self.nr_splitted_log.append(nr_splitted)
-        self.nr_pruned_log.append(nr_pruned)
+        self.benchmarker.record("cloned", nr_cloned)
+        self.benchmarker.record("splitted", nr_splitted)
+        self.benchmarker.record("pruned", nr_pruned)
 
         if changed:
             # Rebuild GaussiansModule from modified Gaussians
@@ -337,6 +366,10 @@ class PostProcessing3DGS:
         batchify_fn=None,
         visualization_dump=None
     ) -> OptimizerOutput | None:
+
+        # This instance is reused across scenes (created once in scene_trainer), so clear the
+        # per-iteration logs (benchmarker: iter_time_log, nr_gaussians_log, ...) for a per-scene reset.
+        self.reset_logs()
 
         target_render_list = DetachingCPUList()
         context_render_list = DetachingCPUList()
@@ -400,63 +433,60 @@ class PostProcessing3DGS:
         pbar_postfix = {}
         for i in pbar:
 
-            self.iter_start.record()
+            with self.benchmarker.time("iter"):
+                with torch.enable_grad():
 
-            with torch.enable_grad():
+                    # Log number of gaussians
+                    self.benchmarker.record("gaussians", gaussian_module.means.shape[0])
 
-                # Log number of gaussians
-                self.nr_gaussians_log.append(gaussian_module.means.shape[0])
+                    # reset gradients
+                    optimizer.zero_grad()
 
-                # reset gradients
-                optimizer.zero_grad()
+                    # Sample context views using the same strategy as the optimizer
+                    iter_context, _ = batchify_fn(batch, "context")
 
-                # Sample context views using the same strategy as the optimizer
-                iter_context, _ = batchify_fn(batch, "context")
-
-                # [Improvement 4] Render in chunks, accumulate gradients, collect ADC metadata
-                meta_for_adc = self._chunked_forward_backward(
-                    gaussian_module, iter_context, decoder, render_res, adc_state
-                )
-
-                # step
-                optimizer.step()
-
-                # update scheduler
-                if scheduler is not None:
-                    scheduler.step()
-
-            # [Improvement 3] ADC: update state and apply densification/pruning
-            if adc_state is not None and meta_for_adc is not None:
-                from optgs.scene_trainer.adc.vanilla import update_vanilla_strategy_state
-
-                v_chunk = iter_context["image"].shape[1]
-                update_vanilla_strategy_state(
-                    adc_state,
-                    radii_2d=meta_for_adc["radii"],
-                    means2d_grads=meta_for_adc["means_2d_grads"],
-                    visibility_mask=meta_for_adc["visibility_filter"],
-                    v=v_chunk,
-                    w=w,
-                    h=h,
-                )
-
-                gaussian_module, adc_changed = self._apply_adc(i, gaussian_module, adc_state, device)
-                if adc_changed:
-                    # Rebuild optimizer and scheduler after ADC changed Gaussian count
-                    optimizer = self.get_optimizer(gaussian_module, scene_scale)
-                    scheduler = self.get_scheduler(
-                        optimizer, scene_scale=scene_scale, prior_steps=self.cfg.prior_steps
+                    # [Improvement 4] Render in chunks, accumulate gradients, collect ADC metadata
+                    meta_for_adc = self._chunked_forward_backward(
+                        gaussian_module, iter_context, decoder, render_res, adc_state
                     )
-                    # Fast-forward scheduler to current step
-                    for _ in range(i + 1):
-                        scheduler.step() if scheduler is not None else None
 
-            # Timing
-            self.iter_end.record()
-            torch.cuda.synchronize()
+                    # step
+                    optimizer.step()
 
-            elapsed_time = self.iter_start.elapsed_time(self.iter_end)
-            self.iter_time_log.append(elapsed_time)
+                    # update scheduler
+                    if scheduler is not None:
+                        scheduler.step()
+
+                # [Improvement 3] ADC: update state and apply densification/pruning
+                if adc_state is not None and meta_for_adc is not None:
+                    from optgs.scene_trainer.adc.vanilla import update_vanilla_strategy_state
+
+                    v_chunk = iter_context["image"].shape[1]
+                    update_vanilla_strategy_state(
+                        adc_state,
+                        radii_2d=meta_for_adc["radii"],
+                        means2d_grads=meta_for_adc["means_2d_grads"],
+                        visibility_mask=meta_for_adc["visibility_filter"],
+                        v=v_chunk,
+                        w=w,
+                        h=h,
+                    )
+
+                    gaussian_module, adc_changed = self._apply_adc(i, gaussian_module, adc_state, device)
+                    if adc_changed:
+                        # Rebuild optimizer and scheduler after ADC changed the Gaussian count.
+                        # Caveat: rebuilding drops the Adam moments (exp_avg/exp_avg_sq) for every
+                        # Gaussian, so they restart from zero after each densification. Reference 3DGS
+                        # instead resizes the optimizer state in place to keep the moments across
+                        # clone/split/prune (as the in-loop optimizers do via AdamInputSmoothing); the
+                        # nn.Parameter + torch.optim path here cannot do that without rebuilding.
+                        optimizer = self.get_optimizer(gaussian_module, scene_scale)
+                        scheduler = self.get_scheduler(
+                            optimizer, scene_scale=scene_scale, prior_steps=self.cfg.prior_steps
+                        )
+                        # Fast-forward scheduler to current step
+                        for _ in range(i + 1):
+                            scheduler.step() if scheduler is not None else None
 
             if self.save_every(i + 1, tag="context"):
                 with torch.no_grad():
@@ -524,7 +554,7 @@ class PostProcessing3DGS:
 
     def get_optimizer(self, gaussians: GaussiansModule, scene_scale: float):
 
-        # TODO Naama: support different batch sizes
+        # NOTE: post-processing runs one scene at a time (batch size 1)
         batch_size: int = 1
 
         # Build params list (name, parameter, lr)

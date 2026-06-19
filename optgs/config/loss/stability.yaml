@@ -1,2 +1,4 @@
 stability:
   weight: 1.0
+  # Also penalize inputs optimized on per-step view subsets (not fully tested in training).
+  subset_aware: false

@@ -2,13 +2,12 @@ from dataclasses import dataclass
 from typing import Literal, Optional
 
 from optgs.dataset.data_types import BatchedViews
-import numpy as np
 import torch
 import math
 import torch.nn.functional as F
 from pathlib import Path
 from optgs.experimental.edgs.init import init_gaussians_with_corr
-from optgs.experimental.initializers_utils import knn, points_to_gaussians
+from optgs.experimental.initializers_utils import points_to_gaussians
 from optgs.model.types import Gaussians
 from optgs.scene_trainer.common.gaussian_adapter import build_covariance
 from optgs.scene_trainer.initializer.initializer import InitializerOutput, NonlearnedInitializer, NonlearnedInitializerCfg
@@ -23,13 +22,7 @@ class InitializerEdgsCfg(NonlearnedInitializerCfg):
     roma_model_type: str
 
     sample_init_gaussians: int  # if >0, randomly sample this many gaussians from the initialized set
-
-    def get_gaussian_param_num(self):
-        # calculate the number of parameters per Gaussian
-        sh_d = self.get_sh_d()
-        # TODO Naama: check where this is used, and if it is needed
-        init_gaussian_param_num = 3 + 4 + 3 * sh_d + 2 + 1
-        return init_gaussian_param_num
+    cache_dir: str  # root dir for the per-scene points_dict cache (built once per scene by RoMa)
 
     def get_sh_d(self):
         sh_d = (self.sh_degree + 1) ** 2
@@ -44,9 +37,14 @@ class InitializerEdgs(NonlearnedInitializer[InitializerEdgsCfg]):
             self,
             context: BatchedViews,
             visualization_dump: Optional[dict] = None,
-            cached_data_path: Optional[Path] = None,
+            scene: Optional[list[str]] = None,
             **kwargs
     ) -> InitializerOutput:
+
+        # Per-scene cache for the (expensive RoMa-correspondence) points_dict.
+        # NOTE: keyed only by scene name, not by the selected context views — re-evaluating
+        # the same scene with a different context set will hit a stale cache.
+        cached_data_path = Path(self.cfg.cache_dir) / scene[0] if scene is not None else None
 
         device = context["extrinsics"].device
 

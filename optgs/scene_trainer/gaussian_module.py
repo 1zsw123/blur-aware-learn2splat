@@ -5,7 +5,13 @@ from torch import Tensor, nn
 from optgs.model.types import Gaussians
 from optgs.scene_trainer.common.gaussians import build_covariance
 
-
+# Two Gaussian representations coexist:
+#   Gaussians (model/types.py) — a plain dataclass whose fields are tensors; the type that flows
+#     through the whole init → optimize → render pipeline.
+#   GaussiansModule (here) — an nn.Module that wraps the same parameters as nn.Parameter, so a
+#     standard torch optimizer (Adam/SGD) can optimize them directly. Built only for the test-time
+#     post-processing path (postprocessing.py); converted to/from Gaussians via the helpers below.
+#     The ADC strategies do not support it (they raise NotImplementedError on GaussiansModule).
 class GaussiansModule(nn.Module):
     def __init__(
         self, 
@@ -71,9 +77,6 @@ class GaussiansModule(nn.Module):
         _register_param("sh0", sh0)
         if shN is not None:
             _register_param("shN", shN)
-        
-        for name, param in self.named_parameters():
-            print(f"Registered parameter: {name}, shape: {param.shape}, dtype: {param.dtype}, min: {param.min()}, max: {param.max()}, requires_grad: {param.requires_grad}")
 
     @property
     def scales(self):
@@ -105,13 +108,6 @@ class GaussiansModule(nn.Module):
         rotation_xyzw = self.rotations
         covariances = self.covariance_activation(self.scales, rotation_xyzw)  # [G, 3, 3]
         return covariances
-    
-    def reset_opacity(self, optimizer):
-        opacities_old = self.opacity_activation(self.opacities_raw)
-        opacities_raw_new = self.inverse_opacity_activation(torch.min(opacities_old, torch.ones_like(opacities_old)*0.01), eps=1e-6)
-        # optimizable_tensors = self.replace_tensor_to_optimizer(optimizer, opacities_raw_new, "opacity")
-        # self.opacities_raw = optimizable_tensors["opacity"]
-    
 
 
 def gaussians2module(gaussians: Gaussians, device: torch.device) -> GaussiansModule:

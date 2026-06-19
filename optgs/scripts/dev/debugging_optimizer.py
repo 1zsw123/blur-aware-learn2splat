@@ -416,9 +416,7 @@ def make_gaussians_dashboard_video_with_ani(data_groups, psnrs, iters, out_path=
 
 import numpy as np
 import torch
-from torch import Tensor
 from pathlib import Path
-import matplotlib.pyplot as plt
 
 
 def calc_hist(data, max_percentile=99.9, min_percentile=0.1, density=False):

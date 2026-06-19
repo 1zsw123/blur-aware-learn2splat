@@ -1,7 +1,6 @@
 import torch
 import numpy as np
 import torch.nn.functional as F
-from torch.optim.lr_scheduler import LambdaLR
 
 
 def get_expon_lr_func(

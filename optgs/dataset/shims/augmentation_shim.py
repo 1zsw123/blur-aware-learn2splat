@@ -22,25 +22,26 @@ def reflect_views(views: AnyViews) -> AnyViews:
     }
 
 
+def mark_unflipped(views: AnyViews) -> AnyViews:
+    """No-op augmentation that still records x_flipped=False, so the key is
+    always present and downstream code (e.g. BatchedViews.from_dict) need not
+    fall back to a default."""
+    return {**views, "x_flipped": False}
+
+
 def apply_augmentation_shim(
     example: AnyExample,
     generator: torch.Generator | None = None,
 ) -> AnyExample:
-    """Randomly augment the training images."""
-    # Do not augment with 50% chance.
-    if torch.rand(tuple(), generator=generator) < 0.5:
-        return example
-
-    if "context_remain" in example:
-        return {
-            **example,
-            "context": reflect_views(example["context"]),
-            "target": reflect_views(example["target"]),
-            "context_remain": reflect_views(example["context_remain"]),
-        }
-
-    return {
+    """Randomly horizontally-flip the scene (50% chance). Either way, x_flipped
+    is recorded on every view set so the key is always present."""
+    flip = torch.rand(tuple(), generator=generator) >= 0.5
+    transform = reflect_views if flip else mark_unflipped
+    out = {
         **example,
-        "context": reflect_views(example["context"]),
-        "target": reflect_views(example["target"]),
+        "context": transform(example["context"]),
+        "target": transform(example["target"]),
     }
+    if "context_remain" in example:
+        out["context_remain"] = transform(example["context_remain"])
+    return out

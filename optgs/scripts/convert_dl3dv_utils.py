@@ -7,7 +7,7 @@ from typing import TypedDict
 
 import numpy as np
 import torch
-from PIL.Image import Image
+from PIL import Image
 from jaxtyping import UInt8, Int, Float
 from torch import Tensor
 

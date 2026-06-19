@@ -27,6 +27,7 @@ Usage (run from the repo root, with ``optgs`` importable):
     python demo.py                    # headless: dense + sparse checkpoints + an Adam baseline
     python demo.py --with-gui server  # interactive viser GUI (frames rendered by the decoder)
     python demo.py --with-gui client  # interactive viser GUI (viser's WebGL splat renderer)
+    python demo.py --with-gui gradio  # interactive gradio GUI (streamed renders + Model3D splats)
 
 The demo scene and the checkpoints are fetched from the Hugging Face Hub on
 first run (cached under ./data and ./checkpoints). A CUDA device is required.
@@ -118,11 +119,13 @@ class Config:
     seed: int = 42
 
     # --- Interactive GUI ---
-    # Launch a viser GUI instead of the headless comparison. "server" renders
-    # frames with the optgs decoder; "client" uses viser's built-in WebGL
-    # Gaussian-splat renderer. Unset = headless run.
-    with_gui: Optional[Literal["client", "server"]] = None
-    # Port for the viser GUI web server (--with-gui only).
+    # Launch an interactive GUI instead of the headless comparison. viser:
+    # "server" renders frames with the optgs decoder, "client" uses viser's
+    # built-in WebGL Gaussian-splat renderer. "gradio" runs a browser GUI
+    # (decoder renders streamed live + an interactive Model3D splat viewer for
+    # the result). Unset = headless run.
+    with_gui: Optional[Literal["client", "server", "gradio"]] = None
+    # Port for the GUI web server (--with-gui only).
     gui_port: int = 8080
 
     # --- OptGS learned optimizer ---
@@ -600,6 +603,373 @@ def run_gui(
         console.print("\n[yellow]GUI stopped.[/]")
 
 
+def run_gradio_gui(
+    instances: dict,
+    gaussians: Gaussians,
+    train_bv: dict,
+    cfg: Config,
+    device: torch.device,
+) -> None:
+    """Interactive gradio GUI — a browser port of :func:`run_gui` (viser).
+
+    gradio can't stream the camera back to Python, so there is no free-camera
+    server rendering. Instead the optimization is *watched* as a streamed
+    decoder render from a chosen training view (``gr.Image``, refreshed every
+    step), and the finished scene is handed to an interactive ``gr.Model3D``
+    splat viewer (orbit / zoom in the browser). The controls mirror the viser
+    GUI: pick the optimizer (Learn2Splat dense/sparse or a 3DGS Adam baseline),
+    set the step budget / view-minibatch size / sampling strategy, Start, Reset.
+
+    ``instances`` maps "dense"/"sparse" to their initialized ``OptGS``.
+    """
+    import gc
+
+    import gradio as gr
+
+    from optgs.experimental.api.integration.config_bridge import build_adam_baseline
+    from optgs.misc.image_io import prep_image
+    from optgs.model.ply_export import save_gaussian_ply
+
+    # Optimizer dropdown label -> (instances key, swap in a 3DGS Adam baseline);
+    # mirrors run_gui's OPTIONS.
+    OPTIONS: Dict[str, Tuple[str, bool]] = {
+        "Learn2Splat (dense)": ("dense", False),
+        "Learn2Splat (sparse)": ("sparse", False),
+        "Adam (3DGS)": ("dense", True),
+    }
+
+    n_train_views = int(train_bv["image"].shape[1])
+    h_full, w_full = train_bv["image"].shape[3], train_bv["image"].shape[4]
+    init_gaussians = gaussians.clone()  # pristine copy; each Start re-inits from it
+
+    # Shared state (single-GPU, single-session demo, like run_gui's globals): the
+    # Gaussians currently shown, the OptGS rendering them, and a counter for
+    # unique PLY filenames (so Model3D reloads instead of serving a stale cache).
+    holder = {"current": init_gaussians, "active": instances["dense"], "ply": 0}
+
+    ply_dir = os.path.join(cfg.result_dir, "gradio")
+    os.makedirs(ply_dir, exist_ok=True)
+
+    @torch.no_grad()
+    def render_decoder(inst, g: Gaussians, view_idx: float, height: float) -> np.ndarray:
+        """Decoder-render Gaussians ``g`` from training view ``view_idx``.
+
+        Normalized intrinsics make the render resolution-independent; the width
+        is derived from ``height`` at the training views' aspect ratio.
+        """
+        h = int(height)
+        w = max(1, round(h * w_full / h_full))
+        sl = slice(int(view_idx), int(view_idx) + 1)
+        out = inst.decoder.forward(
+            g,
+            train_bv["extrinsics"][:, sl],
+            train_bv["intrinsics"][:, sl],
+            train_bv["near"][:, sl],
+            train_bv["far"][:, sl],
+            image_shape=(h, w),
+        )
+        return prep_image(out.color[0, 0])  # [H, W, 3] uint8
+
+    def reorient_for_viewer(g: Gaussians) -> Gaussians:
+        """Reorient a copy of ``g`` from the COLMAP world (this scene is Z-up)
+        into the Y-up frame the gradio Model3D shows upright.
+
+        gradio/Babylon flips the loaded splats' Y (``scaling.y *= -1``), so
+        exporting through the reflection E(p)=(x,-z,-y) makes the *displayed*
+        scene N(p)=(x,z,-y) — the world's Z-up mapped onto Babylon's Y-up. E's
+        point-reflection part leaves the covariance unchanged; its proper-rotation
+        part R_p=-E rotates the splat orientations to match.
+        """
+        from scipy.spatial.transform import Rotation as Rsp
+
+        g = g.clone()
+        m = g.means[0]
+        g.means = torch.stack([m[:, 0], -m[:, 2], -m[:, 1]], dim=1)[None]  # E
+        q = F.normalize(g.rotations_unnorm[0], dim=-1).detach().cpu().numpy()  # xyzw
+        R_p = np.array([[-1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0, 0.0]])
+        q = (Rsp.from_matrix(R_p) * Rsp.from_quat(q)).as_quat()  # R_p @ R, xyzw
+        g.rotations_unnorm = torch.from_numpy(q).to(g.means)[None]
+        return g
+
+    def export_ply(g: Gaussians) -> str:
+        """Write ``g`` (reoriented to Y-up) to a fresh PLY path for the viewer."""
+        from pathlib import Path
+
+        holder["ply"] += 1
+        path = os.path.join(ply_dir, f"result_{holder['ply']}.ply")
+        save_gaussian_ply(reorient_for_viewer(g), save_path=Path(path))
+        return path
+
+    def start(optimizer_label, max_steps, batch_size, strategy, view_idx, height):
+        """Generator: run the picked optimizer, streaming a decoder render each
+        step, then load the finished splats into the Model3D viewer."""
+        name, use_adam = OPTIONS[optimizer_label]
+        inst = instances[name]
+        holder["active"] = inst
+        # Re-init from the pristine copy so repeated Starts share one start point.
+        inst.initialize_from_tensors(init_gaussians.clone(), train_bv)
+        inst.num_refine = int(max_steps)
+        inst.opt_batch_size = min(int(batch_size), n_train_views)
+        inst.opt_batch_strategy = strategy
+        opt = build_adam_baseline(inst.num_refine).to(device) if use_adam else None
+
+        try:
+            # Disable Start, hide the viewer, keep the placeholder while running.
+            yield (
+                render_decoder(inst, init_gaussians, view_idx, height),
+                f"**optimizing** — step 0/{inst.num_refine} — "
+                f"{init_gaussians.means.shape[1]} Gaussians",
+                gr.update(visible=False, value=None),  # hide the viewer
+                gr.update(interactive=False),          # disable Start
+                gr.update(visible=True),               # keep the placeholder
+            )
+
+            g = init_gaussians
+            for step, g in inst.optimize_iter(optimizer=opt):
+                holder["current"] = g
+                yield (
+                    render_decoder(inst, g, view_idx, height),
+                    f"**optimizing** — step {step + 1}/{inst.num_refine} — "
+                    f"{g.means.shape[1]} Gaussians",
+                    gr.update(), gr.update(), gr.update(),  # no change mid-run
+                )
+
+            yield (
+                render_decoder(inst, g, view_idx, height),
+                f"**done** — {inst.num_refine} steps — {g.means.shape[1]} Gaussians",
+                gr.update(visible=True, value=export_ply(g)),  # reveal the viewer
+                gr.update(interactive=True),                   # re-enable Start
+                gr.update(visible=False),                      # hide the placeholder
+            )
+        finally:
+            # Free the run's CUDA work (also runs if the user hits Stop mid-run),
+            # so GPU memory doesn't accumulate across repeated runs.
+            opt = None
+            gc.collect()
+            torch.cuda.empty_cache()
+
+    def reset(view_idx, height):
+        """Restore the initialization: re-render it, hide the viewer.
+
+        No CUDA cleanup here — ``start``'s ``finally`` already frees each run's
+        work; reset only re-renders the init.
+        """
+        holder["current"] = init_gaussians
+        holder["active"] = instances["dense"]
+        return (
+            render_decoder(instances["dense"], init_gaussians, view_idx, height),
+            "**Initialized.** Pick a method, then Start.",
+            gr.update(visible=False, value=None),  # hide the viewer
+            gr.update(interactive=True),           # enable Start
+            gr.update(visible=True),               # show the placeholder
+        )
+
+    def rerender(view_idx, height):
+        """Re-render the current Gaussians (preview view / height changed)."""
+        return render_decoder(holder["active"], holder["current"], view_idx, height)
+
+    initial_img = render_decoder(instances["dense"], init_gaussians, 0, 540)
+
+    # Open the interactive viewer on the same vantage as the live render's
+    # default preview (view 0). The viewer shows splats in the reoriented frame
+    # N(p)=(x,z,-y) (see reorient_for_viewer); the orbit camera sits at the
+    # training view's position and looks at the scene centroid. babylon_camera
+    # maps the world camera into N and inverts Babylon's ArcRotateCamera position
+    # formula rel=(r·cosα·sinβ, r·cosβ, r·sinα·sinβ) into (alpha°, beta°, radius).
+    def babylon_camera(c2w: np.ndarray, centroid: np.ndarray) -> tuple:
+        p = c2w[:3, 3] - centroid
+        rel = np.array([p[0], p[2], -p[1]], dtype=np.float64)  # N applied to (cam - centroid)
+        radius = float(np.linalg.norm(rel)) or 1e-3
+        beta = float(np.degrees(np.arccos(np.clip(rel[1] / radius, -1.0, 1.0))))
+        alpha = float(np.degrees(np.arctan2(rel[2], rel[0])))
+        return (alpha, beta, radius)
+
+    means0 = init_gaussians.means[0].detach().float().cpu().numpy()
+    centroid0 = (means0.min(0) + means0.max(0)) / 2.0
+    cam0_c2w = train_bv["extrinsics"][0, 0].detach().float().cpu().numpy()
+    init_camera = babylon_camera(cam0_c2w, centroid0)
+
+    # --- Visual style: lifted from the Learn2Splat project page
+    # (https://naamapearl.github.io/learn2splat/) — plum accent (#B04080) with an
+    # indigo hover, a light slate canvas with white cards, Source Serif 4
+    # headings / Inter body / JetBrains Mono labels. ---
+    plum = gr.themes.Color(
+        c50="#faf0f6", c100="#f5e6ef", c200="#eccadd", c300="#dda3c2",
+        c400="#c66ba0", c500="#b04080", c600="#9b3570", c700="#7f2a5b",
+        c800="#6a2550", c900="#581f43", c950="#350e26", name="plum",
+    )
+    slate = gr.themes.Color(
+        c50="#f7f8fc", c100="#eef0f8", c200="#e2e5ef", c300="#c8cde0",
+        c400="#8890b0", c500="#5a6080", c600="#454b6b", c700="#343a56",
+        c800="#262b42", c900="#1a1d2e", c950="#0f1120", name="slate",
+    )
+    theme = gr.themes.Soft(
+        primary_hue=plum,
+        neutral_hue=slate,
+        font=["Inter", "system-ui", "sans-serif"],
+        font_mono=["JetBrains Mono", "ui-monospace", "monospace"],
+    ).set(
+        body_background_fill="#f7f8fc",
+        body_text_color="#1a1d2e",
+        block_background_fill="#ffffff",
+        block_border_color="#e2e5ef",
+        block_radius="12px",
+        block_label_text_color="#5a6080",
+        block_title_text_color="#1a1d2e",
+        border_color_primary="#e2e5ef",
+        input_background_fill="#ffffff",
+        button_primary_background_fill="#b04080",
+        button_primary_background_fill_hover="#3d50c0",
+        button_primary_text_color="#ffffff",
+        button_secondary_background_fill="#ffffff",
+        button_secondary_border_color="#c8cde0",
+        button_secondary_text_color="#1a1d2e",
+        slider_color="#b04080",
+        link_text_color="#b04080",
+    )
+    # Source Serif 4 / Inter / JetBrains Mono, loaded into <head> like the page.
+    fonts_head = (
+        '<link rel="preconnect" href="https://fonts.googleapis.com">'
+        '<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>'
+        '<link rel="stylesheet" href="https://fonts.googleapis.com/css2?'
+        "family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&"
+        "family=Inter:wght@300;400;500;600&"
+        'family=JetBrains+Mono:wght@400;500&display=swap">'
+    )
+    css = """
+    .gradio-container { max-width: 1580px !important; margin: 0 auto !important; }
+    #l2s-hero { background: linear-gradient(180deg,#f3f4fb 0%,#f7f8fc 100%);
+        border:1px solid #e2e5ef; border-radius:14px; padding:26px 30px; margin-bottom:6px; }
+    #l2s-hero .eyebrow { font-family:'JetBrains Mono',monospace; font-size:12px;
+        letter-spacing:.16em; text-transform:uppercase; color:#b04080; font-weight:500;
+        display:inline-flex; align-items:center; gap:8px; }
+    #l2s-hero .eyebrow .dot { width:6px; height:6px; border-radius:50%; background:#b04080; }
+    #l2s-hero h1 { font-family:'Source Serif 4',Georgia,serif; font-weight:600; color:#1a1d2e;
+        font-size:clamp(1.55rem,3vw,2.25rem); line-height:1.2; margin:13px 0 10px; }
+    #l2s-hero p { color:#5a6080; font-size:15px; line-height:1.6; margin:0; max-width:820px; }
+    #l2s-hero a { color:#b04080; text-decoration:none; border-bottom:1px solid #e6cdd9;
+        white-space:nowrap; }
+    .l2s-eyebrow span { font-family:'JetBrains Mono',monospace; font-size:11px;
+        letter-spacing:.15em; text-transform:uppercase; color:#8890b0; font-weight:500; }
+    #l2s-start button, #l2s-reset button { font-family:'JetBrains Mono',monospace;
+        letter-spacing:.03em; font-weight:500; }
+    #l2s-status { background:#f7f8fc; border:1px solid #e2e5ef; border-left:3px solid #b04080;
+        border-radius:9px; padding:4px 14px; }
+    #l2s-status p { color:#5a6080; font-size:14px; margin:8px 0; }
+    #l2s-status strong { color:#1a1d2e; }
+    .l2s-ph { display:flex; align-items:center; justify-content:center; text-align:center;
+        height:420px; border:1px dashed #c8cde0; border-radius:12px; background:#fbfcff;
+        color:#8890b0; font-family:'JetBrains Mono',monospace; font-size:12.5px;
+        letter-spacing:.04em; line-height:1.7; }
+    footer { display:none !important; }
+    """
+    hero_html = (
+        "<div class='eyebrow'><span class='dot'></span>Learn2Splat · Interactive demo</div>"
+        "<h1>Extending the Horizon of Learned 3DGS Optimization</h1>"
+        "<p>SfM-initialize a COLMAP scene, then refine the Gaussians with the "
+        "meta-learned optimizer — pick a method, press <b>Start</b>, and watch the "
+        "decoder render converge. The finished splats load in the interactive 3D "
+        "viewer. <a href='https://naamapearl.github.io/learn2splat/' target='_blank' "
+        "rel='noopener'>Project page&nbsp;↗</a></p>"
+    )
+
+    with gr.Blocks(
+        title="Learn2Splat — Demo", theme=theme, css=css, head=fonts_head,
+        analytics_enabled=False,
+    ) as ui:
+        gr.HTML(hero_html, elem_id="l2s-hero")
+        with gr.Row(equal_height=False):
+            # Column 1 — controls.
+            with gr.Column(scale=3, min_width=300):
+                with gr.Group():
+                    gr.HTML("<div class='l2s-eyebrow'><span>Optimizer</span></div>")
+                    optimizer_dd = gr.Dropdown(
+                        list(OPTIONS), value=next(iter(OPTIONS)), label="Method"
+                    )
+                    with gr.Row():
+                        max_steps_input = gr.Number(
+                            value=cfg.max_steps, minimum=1, maximum=1000, step=1,
+                            precision=0, label="Max steps",
+                        )
+                        batch_size_input = gr.Number(
+                            value=min(cfg.opt_batch_size, n_train_views),
+                            minimum=1, maximum=n_train_views, step=1, precision=0,
+                            label="Opt batch size",
+                        )
+                    strategy_dd = gr.Dropdown(
+                        ["random", "sequential", "fps"],
+                        value=cfg.opt_batch_strategy, label="Batch strategy",
+                    )
+                with gr.Group():
+                    gr.HTML("<div class='l2s-eyebrow'><span>Preview</span></div>")
+                    view_slider = gr.Slider(
+                        0, n_train_views - 1, value=0, step=1, label="Preview view"
+                    )
+                    height_slider = gr.Slider(
+                        240, 1080, value=540, step=60, label="Render height"
+                    )
+                with gr.Row():
+                    start_btn = gr.Button(
+                        "Start optimization", variant="primary",
+                        elem_id="l2s-start", scale=2,
+                    )
+                    reset_btn = gr.Button(
+                        "Reset", variant="secondary", elem_id="l2s-reset", scale=1
+                    )
+                status_md = gr.Markdown(
+                    "**Initialized.** Pick a method, then Start.", elem_id="l2s-status"
+                )
+            # Column 2 — live decoder render (streamed during optimization).
+            with gr.Column(scale=5, min_width=380):
+                image_out = gr.Image(
+                    value=initial_img, label="Optimizer · live",
+                    height=540, format="jpeg", interactive=False,
+                )
+            # Column 3 — interactive splats (hidden until a run finishes; a
+            # placeholder holds the column so the 3-up layout stays balanced).
+            with gr.Column(scale=5, min_width=380):
+                model3d_out = gr.Model3D(
+                    label="Refined splats · interactive", height=540,
+                    visible=False, camera_position=init_camera,
+                )
+                placeholder = gr.HTML(
+                    "<div class='l2s-ph'>The interactive 3D splats<br>"
+                    "appear here once a run finishes.</div>"
+                )
+
+        start_inputs = [
+            optimizer_dd, max_steps_input, batch_size_input, strategy_dd,
+            view_slider, height_slider,
+        ]
+        gui_outputs = [image_out, status_md, model3d_out, start_btn, placeholder]
+        # One shared GPU lane (concurrency_id) so Start / Reset / preview re-renders
+        # never run on the GPU at the same time — overlapping runs were the path to
+        # runaway VRAM growth.
+        start_btn.click(
+            start, inputs=start_inputs, outputs=gui_outputs, concurrency_id="gpu"
+        )
+        reset_btn.click(
+            reset, inputs=[view_slider, height_slider], outputs=gui_outputs,
+            concurrency_id="gpu",
+        )
+        # Slider release (not change) — re-render once when the user lets go.
+        view_slider.release(
+            rerender, [view_slider, height_slider], image_out, concurrency_id="gpu"
+        )
+        height_slider.release(
+            rerender, [view_slider, height_slider], image_out, concurrency_id="gpu"
+        )
+
+    console.print(
+        f"[green]✓[/] gradio GUI on port [cyan]{cfg.gui_port}[/]"
+        f" — forward the port over SSH and open the printed URL"
+    )
+    ui.queue(default_concurrency_limit=1).launch(
+        server_name="0.0.0.0", server_port=cfg.gui_port, share=False,
+        show_error=True,
+    )
+
+
 def main(cfg: Config) -> None:
     # Fetch the demo scene on first run, before anything else touches it.
     ensure_data(cfg.data_dir)
@@ -663,7 +1033,10 @@ def main(cfg: Config) -> None:
         for inst in instances.values():
             inst.initialize_from_tensors(gaussians, train_bv)
 
-        run_gui(instances, gaussians, train_bv, cfg, device, dtype)
+        if cfg.with_gui == "gradio":
+            run_gradio_gui(instances, gaussians, train_bv, cfg, device)
+        else:
+            run_gui(instances, gaussians, train_bv, cfg, device, dtype)
         return
 
     val_c2w, val_Ks, val_images = collect_cameras(dataset, val_idx)

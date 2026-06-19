@@ -15,7 +15,6 @@ automatically and skip the full SceneManager parse.
 
 import argparse
 import concurrent.futures
-import os
 import sys
 import traceback
 from pathlib import Path

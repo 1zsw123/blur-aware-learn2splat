@@ -4,7 +4,6 @@ from typing import Literal
 import math
 import torch
 # import torch.nn.functional as F
-from einops import repeat
 from gsplat.rendering import rasterization
 from jaxtyping import Float
 from torch import Tensor

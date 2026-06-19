@@ -1,3 +1,4 @@
+import contextlib
 import os
 import random
 import sys
@@ -21,11 +22,17 @@ from pytorch_lightning.profilers import PyTorchProfiler
 from optgs.misc.io import cyan
 from optgs.misc.console import banner, config_table, warn
 
-# Configure beartype and jaxtyping.
-with install_import_hook(
-        ("optgs",),
-        ("beartype", "beartype"),
-):
+# Configure beartype and jaxtyping. The import hook instruments every optgs
+# function with runtime shape/type checks, which adds import and per-call
+# overhead. Set OPTGS_NO_TYPECHECK=1 to skip it for faster startup when the
+# checks aren't needed.
+_typecheck = os.environ.get("OPTGS_NO_TYPECHECK", "0") != "1"
+_import_hook = (
+    install_import_hook(("optgs",), ("beartype", "beartype"))
+    if _typecheck
+    else contextlib.nullcontext()
+)
+with _import_hook:
     from optgs.config import setup_cfg, SkipRun
     from optgs.dataset.data_module import DataModule
     from optgs.loss import get_losses
@@ -77,7 +84,7 @@ def train(cfg_dict: DictConfig):
     # Set up checkpointing.
     callbacks.append(
         ModelCheckpoint(
-            cfg_dict.output_dir / "checkpoints",
+            cfg.output_dir / "checkpoints",
             every_n_train_steps=cfg.checkpointing.every_n_train_steps,
             save_top_k=cfg.checkpointing.save_top_k,
             monitor="info/global_step",
@@ -89,10 +96,10 @@ def train(cfg_dict: DictConfig):
 
     # Prepare the checkpoint for loading.
     if cfg.checkpointing.resume:
-        if not os.path.exists(cfg_dict.output_dir / 'checkpoints'):
+        if not os.path.exists(cfg.output_dir / 'checkpoints'):
             checkpoint_path = None
         else:
-            checkpoint_path = find_latest_ckpt(cfg_dict.output_dir / 'checkpoints')
+            checkpoint_path = find_latest_ckpt(cfg.output_dir / 'checkpoints')
             # Pass to Lightning via ckpt_path — it restores weights, optimizer, scheduler, and step.
             # Do not also set pretrained_model; that would double-load the weights.
             print(f'resume from {checkpoint_path}')
@@ -135,7 +142,7 @@ def train(cfg_dict: DictConfig):
         profiler=profiler,
     )
 
-    seed = cfg_dict.seed + trainer.global_rank
+    seed = cfg.seed + trainer.global_rank
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -151,10 +158,6 @@ def train(cfg_dict: DictConfig):
     # Create the model (MetaTrainer wraps SceneTrainer)
     meta_trainer = MetaTrainer(
         cfg=cfg,
-        meta_optimizer_cfg=cfg.meta_optimizer,
-        test_cfg=cfg.meta_trainer.test,
-        train_cfg=cfg.meta_trainer.train,
-        scene_trainer_cfg=cfg.scene_trainer,
         losses=get_losses(cfg.loss),
         step_tracker=step_tracker,
         eval_data_cfg=(None if eval_cfg is None else eval_cfg.dataset),

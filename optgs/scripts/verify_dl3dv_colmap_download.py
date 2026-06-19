@@ -7,7 +7,7 @@ import torch
 from tqdm import tqdm
 
 from optgs.misc.io import CustomPath
-from optgs.scripts.dl3dv_hf_download import validate_sfm_structure
+from optgs.scripts.dl3dv_download import validate_sfm_structure
 
 if __name__ == '__main__':
     chunk_dir = CustomPath("datasets/dl3dv-480p-chunks/train")

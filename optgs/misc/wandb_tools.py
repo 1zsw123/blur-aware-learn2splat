@@ -56,7 +56,7 @@ def setup_wandb_logger(cfg, cfg_dict) -> WandbLogger | LocalLogger:
         if cfg_dict.wandb.id is None:
             print(f"Resuming wandb run without id, using latest run in output directory.")
             # Find the latest wandb run id in the output directory
-            wandb_dir = cfg_dict.output_dir / "wandb" / "latest-run"
+            wandb_dir = cfg.output_dir / "wandb" / "latest-run"
             # look for a file name in the format "run-######.wandb" file and extract the id
             wandb_files = list(wandb_dir.glob("run-*.wandb"))
             assert len(wandb_files) <= 1, "Multiple wandb files found in the latest run directory."
@@ -69,7 +69,7 @@ def setup_wandb_logger(cfg, cfg_dict) -> WandbLogger | LocalLogger:
         print(f"Setting wandb run with id from cfg {cfg_dict.wandb.id}.")
         wandb_extra_kwargs.update({'id': cfg_dict.wandb.id, 'resume': "must"})
 
-    run_name = os.path.basename(cfg_dict.output_dir)
+    run_name = os.path.basename(cfg.output_dir)
 
     if cfg_dict.log_slurm_id:
         hostname = os.uname().nodename
@@ -90,7 +90,7 @@ def setup_wandb_logger(cfg, cfg_dict) -> WandbLogger | LocalLogger:
         name=run_name,
         tags=cfg_dict.wandb.get("tags", None),
         log_model=False,
-        save_dir=cfg_dict.output_dir,
+        save_dir=cfg.output_dir,
         config=OmegaConf.to_container(cfg_dict),
         **wandb_extra_kwargs,
     )
@@ -101,12 +101,6 @@ def setup_wandb_logger(cfg, cfg_dict) -> WandbLogger | LocalLogger:
         # Log notes
         if cfg_dict.wandb.notes is not None:
             logger.experiment.notes = cfg_dict.wandb.notes
-        # Write wandb run ID to file for SLURM requeue resume
-        wandb_id_file = os.environ.get("WANDB_ID_FILE")
-        if wandb_id_file:
-            with open(wandb_id_file, "w") as f:
-                f.write(logger.experiment.id)
-            print(f"Wrote wandb run ID {logger.experiment.id} to {wandb_id_file}")
 
     return logger
 

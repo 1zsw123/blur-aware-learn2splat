@@ -14,15 +14,15 @@ from .validation_wrapper import ValidationWrapper
 from ..misc.step_tracker import StepTracker
 
 
-def get_data_shim(encoder: nn.Module) -> DataShim:
+def get_data_shim(initializer: nn.Module) -> DataShim:
     """Get functions that modify the batch. It's sometimes necessary to modify batches
     outside the data loader because GPU computations are required to modify the batch or
     because the modification depends on something outside the data loader.
     """
 
     shims: list[DataShim] = []
-    if hasattr(encoder, "get_data_shim"):
-        shims.append(encoder.get_data_shim())
+    if hasattr(initializer, "get_data_shim"):
+        shims.append(initializer.get_data_shim())
 
     def combined_shim(batch):
         for shim in shims:

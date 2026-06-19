@@ -1,7 +1,5 @@
 import pathlib
 from copy import copy
-import numpy as np
-import torch
 import yaml
 from colorama import Fore
 from omegaconf import OmegaConf
@@ -69,15 +67,6 @@ class CustomPath(pathlib.Path):
 
     def __add__(self, other: str):
         return CustomPath(str(self) + other)
-
-    def is_json(self):
-        return self.suffix == '.json'
-
-    def is_yaml(self):
-        return self.suffix == '.yaml'
-
-    def json_encoder(self):
-        return str(self)
 
     def __sub__(self, other):
         return CustomPath(self.resolve().relative_to(other.resolve()))
@@ -148,9 +137,6 @@ class FrequencyScheduler:
 
         self.is_disabled = False
 
-    def set_verbose(self, verbose: bool):
-        self.verbose = verbose
-
     def set_all_tags(self, enabled: bool):
         for key in self.enabled_tags:
             self.enabled_tags[key] = enabled
@@ -189,10 +175,13 @@ class FrequencyScheduler:
         return iterations
 
     def get_iterations(self, length_of_event: int) -> list[int]:
-        """Returns a list of all iterations where an event occurs up to the given length."""
+        """Iteration indices for the first `length_of_event` saved events.
+
+        Callers pass len(render_list)/len(gaussian_list), whose position 0 is the init (iteration 0),
+        so the labels are the first `length_of_event` scheduled iterations -- including for a partial
+        scene that saved fewer than the full schedule.
+        """
         if self.iterations is not None and len(self.iterations) >= length_of_event:
-            if length_of_event == 1:
-                return [self.iterations[-1]]
             return self.iterations[:length_of_event]
         else:
             raise ValueError(
@@ -209,13 +198,6 @@ class FrequencyScheduler:
 
     def __repr__(self):
         return f"FrequencyScheduler({self.iterations})"
-
-
-def log_mem(tag=""):
-    torch.cuda.synchronize()
-    print(f"{tag}: allocated={torch.cuda.memory_allocated() / 1e6:.1f}MB, "
-          f"reserved={torch.cuda.memory_reserved() / 1e6:.1f}MB, "
-          f"max_allocated={torch.cuda.max_memory_allocated() / 1e6:.1f}MB")
 
 
 def read_omega_cfg(path: pathlib.Path) -> OmegaConf:
@@ -235,7 +217,6 @@ def read_omega_cfg(path: pathlib.Path) -> OmegaConf:
                 path = CustomPath()
                 for part in seq:
                     path = path / str(part)
-                print(path)
                 return path
             else:
                 raise TypeError(f"Unsupported YAML node type for CustomPath: {type(node)}")

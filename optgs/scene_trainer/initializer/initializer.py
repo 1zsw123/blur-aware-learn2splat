@@ -18,6 +18,41 @@ class InitializerOutput:
     depths: list[torch.Tensor] | torch.Tensor | None = None
     target_render: DecoderOutput | None = None
     context_render: DecoderOutput | None = None
+    # View indices used when rendering a subset (training); None means all views were rendered.
+    target_render_index: torch.Tensor | None = None
+    context_render_index: torch.Tensor | None = None
+
+    def get_render(self, which: str) -> DecoderOutput | None:
+        if which == "target":
+            return self.target_render
+        elif which == "context":
+            return self.context_render
+        else:
+            raise ValueError(f"Unknown which: {which}, should be 'target' or 'context'")
+
+    def set_render(self, which: str, value: DecoderOutput) -> None:
+        if which == "target":
+            self.target_render = value
+        elif which == "context":
+            self.context_render = value
+        else:
+            raise ValueError(f"Unknown which: {which}, should be 'target' or 'context'")
+
+    def get_render_index(self, which: str) -> torch.Tensor | None:
+        if which == "target":
+            return self.target_render_index
+        elif which == "context":
+            return self.context_render_index
+        else:
+            raise ValueError(f"Unknown which: {which}, should be 'target' or 'context'")
+
+    def set_render_index(self, which: str, value: torch.Tensor | None) -> None:
+        if which == "target":
+            self.target_render_index = value
+        elif which == "context":
+            self.context_render_index = value
+        else:
+            raise ValueError(f"Unknown which: {which}, should be 'target' or 'context'")
 
 
 @dataclass
@@ -37,6 +72,17 @@ class InitializerCfg:
     train_fixed_gaussians_num: int | None
     eval_fixed_gaussians_num: int | None
 
+    def get_gaussian_param_num(self) -> int:
+        """Per-Gaussian parameter count of this initializer's own representation:
+        scale(3) + rotation(4) + SH(3*sh_d) + opacity(1) + position encoding (get_position_param_num)."""
+        return 3 + 4 + 3 * self.get_sh_d() + 1 + self.get_position_param_num()
+
+    def get_position_param_num(self) -> int:
+        """Size of this initializer's position encoding. Most initializers place Gaussians at explicit
+        3D positions (3). Initializers that encode position differently (resplat: a 2D pixel offset
+        added to a per-pixel depth) override this."""
+        return 3
+
 @dataclass
 class NonlearnedInitializerCfg(InitializerCfg):
     pass
@@ -47,7 +93,7 @@ class LearnedInitializerCfg(InitializerCfg):
 
 
 @dataclass
-class PerPixelInitializerCfg(InitializerCfg):
+class PerPixelInitializerCfg(LearnedInitializerCfg):
     latent_gs: bool
     latent_downsample: int
 
@@ -59,7 +105,10 @@ class Initializer(nn.Module, ABC, Generic[T]):
         super().__init__()
         self.cfg = cfg
 
-    def preprocessing(self, batch, train_cfg) -> None:
+    def eval_preprocessing(self, batch, train_cfg) -> None:
+        """Eval/validation-only batch prep (depth-range override + optional scale prediction),
+        applied in-place before the initializer runs. Training does not call this. The
+        universal patch-crop data shim is a separate, always-applied step (see MetaTrainer)."""
         pass
 
     @property

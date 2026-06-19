@@ -1,7 +1,7 @@
 # Learn2Splat — interactive demo for a Hugging Face Space (Docker SDK, GPU).
 #
 # Installs the optgs package + prebuilt CUDA-extension wheels, then runs
-# demo.py's viser GUI: SfM-initialize a COLMAP scene and refine the Gaussians
+# demo.py's gradio GUI: SfM-initialize a COLMAP scene and refine the Gaussians
 # with the learned optimizer live in the browser.
 #
 # The CUDA extensions are NOT compiled here — the HF Docker builder runs out of
@@ -53,15 +53,6 @@ RUN pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 \
 COPY --chown=user:user requirements.txt .
 RUN pip install -r requirements.txt
 
-# HF serves the Space over HTTP/2, and the WebSocket subprotocol viser uses to
-# announce its client version doesn't survive the proxy — so viser's server
-# reads the client version as "unknown" and rejects the connection (the GUI
-# then hangs on "connecting"). Client and server are the same viser build
-# here, so treat an undeterminable client version as a match, not a reject.
-RUN VISER_INFRA="$(python -c 'import viser.infra._infra as m; print(m.__file__)')" \
- && sed -i 's/client_version_str = "unknown"/client_version_str = viser.__version__/' "$VISER_INFRA" \
- && grep -q 'client_version_str = viser.__version__' "$VISER_INFRA"
-
 # Prebuilt CUDA-extension wheels — gsplat, nerfacc, pycolmap, fused-ssim,
 # simple-knn, pointops, fused_knn_attn. Built on a matching machine (see
 # DEPLOY.md) so the HF builder never compiles CUDA and never OOMs.
@@ -72,11 +63,10 @@ RUN pip install --no-deps ./wheels/*.whl
 COPY --chown=user:user . .
 RUN pip install --no-build-isolation --no-deps -e .
 
-# viser serves the GUI here — must equal app_port in README.md.
+# gradio serves the GUI here — must equal app_port in README.md.
 EXPOSE 7860
 
-# server mode: the optgs decoder renders frames on the GPU and viser streams
-# them as images — no multi-MB splat-geometry transfer to the browser and no
-# client-side WebGL, which is far more robust behind HF's HTTP/2 proxy.
-# viser binds 0.0.0.0 by default.
-CMD ["python", "demo.py", "--with-gui", "server", "--gui-port", "7860"]
+# gradio mode: the optgs decoder renders the live optimization on the GPU and
+# gradio streams the frames as images (column 2); the finished splats load into
+# an interactive Model3D viewer (column 3). demo.py binds 0.0.0.0 on this port.
+CMD ["python", "demo.py", "--with-gui", "gradio", "--gui-port", "7860"]

@@ -39,7 +39,7 @@ fallback_means_lr: 1.6e-4
 relocate_copy_state: true  # inherit alive Gaussian's optimizer state (better than zeroing)
 
 # Cap (in scale units) applied to the *noise-only* covariance computation. Does NOT change the
-# rendered Gaussian scales. Needed for knn_based whose network saturates clamp_refine_max_scale,
+# rendered Gaussian scales. Needed for knn_based whose network saturates clamp_max_scale,
 # which produces covariances 10²-10⁴× larger than vanilla's and makes the noise overflow the
 # renderer's tile-binning math (silent CUDA OOB downstream). Tune to ~scene_scale / 5.
 noise_scale_cap: 1.0

@@ -89,7 +89,6 @@ class GaussianAdapter(nn.Module):
             scales = scales * gaussian_scale_depth[..., None] * multiplier[..., None]
 
         elif point_cloud is not None:
-            # TODO: try other activations
             if self.cfg.softplus_scale:
                 scales = torch.clamp(F.softplus(scales - self.cfg.exp_scale_bias), max=self.cfg.gaussian_scale_max)
             else:
@@ -107,7 +106,6 @@ class GaussianAdapter(nn.Module):
             multiplier = self.get_scale_multiplier(intrinsics, pixel_size)
             scales = scales * depths[..., None] * multiplier[..., None]
 
-        # TODO: avoid nan when using exp scale?
         scales = torch.clamp(scales, min=self.cfg.clamp_min_scale)
 
         assert input_images is not None

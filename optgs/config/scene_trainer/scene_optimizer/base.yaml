@@ -6,12 +6,12 @@ defaults:
 input_gradients_chunk_size: -1
 
 # iterative refine
-no_refine_mean: false
-no_refine_scale: false
-no_refine_rotation: false
-no_refine_opacity: false
-no_refine_sh0: false
-no_refine_shN: false
+freeze_mean: false
+freeze_scale: false
+freeze_rotation: false
+freeze_opacity: false
+freeze_sh0: false
+freeze_shN: false
 
 zero_state_on_densify: false
 

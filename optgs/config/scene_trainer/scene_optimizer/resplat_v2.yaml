@@ -5,7 +5,7 @@ name: resplat_v2
 input_error: true
 input_error_mv_attn: true
 input_error_add_rgb_feature: true
-refine_knn_samples: 8
+knn_samples: 8
 state_channels: 512
 residual_state: true
-update_head_layer_num: 4
+delta_head_layer_num: 4

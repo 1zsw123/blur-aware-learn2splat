@@ -14,11 +14,13 @@ short_description: Interactive demo of the Learn2Splat learned 3DGS optimizer
 A learned optimizer for 3D Gaussian Splatting. This Space SfM-initializes a
 COLMAP scene and refines the Gaussians live in your browser: pick the
 Learn2Splat optimizer (dense or sparse checkpoint) or a 3DGS Adam baseline,
-press **Start**, and watch the splats converge.
+press **Start**, and watch the decoder render converge — then explore the
+finished splats in an interactive 3D viewer.
 
-Runs `demo.py --with-gui client` from the
+Runs `demo.py --with-gui gradio` from the
 [Learn2Splat repository](https://github.com/autonomousvision/learn2splat);
-the splats are drawn by viser's in-browser WebGL renderer.
+the optimization is rendered on the GPU and streamed by gradio, and the
+result loads into a `Model3D` splat viewer.
 
 > Requires GPU hardware. The demo holds two checkpoints in VRAM at once —
 > an A10G (24 GB) is recommended.

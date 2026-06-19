@@ -18,6 +18,9 @@ class LossSh0CfgWrapper:
     sh0: LossSh0Cfg
 
 class LossSh0(Loss[LossSh0Cfg, LossSh0CfgWrapper]):
+    """Supervises each Gaussian's SH degree-0 (base) color against the ground-truth image colour
+    sampled at the Gaussian's projected 2D location, averaged over the views where it is visible."""
+
     def forward(
         self,
         prediction: DecoderOutput,

@@ -21,7 +21,6 @@ meta_trainer:
   max_steps: 50_000
   val_check_interval: 0.25
   train:
-    l1_loss: true
     depth_smooth_loss_weight: 0.0
   test:
     eval_time_skip_steps: 0
@@ -31,6 +30,8 @@ meta_trainer:
 
 # lpips loss
 loss:
+  mse:
+    l1_loss: true
   lpips:
     apply_after_step: 0
     weight: 0.5
@@ -40,8 +41,6 @@ dataset:
   roots: [ datasets/dl3dv-480p-chunks ]
   near: 0.01
   far: 200.
-  min_size: [ 384,512 ]
-  max_size: [ 512,960 ]
   image_shape: [ 256, 448 ]
   view_sampler:
     num_context_views: 8

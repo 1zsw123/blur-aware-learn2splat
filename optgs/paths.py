@@ -63,8 +63,15 @@ if _IS_SOURCE_CHECKOUT:
     except OSError:
         pass
 
-if sys.gettrace() is not None:
-    print("Running in debug mode")
-    DEBUG = True
+# DEBUG enables debug-only code paths (shorter runs, extra logging, "DEBUG"
+# run names). Force it on or off with OPTGS_DEBUG (1/0, true/false); otherwise
+# it auto-enables under any debugger that installs a trace function (PyCharm,
+# pdb, debugpy).
+_debug_env = os.environ.get("OPTGS_DEBUG")
+if _debug_env is not None:
+    DEBUG = _debug_env.strip().lower() in ("1", "true", "yes", "on")
 else:
-    DEBUG = False
+    DEBUG = sys.gettrace() is not None
+
+if DEBUG:
+    print("Running in debug mode")

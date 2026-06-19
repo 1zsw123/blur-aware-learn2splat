@@ -45,10 +45,6 @@ class ViewSampler(ABC, Generic[T]):
         self._all_target_indices = None
 
     @property
-    def all_context_indices(self) -> Int64[Tensor, " context_view"]:
-        return self._all_context_indices
-
-    @property
     def context_indices(self) -> Int64[Tensor, " target_view"]:
         return self._all_context_indices
 
@@ -69,9 +65,6 @@ class ViewSampler(ABC, Generic[T]):
             self._all_target_indices = indices
         else:
             raise RuntimeError("Target indices have already been set.")
-
-    def sample_subset(self, extrinsics, intrinsics, device):
-        pass
 
     @abstractmethod
     def _sample_impl(
@@ -123,13 +116,3 @@ class ViewSampler(ABC, Generic[T]):
     @property
     def global_step(self) -> int:
         return 0 if self.step_tracker is None else self.step_tracker.get_step()
-
-    def new_instance(self) -> "ViewSampler":
-        """Create a new instance of the same ViewSampler class with the same configuration."""
-        return value(self.__class__)(
-            cfg=self.cfg,
-            stage=self.stage,
-            is_overfitting=self.is_overfitting,
-            cameras_are_circular=self.cameras_are_circular,
-            step_tracker=self.step_tracker,
-        )

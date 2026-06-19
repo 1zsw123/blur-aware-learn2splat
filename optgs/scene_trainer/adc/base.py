@@ -1,6 +1,5 @@
 from dataclasses import dataclass
-from typing import Any, Literal, Callable
-import torch
+from typing import Literal, Callable
 from torch import Tensor
 from optgs.scene_trainer.gaussian_module import GaussiansModule
 from optgs.model.types import Gaussians
@@ -48,7 +47,7 @@ class BaseStrategyCfg:
     relocate_copy_state: bool = False
 
     # MCMC noise: cap on the scales used for the noise covariance (does NOT affect rendered scales).
-    # Needed because knn_based saturates clamp_refine_max_scale, producing covariances orders of
+    # Needed because knn_based saturates clamp_max_scale, producing covariances orders of
     # magnitude larger than vanilla's Adam-evolved scales. The resulting MCMC noise overflows the
     # renderer's tile-binning math and causes silent CUDA OOB. Rule of thumb: ~scene_scale / 5.
     noise_scale_cap: float = 1.0

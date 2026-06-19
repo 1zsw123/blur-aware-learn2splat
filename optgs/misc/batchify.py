@@ -1,23 +1,6 @@
 import torch
 
 
-def split_to_minibatch(batch_split, iter_context_idxs):
-    minibatch = {
-        "image": batch_split["image"][0][iter_context_idxs].unsqueeze(
-            0
-        ),  # [1, Vc', 3, Hc, Wc]
-        "extrinsics": batch_split["extrinsics"][0][iter_context_idxs].unsqueeze(
-            0
-        ),  # [1, Vc', 4, 4]
-        "intrinsics": batch_split["intrinsics"][0][iter_context_idxs].unsqueeze(
-            0
-        ),  # [1, Vc', 4, 4]
-        "near": batch_split["near"][0][iter_context_idxs].unsqueeze(0),  # [1, Vc']
-        "far": batch_split["far"][0][iter_context_idxs].unsqueeze(0),  # [1, Vc']
-    }
-    return minibatch
-
-
 def batched_select(data, indices):
     """
     Select data[i, indices[i]] for each batch element i.

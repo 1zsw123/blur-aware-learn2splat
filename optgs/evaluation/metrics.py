@@ -6,7 +6,7 @@ from jaxtyping import Float
 # from lpips import LPIPS
 # from skimage.metrics import structural_similarity
 from torch import Tensor
-from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
+from torchmetrics.image import StructuralSimilarityIndexMeasure
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from tqdm import tqdm
 

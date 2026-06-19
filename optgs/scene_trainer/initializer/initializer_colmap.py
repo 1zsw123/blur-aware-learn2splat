@@ -36,12 +36,6 @@ class InitializerColmapCfg(NonlearnedInitializerCfg):
     points3d_ply_filename: Optional[str]  # if set, loads points from this PLY file (relative to scene dir) instead of COLMAP binary
     override_dataset_poses: bool  # if true, overrides the dataset poses with the COLMAP poses (after applying T_world transform)
 
-    def get_gaussian_param_num(self):
-        # calculate the number of parameters per Gaussian
-        sh_d = self.get_sh_d()
-        init_gaussian_param_num = 3 + 4 + 3 * sh_d + 2 + 1
-        return init_gaussian_param_num
-
     def get_sh_d(self):
         sh_d = (self.sh_degree + 1) ** 2
         return sh_d
@@ -112,7 +106,6 @@ class InitializerColmap(NonlearnedInitializer[InitializerColmapCfg]):
             points = parser.points          # (N, 3) float32
             points_rgb = parser.points_rgb  # (N, 3) uint8
 
-        # TODO Patricia: Fix permission denied
         # Write atomically with a temp file that already ends in .npz.
         try:
             tmp_path = ''
@@ -275,7 +268,11 @@ class InitializerColmap(NonlearnedInitializer[InitializerColmapCfg]):
             rgbs = F.pad(rgbs, (0, 0, 0, pad), value=0.0)
             scales = F.pad(scales, (0, 0, 0, pad), value=1e-10)
             opacities = F.pad(opacities, (0, pad), value=1e-10)
-            # TODO Naama: might be a problem if we don't freeze zero-grad gaussians
+            # NOTE: These are invisible (zero-opacity) dummy Gaussians, added only so that every GPU optimizes
+            # the same number of Gaussians; nr_valid (set below) is the true count. They must stay
+            # invisible: if the optimizer updates them they gain opacity and become real Gaussians. The
+            # knn optimizer keeps them frozen by updating only Gaussians with nonzero gradient (the dummies
+            # are invisible, so their gradient is zero) — see KnnBasedOptimizer._forward_impl.
 
         points_dict = {
             "xyz": xyz,

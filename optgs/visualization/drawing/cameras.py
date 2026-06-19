@@ -114,7 +114,6 @@ def draw_cameras(
         y_name = "XYZ"[image_y_axis]
         image = add_label(image, f"{x_name}{y_name} Projection")
 
-        # TODO: Draw axis indicators.
         projections.append(image)
 
     return torch.stack(projections)

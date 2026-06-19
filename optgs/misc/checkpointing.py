@@ -7,6 +7,35 @@ import torch
 from optgs.misc.io import cyan
 
 
+# TODO (release): remove ckpt migration
+# Optimizer module attributes renamed in the update_/refine_ cleanup pass.
+# Maps every old spelling (including the resplat-era "render_error_mv_attn") to the
+# current name. Applied per dot-delimited key segment so it works whether checkpoint
+# keys are relative to the optimizer ("update_head.0.weight") or prefixed
+# ("optimizer.update_head.0.weight"). Idempotent: current names never match an old
+# segment, so re-running on an already-migrated checkpoint is a no-op.
+_OPTIMIZER_ATTR_RENAMES = {
+    "update_proj": "state_proj",
+    "update_feature": "error_feature_extractor",
+    "update_rgb_error_proj": "rgb_error_proj",
+    "update_input_norm": "input_norm",
+    "update_module": "point_transformer",
+    "update_head_list": "extra_gaussian_heads",
+    "update_head": "delta_head",
+    "update_error_attn": "error_mv_attn",
+    "render_error_mv_attn": "error_mv_attn",  # resplat-era name
+}
+
+
+def _rename_optimizer_attrs(state_dict):
+    """Rewrite checkpoint keys for renamed optimizer module attributes (see map above)."""
+    renamed = {}
+    for k, v in state_dict.items():
+        parts = [_OPTIMIZER_ATTR_RENAMES.get(p, p) for p in k.split(".")]
+        renamed[".".join(parts)] = v
+    return renamed
+
+
 # Function to extract the step number from the filename
 def extract_step(file_name):
     step_str = file_name.split("-")[1].split("_")[1].replace(".ckpt", "")
@@ -41,9 +70,6 @@ def load_partial_state_dict(model, pretrained_state_dict):
         k: v for k, v in pretrained_state_dict.items()
         if k in model_state_dict and v.shape == model_state_dict[k].shape
     }
-    # for key in model_state_dict:
-    #     if key not in filtered_state_dict:
-    #         print(key)
     model_state_dict.update(filtered_state_dict)
     model.load_state_dict(model_state_dict)
 
@@ -71,24 +97,13 @@ def load_optimizer(cfg, scene_trainer, strict_load):
         # Resplat repo format: keys are encoder.* (before init/opt split).
         # Strip encoder. prefix; init-related keys will be ignored via strict=False.
         optimizer_state_dict = {k[len("encoder."):]: v for k, v in pretrained_model.items() if k.startswith("encoder.")}
-        # Rename module attributes that changed when the encoder was split.
-        _ORIG_OPTIMIZER_ATTR_RENAMES = {
-            "render_error_mv_attn": "update_error_attn",
-        }
-        renamed = {}
-        for k, v in optimizer_state_dict.items():
-            for old, new in _ORIG_OPTIMIZER_ATTR_RENAMES.items():
-                if k == old or k.startswith(old + "."):
-                    k = new + k[len(old):]
-                    break
-            renamed[k] = v
-        optimizer_state_dict = renamed
+
+    # Rename module attributes that were renamed in the update_/refine_ cleanup pass
+    optimizer_state_dict = _rename_optimizer_attrs(optimizer_state_dict)
 
     # If init_state_wo_features is True, remove all feature-related parameters from the optimizer state dict
-    print(cfg.scene_trainer.scene_optimizer.init_state_wo_features)
-
     if getattr(cfg.scene_trainer.scene_optimizer, "init_state_wo_features", False):
-        optimizer_state_dict = {k: v for k, v in optimizer_state_dict.items() if "update_proj" not in k}
+        optimizer_state_dict = {k: v for k, v in optimizer_state_dict.items() if "state_proj" not in k}
     scene_trainer.optimizer.load_state_dict(optimizer_state_dict, strict=strict_load)
     print(cyan(f"Loaded pretrained optimizer: {cfg.checkpointing.pretrained_optimizer}"))
 
@@ -116,6 +131,8 @@ def load_full_model(cfg, scene_trainer, strict_load):
     pretrained_model = torch.load(cfg.checkpointing.pretrained_model, map_location='cpu')
     if 'state_dict' in pretrained_model:
         pretrained_model = pretrained_model['state_dict']
+    # Rename optimizer module attributes renamed in the update_/refine_ cleanup pass.
+    pretrained_model = _rename_optimizer_attrs(pretrained_model)
     if cfg.checkpointing.partial_load:
         print('partial load')
         load_partial_state_dict(scene_trainer, pretrained_model)
@@ -231,7 +248,7 @@ def apply_freezes(cfg, scene_trainer):
             print('train refine only, freezing scene optimizer')
             for name, params in scene_trainer.optimizer.named_parameters():
                 params.requires_grad = False
-        if cfg.scene_trainer.scene_optimizer.train_global_update_only:
+        if cfg.scene_trainer.scene_optimizer.train_global_only:
             print('train global update only')
             for name, params in scene_trainer.optimizer.named_parameters():
                 if 'global_update' not in name:

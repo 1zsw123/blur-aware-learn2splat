@@ -24,6 +24,13 @@ class LossDeltasCfgWrapper:
 
 
 class LossDeltas(Loss[LossDeltasCfg, LossDeltasCfgWrapper]):
+    """L1 regularization on the optimizer's predicted per-Gaussian deltas, keeping the updates small.
+
+    With cfg.exclude_by_norm_grad the penalty is restricted to Gaussians with small gradients (and,
+    with exclude_by_norm_grad_opposite, those whose delta already agrees in sign with the gradient).
+    Returns 0 until global_step >= cfg.apply_after_step.
+    """
+
     def forward(
         self,
         prediction: DecoderOutput,
@@ -32,8 +39,6 @@ class LossDeltas(Loss[LossDeltasCfg, LossDeltasCfgWrapper]):
         gt_rgb: Tensor,
         pred_rgb: Tensor,
         valid_depth_mask: Tensor | None,
-        l1_loss: bool,
-        clamp_large_error: float,
         **kwargs,
     ) -> Float[Tensor, ""]:
 

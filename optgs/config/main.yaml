@@ -5,7 +5,7 @@ defaults:
   - scene_trainer/scene_optimizer: null
   - scene_trainer/decoder: gsplat
   - meta_trainer/test/postprocessing: none
-  - meta_trainer/train/replay_buffer_cfg: none
+  - meta_trainer/train/ckpt_buffer_cfg: none
 
 wandb:
   project: placeholder
@@ -33,15 +33,6 @@ data_loader:
     persistent_workers: true
     batch_size: 1
     seed: 3456
-
-meta_optimizer:
-  lr: 2.e-4
-  lr_monodepth: 2.e-6
-  lr_depth: 0.
-  warm_up_steps: 2000
-  weight_decay: 0.01
-  warm_up_ratio: 0.01
-  adamw_8bit: false
 
 checkpointing:
   load: null
@@ -75,25 +66,30 @@ meta_trainer:
   limit_test_batches: 1.0
   limit_train_batches: 1.0
   num_nodes: 1
+  meta_optimizer:
+    lr: 2.e-4
+    lr_monodepth: 2.e-6
+    lr_depth: 0.
+    warm_up_steps: 2000
+    weight_decay: 0.01
+    warm_up_ratio: 0.01
+    adamw_8bit: false
   train:
     depth_mode: null
     extended_visualization: false
     print_log_every_n_steps: 100
     eval_model_every_n_val: 2  # quantitative evaluation every n val
     eval_data_length: 999999
-    eval_deterministic: false
     eval_time_skip_steps: 3
     eval_save_model: true
-    l1_loss: false
     intermediate_loss_weight: 0.9
     no_viz_video: false
     eval_depth: false
-    train_ignore_large_loss: 0.
     no_log_projections: true
     no_log_video: true
     depth_loss_weight: 0.
     log_depth_loss: true
-    depth_smooth_loss_weight: 0.01
+    depth_smooth_loss_weight: 0.  # only meaningful when train_scene_init=True
     depth_smooth_loss_nonorm: false
     depth_smooth_loss_weight_nvs: 0. # for novel views
     monodepth_loss_weight: 0. # for monocular depth loss
@@ -103,21 +99,17 @@ meta_trainer:
     render_depth_loss_weight: 0.
     viz_render_depth: false
     use_gt_depth_range: false
-    depth_range_from_disparity: false
-    max_disparity: 128.
-    min_disparity: 4.
     loss_on_input_views: false
     loss_on_target_views: true
     loss_on_input_views_num: 1
     loss_on_target_views_num: -1
     train_window_size: null
-    half_res_lpips_loss: false
     viz_depth_separate: false
     # L2 weight decay on Gaussian properties (meta-loss)
     scale_l2_loss_weight: 0.
     sh_l2_loss_weight: 0.
     opacity_l2_loss_weight: 0.
-    use_replay_buffer: false
+    use_ckpt_buffer: false
   test:
     output_path: null
     compute_scores: true
@@ -130,22 +122,22 @@ meta_trainer:
     save_gt_image: false
     save_render_depth: false
     save_gt_depth: false
+    save_init_pred_depth: false
     save_error_image: false
     save_video: false
-    save_video_fixed_view: false
-    save_video_fixed_view_index: 0
-    save_video_fixed_view_duplicate: 0
-    save_video_fixed_iteration: false
-    save_video_fixed_iteration_indices: null
-    save_video_fixed_iteration_render_fixed_view: false
-    save_video_combined: false
-    save_video_combined_iterations: null
-    save_video_combined_fixed_iteration_length: 50
+    save_video_optim: false
+    save_video_view_index: 0
+    save_video_frame_repeat: 1
+    save_video_orbit: false
+    save_video_orbit_steps: null
+    save_video_orbit_with_optim: false
+    save_video_optim_orbit: false
+    save_video_optim_orbit_steps: null
+    save_video_orbit_span: 50
     save_gaussian: false
     save_poses: false
     save_cameras_json: true
     save_cameras_npz: true
-    save_point_cloud: false
     render_chunk_size: null
     dec_chunk_size: null
     stablize_camera: false

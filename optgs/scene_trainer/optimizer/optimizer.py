@@ -1,3 +1,13 @@
+"""Base classes and shared types for the scene optimizers.
+
+Defines the optimizer interface that `SceneTrainer` calls: `Optimizer` (the abstract base, with the
+per-iteration timing/benchmarking and ADC plumbing) and `LearnedOptimizer` (adds the network-based
+machinery). Also defines the pipeline data types passed in and out each iteration: `OptimizerInput`,
+`OptimizerOutput`, `OptimizerState`, `OptimizerPreviousOutput`, and the `OptimizerCfg` base config. The
+learned optimizer used in the paper is `KnnBasedOptimizer` (optimizer_knn_based.py); the 3DGS Adam
+baseline is `AdamOptimizer` (optimizer_adam.py).
+"""
+
 from abc import ABC
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -6,9 +16,8 @@ import torch
 from matplotlib import pyplot as plt
 from torch import nn
 from torch import Tensor
-import numpy as np
 import os
-from optgs.dataset.camera_datasets.camera import get_scene_scale
+from optgs.misc.benchmarker import Benchmarker
 from optgs.misc.io import FrequencyScheduler
 from optgs.dataset.data_types import BatchedViews
 from optgs.model.decoder import Decoder
@@ -16,7 +25,6 @@ from optgs.model.decoder.decoder import DecoderOutput
 from optgs.model.types import Gaussians
 from optgs.scene_trainer.adc.base import BaseStrategyCfg
 from optgs.scene_trainer.initializer.initializer import InitializerOutput
-from optgs.scene_trainer.optimizer.layer import AdamState
 from optgs.scene_trainer.initializer import InitializerCfg
 from optgs.misc.detaching_cpu_list import DetachingCPUList
 from optgs.scene_trainer.optimizer.lr_scheduler import LrSchedulerCfgType, get_scheduler
@@ -28,9 +36,6 @@ if TYPE_CHECKING:
 
 @dataclass
 class OptimizerState:
-    state: torch.Tensor | None = None
-    init_state: torch.Tensor | None = None  # state at the beginning of the optimization
-    adam_state: AdamState | None = None
     adc_state: Any = None  # VanillaStrategyState | McmcStrategyState | None
 
 
@@ -38,6 +43,48 @@ class OptimizerState:
 class OptimizerPreviousOutput:
     gaussians: Gaussians
     state: OptimizerState | None = None
+    # Optional pre-computed renders of `gaussians`, used by the splice in
+    # SceneTrainer.get_optimized_gaussians to put init/resumed renders at position 0
+    # of optimizer_output's render lists. Mirrors the same fields on InitializerOutput
+    # so the splice can treat both prev_output types uniformly.
+    target_render: DecoderOutput | None = None
+    context_render: DecoderOutput | None = None
+
+    # View indices used when rendering a subset (training); None means all views were rendered.
+    target_render_index: "torch.Tensor | None" = None
+    context_render_index: "torch.Tensor | None" = None
+
+    def get_render(self, which: str) -> "DecoderOutput | None":
+        if which == "target":
+            return self.target_render
+        elif which == "context":
+            return self.context_render
+        else:
+            raise ValueError(f"Unknown which: {which}, should be 'target' or 'context'")
+
+    def set_render(self, which: str, value: "DecoderOutput") -> None:
+        if which == "target":
+            self.target_render = value
+        elif which == "context":
+            self.context_render = value
+        else:
+            raise ValueError(f"Unknown which: {which}, should be 'target' or 'context'")
+
+    def get_render_index(self, which: str) -> "torch.Tensor | None":
+        if which == "target":
+            return self.target_render_index
+        elif which == "context":
+            return self.context_render_index
+        else:
+            raise ValueError(f"Unknown which: {which}, should be 'target' or 'context'")
+
+    def set_render_index(self, which: str, value: "torch.Tensor | None") -> None:
+        if which == "target":
+            self.target_render_index = value
+        elif which == "context":
+            self.context_render_index = value
+        else:
+            raise ValueError(f"Unknown which: {which}, should be 'target' or 'context'")
 
 
 @dataclass
@@ -45,12 +92,10 @@ class OptimizerInput:
     context: BatchedViews
     renderer: Decoder
     prev_output: InitializerOutput | OptimizerPreviousOutput
-    num_refine: int
     iter_batch_size: int | None
     target: BatchedViews | None = None
     context_remain: dict | None = None
     debug_dict: dict | None = None
-    additional_info: tuple | None = None
 
     @property
     def device(self) -> torch.device:
@@ -59,7 +104,6 @@ class OptimizerInput:
 
 @dataclass
 class OptimizerOutput:
-    # TODO Naama: should we add here iterations?
     gaussian_list: DetachingCPUList[Gaussians]
     t: int | None = None
     T: int | None = None
@@ -100,12 +144,12 @@ class OptimizerOutput:
 class OptimizerCfg:
     
     # subset optimization flags
-    no_refine_mean: bool
-    no_refine_scale: bool
-    no_refine_rotation: bool
-    no_refine_opacity: bool
-    no_refine_sh0: bool
-    no_refine_shN: bool
+    freeze_mean: bool
+    freeze_scale: bool
+    freeze_rotation: bool
+    freeze_opacity: bool
+    freeze_sh0: bool
+    freeze_shN: bool
 
     # lr scheduler
     lr_scheduler: LrSchedulerCfgType
@@ -131,14 +175,14 @@ class OptimizerCfg:
 
     @property
     def optimize_all(self):
-        # All the no_refine_* are False
+        # All the freeze_* are False
         return not any([
-            self.no_refine_mean,
-            self.no_refine_scale,
-            self.no_refine_rotation,
-            self.no_refine_opacity,
-            self.no_refine_sh0,
-            self.no_refine_shN,
+            self.freeze_mean,
+            self.freeze_scale,
+            self.freeze_rotation,
+            self.freeze_opacity,
+            self.freeze_sh0,
+            self.freeze_shN,
         ])
 
 
@@ -153,30 +197,14 @@ class Optimizer(nn.Module, ABC, Generic[T]):
         self.cfg = cfg
         self.save_every = save_every
 
-        # for timing
-        self.iter_start = torch.cuda.Event(enable_timing=True)
-        self.iter_end = torch.cuda.Event(enable_timing=True)
-        # decoder_event_start/end bracket only the rendering-for-gradients call inside
-        # apply_one_update_step, letting us split iter_time into decoder vs optimizer.
-        self.decoder_event_start = torch.cuda.Event(enable_timing=True)
-        self.decoder_event_end = torch.cuda.Event(enable_timing=True)
+        # Per-iteration timing. The optimizer brackets each iteration with benchmarker.time("iter") and
+        # the render inside it with benchmarker.time("decoder"); these use CUDA events with a deferred
+        # sync, so the loop is not stalled every step. iter/decoder/optimizer_time_log read back from it.
+        self.benchmarker = Benchmarker()
         # scene_start_event_start/end bracket optimizer.on_scene_start() (KNN, Adam init).
         # Read after the post-loop cuda.synchronize() in scene_trainer.get_optimized_gaussians.
         self.scene_start_event_start = torch.cuda.Event(enable_timing=True)
         self.scene_start_event_end = torch.cuda.Event(enable_timing=True)
-
-        # Init logs for densification/pruning
-        self.radii_max_log = []
-        self.grads_max_log = []
-        self.nr_cloned_log = []
-        self.nr_splitted_log = []
-        self.nr_pruned_log = []
-        self.nr_gaussians_log = []
-        self.iter_time_log = []       # total ms per iteration
-        self.decoder_time_log = []    # ms spent in rendering-for-gradients per iteration
-        self.optimizer_time_log = []  # ms spent in update step (iter_time - decoder_time)
-        self.scene_start_ms = 0.0    # ms for on_scene_start (KNN lookup, Adam state init)
-        self.nr_nonzero_grad_log = []
 
         # LR scheduler
         self.scheduler = get_scheduler(self.cfg.lr_scheduler)
@@ -184,18 +212,72 @@ class Optimizer(nn.Module, ABC, Generic[T]):
     def forward(self, i, optimizer_input: OptimizerInput, optimizer_output: OptimizerOutput, **kwargs) -> OptimizerOutput:
         return self._forward_impl(i, optimizer_input, optimizer_output, **kwargs)
 
-    def _record_iter_timing(self) -> None:
-        """Record per-iteration timing into iter/decoder/optimizer_time_log.
-        Call right after the timed region; iter_start must already be recorded."""
-        self.iter_end.record()
-        torch.cuda.synchronize()
-        elapsed_time = self.iter_start.elapsed_time(self.iter_end)
-        self.iter_time_log.append(elapsed_time)
-        decoder_ms = self.decoder_event_start.elapsed_time(self.decoder_event_end)
-        self.decoder_time_log.append(decoder_ms)
-        self.optimizer_time_log.append(elapsed_time - decoder_ms)
+    @property
+    def iter_time_log(self) -> list[float]:
+        """Total ms per optimization iteration (from benchmarker.time("iter"))."""
+        return self.benchmarker.execution_times["iter"]
+
+    @property
+    def decoder_time_log(self) -> list[float]:
+        """Ms spent rendering-for-gradients per iteration (from benchmarker.time("decoder"))."""
+        return self.benchmarker.execution_times["decoder"]
+
+    @property
+    def optimizer_time_log(self) -> list[float]:
+        """Ms spent in the update step per iteration (iter_time - decoder_time)."""
+        return [it - dec for it, dec in zip(self.iter_time_log, self.decoder_time_log)]
+
+    # Per-iteration stats, stored in `self.benchmarker` next to the timings (one entry per step).
+    # Counts are ints, max-radii/grads are floats, so the element type is float | int.
+    @property
+    def nr_gaussians_log(self) -> list[float | int]:
+        return self.benchmarker.execution_times["gaussians"]
+
+    @property
+    def nr_nonzero_grad_log(self) -> list[float | int]:
+        return self.benchmarker.execution_times["nonzero_grads"]
+
+    @property
+    def nr_cloned_log(self) -> list[float | int]:
+        return self.benchmarker.execution_times["cloned"]
+
+    @property
+    def nr_splitted_log(self) -> list[float | int]:
+        return self.benchmarker.execution_times["splitted"]
+
+    @property
+    def nr_pruned_log(self) -> list[float | int]:
+        return self.benchmarker.execution_times["pruned"]
+
+    @property
+    def radii_max_log(self) -> list[float | int]:
+        return self.benchmarker.execution_times["radii_max"]
+
+    @property
+    def grads_max_log(self) -> list[float | int]:
+        return self.benchmarker.execution_times["grads_max"]
+
+    @property
+    def scene_start_ms(self) -> float:
+        """Ms for on_scene_start (Adam/state init, preprocessing); one value per scene."""
+        times = self.benchmarker.execution_times["scene_start"]
+        return times[-1] if times else 0.0
+
+    @staticmethod
+    def _append_info(optimizer_output: "OptimizerOutput", gaussians, **info_lists) -> None:
+        """Append per-iteration debug info at test time (shared by all optimizers).
+
+        Saves `gaussians`, then appends each keyword value (e.g. deltas / grads /
+        normalized_grads / states_norms / learning_rates) to optimizer_output.info[key].
+        Each optimizer prepares its own already-CPU values before calling.
+        """
+        optimizer_output.gaussian_list.append(gaussians, detach_and_cpu=True)
+        assert optimizer_output.info is not None
+        for key, value in info_lists.items():
+            optimizer_output.info.setdefault(key, []).append(value)
 
     def on_scene_start(self, optimizer_input: OptimizerInput) -> None:
+        self.benchmarker.clear_history()  # isolate this scene's per-iteration timing
         self._on_scene_start_impl(optimizer_input)
 
     def _on_scene_start_impl(self, optimizer_input: OptimizerInput) -> None:
@@ -222,17 +304,8 @@ class Optimizer(nn.Module, ABC, Generic[T]):
         pass
 
     def reset_logs(self):
-        self.radii_max_log = []
-        self.grads_max_log = []
-        self.nr_cloned_log = []
-        self.nr_splitted_log = []
-        self.nr_pruned_log = []
-        self.nr_gaussians_log = []
-        self.iter_time_log = []
-        self.decoder_time_log = []
-        self.optimizer_time_log = []
-        self.scene_start_ms = 0.0
-        self.nr_nonzero_grad_log = []
+        # All per-scene logs (timings, stats, scene_start) live in self.benchmarker; one clear resets them.
+        self.benchmarker.clear_history()
 
     @staticmethod
     def initialize_adc_state(cfg: OptimizerCfg, optimizer_input: OptimizerInput) -> None:
@@ -274,12 +347,18 @@ class Optimizer(nn.Module, ABC, Generic[T]):
             full_context: BatchedViews,
             full_target: BatchedViews,
     ) -> None:
-        """Render and append post-update context+target views.
+        """Render and append post-update context+target views into optimizer_output's render lists.
 
-        Renders every iteration during training (so per-step renders can feed the meta-loss);
-        otherwise renders only when save_every fires for the given tag. The per-iter subset
-        (optimizer_input.context/target) is used in training when sampling indices exist,
-        otherwise the full views.
+        When and what is rendered:
+        - Training: render every iteration so per-step renders can feed the meta-loss.
+                    If `opt_batch_size < V` (subset sampling), render only that per-iter subset
+                    to match the views the optimization step saw.
+        - Test/eval (self.training=False): render only when save_every fires for this tag,
+                    and ALWAYS use the full V views — even if opt_batch_size < V drove the
+                    optimization step on a subset. This is the invariant the test-time
+                    save/score paths in MetaTrainer._eval_and_save rely on: render_list[k]
+                    is always [1, V, ...], so it lines up 1:1 with batch[tag]["index"][0]
+                    (the full-V frame indices) used for filename labelling and metric GT.
         """
         for tag, full, iter_views in (
             ("context", full_context, optimizer_input.context),
@@ -288,6 +367,8 @@ class Optimizer(nn.Module, ABC, Generic[T]):
             if not (self.training or self.save_every(i + 1, tag=tag)):
                 continue
             index_list = optimizer_output.get_index_list(tag)
+            # Subset rendering is training-only — at test time we always re-render the full V
+            # views so downstream save/score paths see uniform [1, V, ...] tensors.
             subset = iter_views if (index_list and self.training) else full
             render_output = optimizer_input.renderer.forward_batch_subset(
                 updated_gaussians,
@@ -347,17 +428,11 @@ class Optimizer(nn.Module, ABC, Generic[T]):
             lr=lr
         )
         
-        self.nr_cloned_log.append(nr_cloned)
-        self.nr_splitted_log.append(nr_splitted)
-        self.nr_pruned_log.append(nr_pruned)
-        if max_radii is not None:
-            self.radii_max_log.append(max_radii)
-        else:
-            self.radii_max_log.append(0.0)
-        if max_grad2d is not None:
-            self.grads_max_log.append(max_grad2d)
-        else:
-            self.grads_max_log.append(0.0)
+        self.benchmarker.record("cloned", nr_cloned)
+        self.benchmarker.record("splitted", nr_splitted)
+        self.benchmarker.record("pruned", nr_pruned)
+        self.benchmarker.record("radii_max", max_radii if max_radii is not None else 0.0)
+        self.benchmarker.record("grads_max", max_grad2d if max_grad2d is not None else 0.0)
 
     def plot_info(self, step, output_path: Path | None = None, scene_name: str | None = None) -> None:
 
@@ -380,7 +455,7 @@ class Optimizer(nn.Module, ABC, Generic[T]):
         if len(self.nr_cloned_log) == len(self.iter_time_log):
             data.append((range(len(self.iter_time_log)), self.nr_cloned_log, "Cloned"))
         if len(self.nr_splitted_log) == len(self.iter_time_log):
-            data.append((range(len(self.iter_time_log)), self.nr_splitted_log, "Splitted"))
+            data.append((range(len(self.iter_time_log)), self.nr_splitted_log, "Split"))
         if len(self.nr_pruned_log) == len(self.iter_time_log):
             data.append((range(len(self.iter_time_log)), self.nr_pruned_log, "Pruned"))
 
@@ -404,17 +479,13 @@ class Optimizer(nn.Module, ABC, Generic[T]):
             ax.set_title(f"{label} Gaussians", fontsize=13, pad=5)
             # show x-axis ticks on all plots
             ax.tick_params(axis='x', which='both', bottom=True, top=False, labelbottom=True)
-            # set y-axis vmin to 0
-            # ax.set_ylim(bottom=0)
-        
+
         # Shared x-axis label
         axes[-1].set_xlabel("Iteration", fontsize=12)
         # Improve layout
         plt.tight_layout()
         plt.subplots_adjust(hspace=0.3)
-        #
-        # module_name = self.__class__.__name__.lower()
-        
+
         # Save and close
         save_path = save_path / f"stats_{step}.png"
         plt.savefig(save_path, dpi=300, bbox_inches='tight')

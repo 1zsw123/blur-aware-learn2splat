@@ -13,9 +13,7 @@ from optgs.model.decoder.decoder import Decoder, DecoderOutput
 from optgs.model.types import Gaussians
 from einops import rearrange
 from tqdm import tqdm
-import gc
-import torch.autograd.profiler as profiler
-from optgs.misc.memory_profiler import profile_gpu_memory, report_gpu_tensors
+from optgs.misc.memory_profiler import profile_gpu_memory
 
 T = TypeVar("T")
 GPU_MEM_PROFILING = False  # set to True to enable GPU memory profiling
@@ -30,9 +28,12 @@ def split_grads(grads_tensor, cfg):
         assert grads_tensor.shape[0] == 1, "Batch size > 1 not supported for grads_tensor with ndim 3"
         grads_tensor = grads_tensor.squeeze(0)  # [N, D]
     
-    # Split the last dimension
+    # Split the last dimension into the packed Gaussian parameter groups
+    sizes = get_gaussian_param_sizes(cfg.sh_d)
     means, scales, rotations, opacities, shs = torch.split(
-        grads_tensor, (3, 3, 4, 1, 3 * cfg.sh_d), dim=-1
+        grads_tensor,
+        (sizes["means"], sizes["scales"], sizes["quats"], sizes["opacities"], sizes["shs"]),
+        dim=-1,
     )
     
     shs = rearrange(shs, "n (c x) -> n c x", c=3, x=cfg.sh_d)  # [N, 3, sh_d]
@@ -121,14 +122,6 @@ def chunk_ranges(v: int, chunk_size: int) -> List[Tuple[int, int]]:
         ranges.append((start, stop))
         start = stop
     return ranges
-
-def chunk_slices(v: int, chunk_size: int, dim: int = 1) -> List[slice]:
-    """
-    Return a list of slice objects that slice along axis `dim`.
-    Use like: tensor[(slice(None), slice_start_stop, ...)] — easier: use helper below.
-    NOTE: slice objects don't encode the axis; they only give start/stop; see usage.
-    """
-    return [slice(s, e) for s, e in chunk_ranges(v, chunk_size)]
 
 def chunk_index_iter(v: int, chunk_size: int) -> Iterator[Tuple[int,int,int]]:
     """
@@ -336,28 +329,30 @@ def unpack_gaussians(
     detach: bool = True, 
     clone: bool = False, 
     requires_grad: bool = False,
-    scales_lims: tuple | None = None,  # post activation (1e-6, 3)
-    raw_opacities_lims: tuple | None = None,  # pre activation (-7, 7)
+    scales_lims: tuple | None = None,  # in scales' refine space: log if scales_log else activation
+    raw_opacities_lims: tuple | None = None,  # logit (pre-sigmoid) space, e.g. (-7, 7)
 ):
     """ Unpack Gaussian parameters and invert opacities and scales.
 
-    # TODO Naama: fix this
-    Clamp values for scales are in post-activation space, i.e., after exponentiation.
-    Clamp values for opacities are in pre-activation space, i.e., before sigmoid
-
+    Clamp limits apply in the space each parameter is refined in: scales_lims in log space
+    when scales_log is set (else activation space), raw_opacities_lims in logit (pre-sigmoid)
+    space.
     """
+
+    # Restrict to the valid (non-padding) gaussians when a selection is set.
+    gaussians = gaussians.select_valid()
 
     # Means
     means = gaussians.means  # [B, N, 3]
 
     # Scales
     scales = gaussians.scales  # [B, N, 3]
-    if scales_lims is not None:
-        scales = torch.clamp(scales, scales_lims[0], scales_lims[1])
-    # if self.cfg.opt_scales_before_act:
     if scales_log:
         # Invert also scales
         scales = torch.log(scales + 1e-8)
+    # Clamp in the same space the scales now live in (log if scales_log, else activation).
+    if scales_lims is not None:
+        scales = torch.clamp(scales, scales_lims[0], scales_lims[1])
 
     # Quaternions
     # use unnormalized rotations since we are going to refine the unnormed rotations
@@ -379,15 +374,6 @@ def unpack_gaussians(
     shs = gaussians.harmonics  # [B, N, 3, 9]
     shs = shs.flatten(-2)  # [B, N, C] - faster than rearrange
 
-    if gaussians.sel is not None:
-        # TODO Naama: move method to Gaussians class
-        sel = gaussians.sel  #  [B, N]
-        means = means[:, sel]
-        opacities_raw = opacities_raw[:, sel]
-        rotations_unnorm = rotations_unnorm[:, sel]
-        scales = scales[:, sel]
-        shs = shs[:, sel]
-
     if detach:
         means = means.detach()
         opacities_raw = opacities_raw.detach()
@@ -408,29 +394,6 @@ def unpack_gaussians(
         rotations_unnorm.requires_grad_(True)
         scales.requires_grad_(True)
         shs.requires_grad_(True)
-
-    # # predicting multiple gaussians per point, init new gaussians by copying with scaled opacities
-    # if self.cfg.reinit_gaussian_when_refine_multiple and self.cfg.refine_gaussian_multiple > 1:
-    #     raise NotImplementedError
-    #     # This should only be called at the first iteration
-    #     # TODO Naama: might be bug if we use replay buffer
-    #     repeat = self.cfg.refine_gaussian_multiple
-    #     prev_means = prev_means.repeat(1, repeat, 1)
-    #     prev_scales = prev_scales.repeat(1, repeat, 1)
-    #     prev_rotations_unnorm = prev_rotations_unnorm.repeat(1, repeat, 1)
-    #
-    #     # scale down opacities
-    #     prev_opacities_raw = prev_opacities_raw.repeat(1, repeat, 1)  # smaller opacities, important
-    #     # Given y = sigmoid(x), to get new x' such that sigmoid(x') = y / K:
-    #     # The formula is: x' = x + log((1 - y) / (K - y))
-    #     # This adjusts x so that the sigmoid output is scaled down by a factor of K
-    #     tmp_sigmoid = prev_opacities_raw.sigmoid()
-    #     # print(tmp_sigmoid.mean().item())
-    #     prev_opacities_raw = prev_opacities_raw + torch.log((1 - tmp_sigmoid) / (repeat - tmp_sigmoid))
-    #
-    #     prev_shs = prev_shs.repeat(1, repeat, 1)
-    #
-    #     # TODO: this part not ready
 
     return means, scales, rotations_unnorm, opacities_raw, shs
 
@@ -484,6 +447,8 @@ def pack_gaussians(
 
 def get_visibility_contribution_from_gaussian_obj(views_info, gaussians, image_shape=None, render_image=False) -> tuple[Tensor, dict]:
     """
+    # TODO (release): experimental code
+
     Args:
         views_info: dict containing:
             "extrinsics": Tensor of shape [B, V, 4, 4]
@@ -501,8 +466,6 @@ def get_visibility_contribution_from_gaussian_obj(views_info, gaussians, image_s
     out[k] = sum_{c,i,j}^{C, H, W} w_{k,c,i,j}
     ️
     """
-    # Context can be either context or target
-    # TODO Naama: check visibility for both context and target views
     b = gaussians.means.shape[0]
     assert b == 1
     # Data preparation

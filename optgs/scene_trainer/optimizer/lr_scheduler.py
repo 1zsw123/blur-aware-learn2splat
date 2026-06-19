@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 
+from optgs.misc.general_utils import get_expon_lr_func
 from optgs.scene_trainer.optimizer.optimizer_utils import Number3DGSCfg, Bool3DGSCfg
 
 
@@ -17,7 +18,15 @@ class DDIMSchedulerCfg(SchedulerCfg):
     s: float | int
 
 
-LrSchedulerCfgType = DDIMSchedulerCfg | SchedulerCfg
+@dataclass
+class ExponSchedulerCfg(SchedulerCfg):
+    lr_final: float | int      # final LR the schedule decays to (in _base=1 units)
+    lr_delay_steps: int        # 0 disables the warm-up ramp
+    lr_delay_mult: float | int
+    max_steps: int             # step at which lr_final is reached; = total optimization steps
+
+
+LrSchedulerCfgType = DDIMSchedulerCfg | ExponSchedulerCfg | SchedulerCfg
 
 
 class Scheduler[SchedulerCfg]:
@@ -36,11 +45,6 @@ class Scheduler[SchedulerCfg]:
         raise NotImplementedError
 
 
-class DummyScheduler(Scheduler[SchedulerCfg]):
-    def get_lr(self, t: int, param: str) -> float | int:
-        return 1
-
-
 class DDIMCosineScheduler(Scheduler[DDIMSchedulerCfg]):
     def scheduler_fn(self, t: int, base_lr: float | int) -> float | int:
         # Implement DDIM Cosine scheduling logic here
@@ -52,9 +56,27 @@ class DDIMCosineScheduler(Scheduler[DDIMSchedulerCfg]):
         return lr
 
 
+class ExponScheduler(Scheduler[ExponSchedulerCfg]):
+    """Log-linear (exponential) LR decay, as used by the 3DGS means schedule."""
+
+    def scheduler_fn(self, t: int, base_lr: float | int) -> float | int:
+        # base_lr is the per-param LR (lr_data.param = _base * _param); lr_final carries the same
+        # _base multiplier so the whole schedule scales uniformly with _base. The schedule is
+        # linear in its endpoints, so a caller can pull out scene-extent scaling by multiplying
+        # the result (see AdamOptimizer means LR).
+        return get_expon_lr_func(
+            lr_init=base_lr,
+            lr_final=self.cfg.lr_final * self.cfg.lr_data.base,
+            lr_delay_steps=self.cfg.lr_delay_steps,
+            lr_delay_mult=self.cfg.lr_delay_mult,
+            max_steps=self.cfg.max_steps,
+        )(t)
+
+
 SCHEDULERS = {
     "none": Scheduler,
     "ddim": DDIMCosineScheduler,
+    "expon": ExponScheduler,
 }
 
 def get_scheduler(cfg: SchedulerCfg) -> Scheduler:

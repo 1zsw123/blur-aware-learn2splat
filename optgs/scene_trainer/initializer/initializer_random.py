@@ -1,6 +1,5 @@
 from dataclasses import dataclass
-from typing import Literal, Optional
-from pathlib import Path
+from typing import Literal
 import torch
 import torch.nn.functional as F
 
@@ -8,7 +7,7 @@ from optgs.dataset.data_types import BatchedViews
 from optgs.scene_trainer.common.gaussian_adapter import build_covariance
 from optgs.model.types import Gaussians
 from optgs.experimental.initializers_utils import knn, points_to_gaussians
-from optgs.scene_trainer.initializer.initializer import NonlearnedInitializer, InitializerOutput, InitializerCfg, NonlearnedInitializerCfg
+from optgs.scene_trainer.initializer.initializer import NonlearnedInitializer, InitializerOutput, NonlearnedInitializerCfg
 from optgs.dataset.camera_datasets.camera import get_scene_scale
 
 
@@ -20,12 +19,6 @@ class InitializerRandomCfg(NonlearnedInitializerCfg):
     scaling_factor: float
     init_opacity: float
     sh_degree: int
-    
-    def get_gaussian_param_num(self):
-        # calculate the number of parameters per Gaussian
-        sh_d = self.get_sh_d()
-        init_gaussian_param_num = 3 + 4 + 3 * sh_d + 2 + 1
-        return init_gaussian_param_num
     
     def get_sh_d(self):
         sh_d = (self.sh_degree + 1) ** 2

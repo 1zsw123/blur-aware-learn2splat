@@ -5,7 +5,6 @@ import torch
 from optgs.dataset.dataset_colmap import Parser
 import json
 
-from optgs.scripts.convert_dl3dv_utils import load_metadata
 from einops import rearrange, repeat
 
 if __name__ == '__main__':

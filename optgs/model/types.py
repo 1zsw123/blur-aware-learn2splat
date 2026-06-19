@@ -1,6 +1,14 @@
+"""Core `Gaussians` dataclass shared across the whole pipeline.
+
+`Gaussians` holds one scene's primitives — means, SH harmonics, opacities, scales, rotations — plus the
+optional per-Gaussian fields the optimizer attaches during refinement (gradients, deltas, visibility,
+optimization state) and a `nr_valid` count for padded scenes. Helpers (`to`, `clone`, `__getitem__`)
+move it across devices and batch dimensions. Initializers produce it, the optimizer refines it, and the
+decoder renders it.
+"""
+
 from dataclasses import dataclass, fields
 
-import torch
 from jaxtyping import Float, Bool, Int64, BFloat16
 from torch import Tensor
 
@@ -72,6 +80,15 @@ class Gaussians:
             else:
                 new_tensors[field.name] = None
         return Gaussians(**new_tensors)
+
+    def select_valid(self) -> "Gaussians":
+        """Return the subset of valid (non-padding) gaussians selected by `sel`.
+
+        Returns self unchanged when `sel` is None.
+        """
+        if self.sel is None:
+            return self
+        return self[:, self.sel]
 
     def sample_subset(self, sampled_indices) -> "Gaussians":
         """ Randomly sample a subset of gaussians. """

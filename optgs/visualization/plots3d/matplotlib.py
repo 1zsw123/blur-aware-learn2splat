@@ -1,9 +1,9 @@
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
-from typing import Optional, Literal, Tuple, List, Union
+from typing import Optional, Literal, Tuple, List
 from pathlib import Path
-from itertools import product, combinations
+from itertools import combinations
 from optgs.visualization.plots3d.utils import PointCloud, Camera
 from optgs.dataset.camera_datasets.camera import get_scene_scale
 

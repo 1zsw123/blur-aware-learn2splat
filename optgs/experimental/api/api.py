@@ -21,7 +21,7 @@ For non-inria codebases use :meth:`OptGS.initialize_from_ply` /
 
 External SfM scenes carry no optgs encoder features, so checkpoints trained
 with ``init_state_wo_features=False`` are coerced at construction (with a
-warning): the feature-conditioned ``update_proj`` weights are dropped and the
+warning): the feature-conditioned ``state_proj`` weights are dropped and the
 optimizer state is initialized standard-normal.
 """
 
@@ -105,7 +105,7 @@ class OptGS:
                 "(scene_trainer.scene_optimizer.init_state_wo_features=False). "
                 "External SfM/inria scenes carry no optgs encoder features; "
                 "proceeding with init_state_wo_features=True — the "
-                "feature-conditioned update_proj weights are dropped and the "
+                "feature-conditioned state_proj weights are dropped and the "
                 "initial optimizer state is set to a standard-normal random "
                 "vector (init_state_type='random', init_state_scale=1.0)."
             )
@@ -348,7 +348,6 @@ class OptGS:
             context=self._context,
             renderer=self.decoder,
             prev_output=self._init_output,
-            num_refine=self.num_refine,
             iter_batch_size=self.iter_batch_size,
             target=self._context,
         )
@@ -416,27 +415,36 @@ class OptGS:
             OptimizerPreviousOutput,
         )
 
+        # torch's grad mode is thread-local, and a generator consumer (e.g.
+        # gradio) may resume this generator on a *different* worker thread each
+        # step — so a single ``with torch.no_grad()`` spanning the ``yield`` does
+        # not reliably hold across steps. Enter no_grad *per step* and yield
+        # outside it: the Adam baseline's in-place parameter updates require
+        # no_grad ambient (calc_input_gradients re-enables grad internally just
+        # for the gradient computation), so a step that resumes on a grad-enabled
+        # thread would otherwise raise "a leaf Variable that requires grad is
+        # being used in an in-place operation" and leak the autograd graph.
+        inp = OptimizerInput(
+            context=self._context,
+            renderer=self.decoder,
+            prev_output=self._init_output,
+            iter_batch_size=self.iter_batch_size,
+            target=self._context,
+        )
         with torch.no_grad():
-            inp = OptimizerInput(
-                context=self._context,
-                renderer=self.decoder,
-                prev_output=self._init_output,
-                num_refine=self.num_refine,
-                iter_batch_size=self.iter_batch_size,
-                target=self._context,
-            )
             opt.validate_input(inp)
             opt.on_scene_start(inp)  # InitializerOutput -> OptimizerPreviousOutput
-            if not isinstance(inp.prev_output, OptimizerPreviousOutput):
-                raise OptGSError(
-                    "optimizer.on_scene_start did not produce an "
-                    f"OptimizerPreviousOutput (got {type(inp.prev_output)})."
-                )
+        if not isinstance(inp.prev_output, OptimizerPreviousOutput):
+            raise OptGSError(
+                "optimizer.on_scene_start did not produce an "
+                f"OptimizerPreviousOutput (got {type(inp.prev_output)})."
+            )
 
-            out = OptimizerOutput.empty(t=0)
-            out.T = self.num_refine
-            try:
-                for step in range(self.num_refine):
+        out = OptimizerOutput.empty(t=0)
+        out.T = self.num_refine
+        try:
+            for step in range(self.num_refine):
+                with torch.no_grad():
                     # Fresh view minibatch each step (the regime the optimizer
                     # was trained with); full_context/target stay the whole scene.
                     batch = self._view_minibatch(self._context)
@@ -447,12 +455,14 @@ class OptGS:
                         full_context=self._context, full_target=self._context,
                     )
                     out.t = (out.t or 0) + 1
-                    yield step, inp.prev_output.gaussians
-            finally:
+                    g = inp.prev_output.gaussians
+                yield step, g
+        finally:
+            with torch.no_grad():
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
                 opt.on_scene_end()
-                self._refined = inp.prev_output.gaussians
+            self._refined = inp.prev_output.gaussians
 
     def export_ply(self, path: str) -> None:
         """Write the most recently refined Gaussians to a 3DGS PLY."""

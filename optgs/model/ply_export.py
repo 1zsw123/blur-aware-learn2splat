@@ -62,7 +62,6 @@ def export_ply(
 def save_gaussian_ply(
     gaussians: Gaussians | GaussiansModule,
     save_path,
-    save_all_gaussians=True,  # no trim
 ):
     """
     Save Gaussians to a .ply file for visualization.
@@ -71,9 +70,6 @@ def save_gaussian_ply(
     i.e., before applying the activation functions (sigmoid for opacity, exp for scales).
 
     """
-
-    if not save_all_gaussians:
-        raise NotImplementedError("Not implemented yet.")
 
     if isinstance(gaussians, GaussiansModule):
         
@@ -138,9 +134,10 @@ def load_gaussians_ply(path, max_sh_degree=3) -> Gaussians:
     
     # 
     if len(extra_f_names) == 0:
-        # loaded ply has no SH coefficients
-        # TODO: does this mean that features_dc probably encodes RGB which needs to be converted to SH0?
-        # all other features are zero
+        # SH degree 0: only the DC band is present, no higher-order coefficients.
+        # f_dc still holds the SH DC term (SH0), not raw RGB -- the 3DGS .ply
+        # convention stores SH0, and the colour is recovered as rgb = 0.5 + C0 * SH0.
+        # So f_dc is read directly into harmonics[..., 0]; the remaining bands are zero.
         print("Loaded PLY has no SH coefficients, only DC features.")
         features_extra = np.zeros((xyz.shape[0], 3, (max_sh_degree + 1) ** 2 - 1))
     

@@ -13,28 +13,17 @@ from optgs.dataset.shims.patch_shim import apply_patch_shim
 from optgs.geometry.projection import sample_image_grid, get_world_rays
 from optgs.misc.general_utils import rotate_quats
 from optgs.misc.io import FrequencyScheduler
-from optgs.model.encoder.layer import BasicBlock
-from optgs.model.encoder.unimatch.dpt_head import DPTHead
-from optgs.model.encoder.unimatch.feature_upsampler import ResizeConvFeatureUpsampler
-from optgs.model.encoder.unimatch.ldm_unet.unet import UNetModel
-from optgs.model.encoder.unimatch.mv_unimatch import MultiViewUniMatch
-from optgs.model.encoder.visualization.encoder_visualizer_depthsplat_cfg import EncoderVisualizerDepthSplatCfg
+from optgs.model.backbones.layer import BasicBlock
+from optgs.model.backbones.unimatch.dpt_head import DPTHead
+from optgs.model.backbones.unimatch.feature_upsampler import ResizeConvFeatureUpsampler
+from optgs.model.backbones.unimatch.ldm_unet.unet import UNetModel
+from optgs.model.backbones.unimatch.mv_unimatch import MultiViewUniMatch
 from optgs.model.types import Gaussians
 from optgs.scene_trainer.common.gaussian_adapter import GaussianAdapter, GaussianAdapterCfg, build_covariance, RGB2SH
 from optgs.scene_trainer.initializer.initializer import InitializerOutput, LearnedInitializer, PerPixelInitializerCfg
 
 try:
-    from optgs.model.encoder.point_transformer.layer import (PlainPointTransformer, SubsampleBlock, PointLinearWrapper,
-                                                             MultiScalePointTransformer,
-                                                             MultViewLowresAttn, MultViewUniMatchAttn,
-                                                             GaussianErrorCrossAttn)
-except:
-    pass
-
-from optgs.model.encoder.lvsm.transformer import LVSMTransformer
-
-try:
-    from simple_knn._C import distCUDA2
+    from optgs.model.backbones.point_transformer.layer import PlainPointTransformer
 except:
     pass
 
@@ -45,7 +34,6 @@ class ResplatInitializerCfg(PerPixelInitializerCfg):
     d_feature: int
     num_depth_candidates: int
     num_surfaces: int
-    visualizer: EncoderVisualizerDepthSplatCfg
     gaussian_adapter: GaussianAdapterCfg
     gaussians_per_pixel: int
     unimatch_weights_path: str | None
@@ -89,19 +77,13 @@ class ResplatInitializerCfg(PerPixelInitializerCfg):
     pt_head_conv: bool
     pt_head_concat_img: bool
     pt_head_channels: int | None
-    multi_scale_pt: bool
     attn_proj_channels: int | None
-    fps_num_samples: int | None
     knn_samples: int
     post_norm: bool
     no_rpe: bool
     no_knn_attn: bool
     num_blocks: int
-    pt_downsample: int
-    fps_agg_func: str
-    subsample_method: str
     add_pt_residual: bool
-    pt_pred_residual_position: bool  # based on the inital point cloud from depth, predict additional residual
     latent_dpt_upsampler: bool
     latent_dpt_upsampler_no_concat: bool
     light_dpt_feature: bool
@@ -118,10 +100,6 @@ class ResplatInitializerCfg(PerPixelInitializerCfg):
     # unet gaussian regressor
     unet_gaussian_regressor: bool
     resnet_gaussian_regressor: bool
-
-    # lvsm gaussian regressor
-    lvsm_gaussian_regressor: bool
-    lvsm_layers: int
 
     sample_log_depth: bool
     bilinear_upsample_depth: bool
@@ -211,17 +189,10 @@ class ResplatInitializerCfg(PerPixelInitializerCfg):
     def get_gaussian_param_num(self):
         # predict gaussian parameters: scale, q, sh, offset, opacity
         # d_in: (scale, q, sh)
-        sh_d = self.get_sh_d()
-        init_gaussian_param_num = 3 + 4 + 3 * sh_d + 2 + 1
+        # base params (scale, q, sh, opacity) plus the 2D pixel offset (via get_position_param_num)
+        init_gaussian_param_num = super().get_gaussian_param_num()
         if self.no_pixel_offset:
             init_gaussian_param_num -= 2
-        if self.pt_downsample > 0:
-            # no pixel offset
-            init_gaussian_param_num -= 2
-        if self.pt_pred_residual_position:
-            # based on the inital point cloud from depth, predict additional residual
-            # without pixel offset on 2d
-            init_gaussian_param_num = init_gaussian_param_num + 3 - 2
         # multiple gaussians per latent
         if self.init_gaussian_multiple > 1:
             # we use the point cloud unprojected from higher resolution depth map as center
@@ -229,6 +200,10 @@ class ResplatInitializerCfg(PerPixelInitializerCfg):
             assert self.latent_gs
             init_gaussian_param_num *= self.init_gaussian_multiple
         return init_gaussian_param_num
+
+    def get_position_param_num(self) -> int:
+        # resplat encodes position as a 2D pixel offset added to a per-pixel depth, not an explicit 3D point.
+        return 2
 
     def get_sh_d(self):
         sh_d = (self.gaussian_adapter.sh_degree + 1) ** 2
@@ -326,15 +301,6 @@ class ResplatInitializer(LearnedInitializer[ResplatInitializerCfg]):
                 BasicBlock(channels, channels),
             ]
 
-        elif self.cfg.lvsm_gaussian_regressor:
-            modules = [
-                nn.Linear(in_channels, channels),
-                nn.LayerNorm(channels),
-                nn.GELU(),
-                LVSMTransformer(channels,
-                                n_layer=self.cfg.lvsm_layers)
-            ]
-
         else:
             # conv regressor
             modules = [
@@ -357,52 +323,21 @@ class ResplatInitializer(LearnedInitializer[ResplatInitializerCfg]):
                 channels = self.cfg.pt_head_channels
             self.proj = nn.Linear(in_channels, channels)
 
-            if self.cfg.multi_scale_pt:
-                self.pt = MultiScalePointTransformer(channels,
-                                                     self.cfg.knn_samples,
-                                                     downsample_agg_func=self.cfg.fps_agg_func,
-                                                     subsample_method=self.cfg.subsample_method,
-                                                     fps_num_samples=self.cfg.fps_num_samples,
-                                                     attn_proj_channels=self.cfg.attn_proj_channels,
-                                                     )
-            else:
-                self.pt = PlainPointTransformer(channels, self.cfg.knn_samples,
-                                                post_norm=self.cfg.post_norm,
-                                                no_rpe=self.cfg.no_rpe,
-                                                no_attn=self.cfg.no_knn_attn,
-                                                num_blocks=self.cfg.num_blocks,
-                                                num_heads=self.cfg.pt_heads,
-                                                attn_proj_channels=self.cfg.attn_proj_channels,
-                                                use_checkpointing=self.cfg.use_checkpointing,
-                                                init_use_checkpointing=self.cfg.init_use_checkpointing,
-                                                with_mv_attn=self.cfg.init_pt_with_mv_attn,
-                                                with_mv_attn_lowres=self.cfg.init_pt_with_mv_attn_lowres,
-                                                )
+            self.pt = PlainPointTransformer(channels, self.cfg.knn_samples,
+                                            post_norm=self.cfg.post_norm,
+                                            no_rpe=self.cfg.no_rpe,
+                                            no_attn=self.cfg.no_knn_attn,
+                                            num_blocks=self.cfg.num_blocks,
+                                            num_heads=self.cfg.pt_heads,
+                                            attn_proj_channels=self.cfg.attn_proj_channels,
+                                            use_checkpointing=self.cfg.use_checkpointing,
+                                            init_use_checkpointing=self.cfg.init_use_checkpointing,
+                                            with_mv_attn=self.cfg.init_pt_with_mv_attn,
+                                            with_mv_attn_lowres=self.cfg.init_pt_with_mv_attn_lowres,
+                                            )
 
             out_channels = channels
 
-            # point downsample
-            if self.cfg.pt_downsample > 0:
-                num_downsample = int(np.log2(self.cfg.pt_downsample))
-
-                if num_downsample == 0:
-                    stride = 1
-                else:
-                    stride = 2
-
-                    assert num_downsample == 1, f"unsupported num_downsample: {num_downsample}"
-
-                self.pt_down = SubsampleBlock(channels, out_channels=channels * 2,
-                                              stride=stride,
-                                              knn_samples=self.cfg.knn_samples,
-                                              post_norm=self.cfg.post_norm,
-                                              agg_func=self.cfg.fps_agg_func,
-                                              subsample_method=self.cfg.subsample_method,
-                                              )
-
-                out_channels = channels * 2
-
-                # TODO: add more pt blocks after downsampling
 
             if self.cfg.pt_head_concat_img:
                 # concat to the initial image and features
@@ -675,16 +610,8 @@ class ResplatInitializer(LearnedInitializer[ResplatInitializerCfg]):
                 features,
             ), dim=1)
 
-        if self.cfg.lvsm_gaussian_regressor:
-            h, w = concat.shape[-2:]
-            tmp = rearrange(concat, "(b v) c h w -> b (v h w) c", b=b, v=v)
-            with torch.autocast('cuda', dtype=torch.bfloat16):
-                out = self.gaussian_regressor(tmp)
-
-            out = rearrange(out, "b (v h w) c -> (b v) c h w", b=b, v=v, h=h, w=w)
-        else:
-            with torch.amp.autocast(device_type='cuda', enabled=self.cfg.use_amp, dtype=torch.bfloat16):
-                out = self.gaussian_regressor(concat)
+        with torch.amp.autocast(device_type='cuda', enabled=self.cfg.use_amp, dtype=torch.bfloat16):
+            out = self.gaussian_regressor(concat)
 
         if self.cfg.latent_gs:
             concat = [out, img_unshuffle, features, match_prob]
@@ -744,10 +671,6 @@ class ResplatInitializer(LearnedInitializer[ResplatInitializerCfg]):
 
                 condition_features = rearrange(out, "(bv h w) c -> bv c h w", h=h, w=w)
 
-            if self.cfg.pt_downsample > 0:
-                out, fps_idx = self.pt_down((point_cloud, out, offset))
-                # [N, 3]
-                point_cloud, out, offset = out
 
             with torch.amp.autocast(device_type='cuda', enabled=self.cfg.pt_head_amp, dtype=torch.bfloat16):
                 if self.cfg.pt_head_concat_img:
@@ -767,22 +690,9 @@ class ResplatInitializer(LearnedInitializer[ResplatInitializerCfg]):
                 if self.cfg.pt_head_conv:
                     out = rearrange(out, "(b v) c h w -> (b v h w) c", b=b, v=v)
 
-            if self.cfg.pt_downsample > 0:
-                # [N, C]
-                gaussians = out
-            else:
-                if self.cfg.pt_pred_residual_position:
-                    # TODO: add intermediate supervision to the initial point cloud
-                    # TODO: multiple scale factor to the delta position to make it more stable
-                    # residual position
-                    point_cloud = point_cloud + out[..., -3:]  # [BVHW, 3]
+            point_cloud = rearrange(point_cloud, "(b v h w) c -> b v (h w) () () c", b=b, v=v, h=h, w=w)
 
-                    # remaining gaussians
-                    out = out[..., :-3]
-
-                point_cloud = rearrange(point_cloud, "(b v h w) c -> b v (h w) () () c", b=b, v=v, h=h, w=w)
-
-                gaussians = rearrange(out, "(b v h w) c -> (b v) c h w", b=b, h=h, w=w)
+            gaussians = rearrange(out, "(b v h w) c -> (b v) c h w", b=b, h=h, w=w)
 
         else:
             with torch.amp.autocast(device_type='cuda', enabled=self.cfg.use_amp, dtype=torch.bfloat16):
@@ -795,7 +705,6 @@ class ResplatInitializer(LearnedInitializer[ResplatInitializerCfg]):
             if self.cfg.init_gaussian_multiple > 1:
                 # hard coded for now
                 if self.cfg.init_gaussian_multiple == 4:
-                    # TODO: try avgpooling downsampling depth
                     if self.cfg.latent_downsample == 4:
                         # resize full resolution depth
                         depths = F.interpolate(depth, scale_factor=0.5, mode='bilinear', align_corners=True)
@@ -806,7 +715,6 @@ class ResplatInitializer(LearnedInitializer[ResplatInitializerCfg]):
                     else:
                         raise NotImplementedError
                 elif self.cfg.init_gaussian_multiple == 16:
-                    # TODO: try avgpooling downsampling depth
                     if self.cfg.latent_downsample == 4:
                         depths = depth
                     elif self.cfg.latent_downsample == 8:
@@ -822,414 +730,170 @@ class ResplatInitializer(LearnedInitializer[ResplatInitializerCfg]):
         else:
             depths = rearrange(depth, "b v h w -> b v (h w) () ()")
 
-        if self.cfg.pt_downsample > 0:
+        gaussians = rearrange(gaussians, "(b v) c h w -> b v c h w", b=b, v=v)
 
-            # split batch
-            assert offset.shape[0] == b
+        # [B, V, H*W, 84]
+        raw_gaussians = rearrange(
+            gaussians, "b v c h w -> b v (h w) c")
 
-            if self.cfg.latent_gs:
-                sh_input_images = rearrange(context["image"], "b v c h w -> (b v) c h w")
-                if self.cfg.latent_gs_img_interp == 'bicubic':
-                    sh_input_images = F.interpolate(sh_input_images, scale_factor=1. / self.cfg.latent_downsample,
-                                                    mode='bicubic', align_corners=True)
-                elif self.cfg.latent_gs_img_interp == 'area':
-                    sh_input_images = F.interpolate(sh_input_images, scale_factor=1. / self.cfg.latent_downsample,
-                                                    mode='area')
-                elif self.cfg.latent_gs_img_interp == 'softmax':
-                    sh_input_images = self.softmax_downsample(sh_input_images)
-                else:
-                    raise NotImplementedError
+        assert len(depth_preds) == 1, "num_scales must be 1; multi-scale depth supervision is not supported"
 
-                h, w = sh_input_images.shape[-2:]
+        # [B, V, H*W, C]
+        repeat = self.cfg.init_gaussian_multiple
+        num_sh = self.gaussian_adapter.d_sh
 
-                sh_input_images = rearrange(sh_input_images, "(b v) c h w -> b v c h w", b=b, v=v)
-            else:
-                sh_input_images = context["image"]
-
-            sh_input_images = rearrange(sh_input_images, "b v c h w -> (b v h w) c")
-
-            # subsample with fps index
-            sh_input_images = sh_input_images[fps_idx.long(), :]  # [N, 3]
-
-            # extrinsics
-            extrinsics_all = rearrange(repeat(context["extrinsics"], "b v i j -> b v h w i j", h=h, w=w),
-                                       "b v h w i j -> (b v h w) i j"
-                                       )
-            extrinsics_all = extrinsics_all[fps_idx.long(), :, :]  # [N, 4, 4]
-
-            point_list = [point_cloud[:offset[0]]]
-            gaussian_list = [gaussians[:offset[0]]]
-            sh_img_list = [sh_input_images[:offset[0]]]
-            extrinsics_list = [extrinsics_all[:offset[0]]]
-
-            for i in range(b - 1):
-                point_list.append(point_cloud[offset[i]:offset[i + 1]])
-                gaussian_list.append(gaussians[offset[i]:offset[i + 1]])
-                sh_img_list.append(sh_input_images[offset[i]:offset[i + 1]])
-                extrinsics_list.append(extrinsics_all[offset[i]:offset[i + 1]])
-
-            point_cloud = torch.stack(point_list, dim=0)  # [B, N, 3]
-            gaussians = torch.stack(gaussian_list, dim=0)  # [B, N, C]
-            sh_imgs = torch.stack(sh_img_list, dim=0)  # [B, N, 3]
-            extrinsics_all = torch.stack(extrinsics_list, dim=0)  # [B, N, 4, 4]
-
-            # point_cloud = [point_cloud[offset[i]:offset[i+1]] for i in range(b)]
-            # point_cloud = torch.stack(point_cloud, dim=0)  # [B, N, 3]
-            # gaussians = [gaussians[offset[i]:offset[i+1]] for i in range(b)]
-            # gaussians = torch.stack(gaussians, dim=0)  # [B, N, 3]
-
-            opacities = gaussians[..., 0].sigmoid()  # [B, N]
-
-            gaussians = self.gaussian_adapter.forward(
-                extrinsics=extrinsics_all,
-                intrinsics=None,
-                coordinates=None,
-                depths=None,
-                opacities=opacities,
-                raw_gaussians=gaussians[..., 1:],
-                image_shape=None,
-                point_cloud=point_cloud,
-                input_images=sh_imgs,
+        if self.cfg.no_pixel_offset:
+            rotations_unnorm, scales, opacities_raw, sh = raw_gaussians.split(
+                [4 * repeat, 3 * repeat, 1 * repeat, 3 * num_sh * repeat],
+                dim=-1,
+            )
+        else:
+            rotations_unnorm, scales, opacities_raw, offset, sh = raw_gaussians.split(
+                [4 * repeat, 3 * repeat, 1 * repeat, 2 * repeat, 3 * num_sh * repeat],
+                dim=-1,
             )
 
-            gaussians = rearrange(gaussians, "(b v) c h w -> b v c h w", b=b, v=v)
+        latent_h, latent_w = gaussians.shape[-2:]
 
-            # [B, V, H*W, 84]
-            raw_gaussians = rearrange(
-                gaussians, "b v c h w -> b v (h w) c")
-
-            assert len(depth_preds) == 1, "num_scales must be 1; multi-scale depth supervision is not supported"
-
-            # [B, V, H*W, C]
-            repeat = self.cfg.init_gaussian_multiple
-            num_sh = self.gaussian_adapter.d_sh
-
-            if self.cfg.no_pixel_offset:
-                rotations_unnorm, scales, opacities_raw, sh = raw_gaussians.split(
-                    [4 * repeat, 3 * repeat, 1 * repeat, 3 * num_sh * repeat],
-                    dim=-1,
-                )
+        if repeat > 1:
+            # reshape all the gaussian parameters
+            if True or self.cfg.latent_new_reshape:
+                # this works
+                r = int(np.sqrt(repeat))
+                rotations_unnorm = rearrange(rotations_unnorm, "b v (h w) (c x y) -> b v (h x w y) c",
+                                             h=latent_h, w=latent_w, x=r, y=r)
+                scales = rearrange(scales, "b v (h w) (c x y) -> b v (h x w y) c", h=latent_h, w=latent_w, x=r,
+                                   y=r)
+                opacities_raw = rearrange(opacities_raw, "b v (h w) (c x y) -> b v (h x w y) c", h=latent_h,
+                                          w=latent_w, x=r, y=r)
+                offset = rearrange(offset, "b v (h w) (c x y) -> b v (h x w y) c", h=latent_h, w=latent_w, x=r,
+                                   y=r)
+                sh = rearrange(sh, "b v (h w) (c x y) -> b v (h x w y) c", h=latent_h, w=latent_w, x=r, y=r)
             else:
-                rotations_unnorm, scales, opacities_raw, offset, sh = raw_gaussians.split(
-                    [4 * repeat, 3 * repeat, 1 * repeat, 2 * repeat, 3 * num_sh * repeat],
-                    dim=-1,
-                )
+                # doesn't work
+                rotations_unnorm = rearrange(rotations_unnorm, "b v hw (k c) -> b v (hw k) c", k=repeat)
+                scales = rearrange(scales, "b v hw (k c) -> b v (hw k) c", k=repeat)
+                opacities_raw = rearrange(opacities_raw, "b v hw (k c) -> b v (hw k) c", k=repeat)
+                offset = rearrange(offset, "b v hw (k c) -> b v (hw k) c", k=repeat)
+                sh = rearrange(sh, "b v hw (k c) -> b v (hw k) c", k=repeat)
 
-            latent_h, latent_w = gaussians.shape[-2:]
+        opacities = opacities_raw.sigmoid()  # [B, V, H*W*K, 1]
 
-            if repeat > 1:
-                # reshape all the gaussian parameters
-                if True or self.cfg.latent_new_reshape:
-                    # this works
-                    r = int(np.sqrt(repeat))
-                    rotations_unnorm = rearrange(rotations_unnorm, "b v (h w) (c x y) -> b v (h x w y) c",
-                                                 h=latent_h, w=latent_w, x=r, y=r)
-                    scales = rearrange(scales, "b v (h w) (c x y) -> b v (h x w y) c", h=latent_h, w=latent_w, x=r,
-                                       y=r)
-                    opacities_raw = rearrange(opacities_raw, "b v (h w) (c x y) -> b v (h x w y) c", h=latent_h,
-                                              w=latent_w, x=r, y=r)
-                    offset = rearrange(offset, "b v (h w) (c x y) -> b v (h x w y) c", h=latent_h, w=latent_w, x=r,
-                                       y=r)
-                    sh = rearrange(sh, "b v (h w) (c x y) -> b v (h x w y) c", h=latent_h, w=latent_w, x=r, y=r)
-                else:
-                    # doesn't work
-                    rotations_unnorm = rearrange(rotations_unnorm, "b v hw (k c) -> b v (hw k) c", k=repeat)
-                    scales = rearrange(scales, "b v hw (k c) -> b v (hw k) c", k=repeat)
-                    opacities_raw = rearrange(opacities_raw, "b v hw (k c) -> b v (hw k) c", k=repeat)
-                    offset = rearrange(offset, "b v hw (k c) -> b v (hw k) c", k=repeat)
-                    sh = rearrange(sh, "b v hw (k c) -> b v (hw k) c", k=repeat)
+        if self.cfg.latent_downsample == 4 and self.cfg.init_gaussian_multiple == 4:
+            scale_factor = 2
+        elif self.cfg.latent_downsample == 2 and self.cfg.init_gaussian_multiple == 4:
+            scale_factor = 2
+        elif self.cfg.latent_downsample == 4 and self.cfg.init_gaussian_multiple == 16:
+            scale_factor = 4
+        elif self.cfg.latent_downsample == 8 and self.cfg.init_gaussian_multiple == 4:
+            scale_factor = 2
+        elif self.cfg.latent_downsample == 8 and self.cfg.init_gaussian_multiple == 16:
+            scale_factor = 4
+        else:
+            scale_factor = 1
 
-            opacities = opacities_raw.sigmoid()  # [B, V, H*W*K, 1]
+        h, w = latent_h * scale_factor, latent_w * scale_factor
 
+        # unproject depth
+        xy_ray, _ = sample_image_grid((h, w), device)
+        xy_ray = rearrange(xy_ray, "h w xy -> (h w) () xy")
+
+        if self.cfg.no_pixel_offset:
+            offset_xy = torch.ones_like(raw_gaussians[..., :2]).unsqueeze(-2).to(
+                raw_gaussians.device) * 0.5  # [B, V, H*W, 1, 2]
+        else:
+            offset_xy = offset.sigmoid().unsqueeze(-2)  # [B, V, H*W, 1, 2]
+
+        pixel_size = 1 / \
+                     torch.tensor((w, h), dtype=torch.float32, device=device)
+        # [H*W, 1, 2]
+        if self.cfg.deform_sample_depth and not self.cfg.deform_sample_depth_debug:
+            # (offset_xy - 0.5) in -0.5 to 0.5, without multiplying by pixel size such that the points can move in the image space
+            xy_ray = (xy_ray + (offset_xy - 0.5)).clamp(min=0., max=1.)
+        else:
+            xy_ray = xy_ray + (offset_xy - 0.5) * pixel_size
+
+        if self.cfg.deform_sample_depth:
+            # use low-res xy_ray to sample full-res depth
+
+            sample_grid = rearrange(xy_ray, "b v (h w) c xy -> (b v) h w (c xy)", h=h, w=w)  # in [0, 1]
+            # to [-1, 1]
+            sample_grid = 2 * (sample_grid - 0.5)  # [BV, h, w, 2]
+
+            fullres_depth = rearrange(depth, "b v h w -> (b v) () h w")  # [BV, 1, H, W]
+            sampled_depth = F.grid_sample(fullres_depth, sample_grid, mode='bilinear', align_corners=True,
+                                          padding_mode="border")  # [BV, 1, h, w]
+            # reshape
+            depths = rearrange(sampled_depth, "(b v) () h w -> b v (h w) () ()", b=b, v=v, h=h, w=w)
+
+        if self.cfg.latent_gs:
+            sh_input_images = rearrange(context["image"], "b v c h w -> (b v) c h w")
             if self.cfg.latent_downsample == 4 and self.cfg.init_gaussian_multiple == 4:
-                scale_factor = 2
-            elif self.cfg.latent_downsample == 2 and self.cfg.init_gaussian_multiple == 4:
-                scale_factor = 2
+                sh_input_images = F.interpolate(sh_input_images, scale_factor=0.5, mode='area')
             elif self.cfg.latent_downsample == 4 and self.cfg.init_gaussian_multiple == 16:
-                scale_factor = 4
+                pass
+            elif self.cfg.latent_downsample == 2 and self.cfg.init_gaussian_multiple == 4:
+                pass
             elif self.cfg.latent_downsample == 8 and self.cfg.init_gaussian_multiple == 4:
-                scale_factor = 2
+                sh_input_images = F.interpolate(sh_input_images, scale_factor=0.25, mode='area')
             elif self.cfg.latent_downsample == 8 and self.cfg.init_gaussian_multiple == 16:
-                scale_factor = 4
+                sh_input_images = F.interpolate(sh_input_images, scale_factor=0.5, mode='area')
             else:
-                scale_factor = 1
+                sh_input_images = F.interpolate(sh_input_images, scale_factor=1. / self.cfg.latent_downsample,
+                                                mode='area')
 
-            h, w = latent_h * scale_factor, latent_w * scale_factor
-
-            # unproject depth
-            xy_ray, _ = sample_image_grid((h, w), device)  # [H, W, 2] in [0, 1]
-            xy_ray = rearrange(xy_ray, "h w xy -> (h w) () xy")  # [H*W, 1, 2]
-
-            if self.cfg.no_pixel_offset:
-                offset_xy = torch.ones_like(raw_gaussians[..., :2]).unsqueeze(-2).to(
-                    raw_gaussians.device) * 0.5  # [B, V, H*W, 1, 2]
-            else:
-                offset_xy = offset.sigmoid().unsqueeze(-2)  # [B, V, H*W, 1, 2]
-
-            pixel_size = 1 / \
-                         torch.tensor((w, h), dtype=torch.float32, device=device)
-            # [H*W, 1, 2]
-            if self.cfg.deform_sample_depth and not self.cfg.deform_sample_depth_debug:
-                # (offset_xy - 0.5) in -0.5 to 0.5, without multiplying by pixel size such that the points can move in the image space
-                xy_ray = (xy_ray + (offset_xy - 0.5)).clamp(min=0., max=1.)
-            else:
-                xy_ray = xy_ray + (offset_xy - 0.5) * pixel_size
-
-            if self.cfg.deform_sample_depth:
-                # use low-res xy_ray to sample full-res depth
-
-                sample_grid = rearrange(xy_ray, "b v (h w) c xy -> (b v) h w (c xy)", h=h, w=w)  # in [0, 1]
-                # to [-1, 1]
-                sample_grid = 2 * (sample_grid - 0.5)  # [BV, h, w, 2]
-
-                fullres_depth = rearrange(depth, "b v h w -> (b v) () h w")  # [BV, 1, H, W]
-                sampled_depth = F.grid_sample(fullres_depth, sample_grid, mode='bilinear', align_corners=True,
-                                              padding_mode="border")  # [BV, 1, h, w]
-                # reshape
-                depths = rearrange(sampled_depth, "(b v) () h w -> b v (h w) () ()", b=b, v=v, h=h, w=w)
-
-            if self.cfg.latent_gs:
-                sh_input_images = rearrange(context["image"], "b v c h w -> (b v) c h w")
-                if self.cfg.latent_downsample == 4 and self.cfg.init_gaussian_multiple == 4:
-                    sh_input_images = F.interpolate(sh_input_images, scale_factor=0.5, mode='area')
-                elif self.cfg.latent_downsample == 4 and self.cfg.init_gaussian_multiple == 16:
-                    pass
-                elif self.cfg.latent_downsample == 2 and self.cfg.init_gaussian_multiple == 4:
-                    pass
-                elif self.cfg.latent_downsample == 8 and self.cfg.init_gaussian_multiple == 4:
-                    sh_input_images = F.interpolate(sh_input_images, scale_factor=0.25, mode='area')
-                elif self.cfg.latent_downsample == 8 and self.cfg.init_gaussian_multiple == 16:
-                    sh_input_images = F.interpolate(sh_input_images, scale_factor=0.5, mode='area')
-                else:
-                    sh_input_images = F.interpolate(sh_input_images, scale_factor=1. / self.cfg.latent_downsample,
-                                                    mode='area')
-
-                sh_input_images = rearrange(sh_input_images, "(b v) c h w -> b v c h w", b=b, v=v)
-
-            else:
-                sh_input_images = context["image"]
-
-            assert len(depth_preds) == 1, "num_scales must be 1; multi-scale depth supervision is not supported"
-
-            # build gaussians
-            # scale
-            scales = torch.clamp(F.softplus(scales - self.cfg.gaussian_adapter.exp_scale_bias),
-                                 min=self.cfg.gaussian_adapter.clamp_min_scale,
-                                 max=self.cfg.gaussian_adapter.gaussian_scale_max
-                                 )
-
-            # Normalize the quaternion features to yield a valid quaternion.
-            # rotations = rotations_unnorm / (rotations_unnorm.norm(dim=-1, keepdim=True) + 1e-8)
-
-            # Convert rotations to world-space
-            c2w_rotations = context["extrinsics"][..., :3, :3].unsqueeze(2)  # [B, V, 1, 3, 3]
-            rotations = rotate_quats(c2w_rotations, rotations_unnorm)
-            rotations_unnorm = rotations.clone()
-            # Create world-space covariance matrices.
-            covariances = build_covariance(scale=scales, rotation_xyzw=rotations)  # [B, V, H*W, 3, 3]
-            
-            # means
-            # [B, V, H*W, 1, 2]
-            # xy_ray = xy_ray.unsqueeze(0).unsqueeze(0).repeat(b, v, 1, 1, 1)
-            origins, directions = get_world_rays(xy_ray,
-                                                 context["extrinsics"].unsqueeze(2).unsqueeze(2),
-                                                 context["intrinsics"].unsqueeze(2).unsqueeze(2))
-            means = origins + directions * depths
-
-            # sh: [B, V, HW, 3, SH]
-            sh = rearrange(sh, "... (xyz d_sh) -> ... xyz d_sh", xyz=3).clone()
-            # sh = sh.broadcast_to((*opacities.shape, 3, self.gaussian_adapter.d_sh)).clone()
-
-            # [B, V, H*W, 3]
-            sh_input_images = rearrange(sh_input_images, "b v c h w -> b v (h w) c")
-            # init sh with input images
-            sh[..., 0] = sh[..., 0] + RGB2SH(sh_input_images)
-
-            gaussians = Gaussians(
-                means=rearrange(means, "b v r spp xyz -> b (v r spp) xyz"),
-                covariances=rearrange(covariances, "b v r i j -> b (v r) i j"),
-                harmonics=rearrange(sh, "b v r c d_sh -> b (v r) c d_sh"),
-                opacities=rearrange(opacities, "b v r spp -> b (v r spp)"),
-                scales=rearrange(scales, "b v r xyz -> b (v r) xyz"),
-                rotations=rearrange(rotations, "b v r wxyz -> b (v r) wxyz"),  # in wxyz format
-                rotations_unnorm=rearrange(rotations_unnorm, "b v r wxyz -> b (v r) wxyz")  # in wxyz format
-            )
+            sh_input_images = rearrange(sh_input_images, "(b v) c h w -> b v c h w", b=b, v=v)
 
         else:
-            gaussians = rearrange(gaussians, "(b v) c h w -> b v c h w", b=b, v=v)
+            sh_input_images = context["image"]
 
-            # [B, V, H*W, 84]
-            raw_gaussians = rearrange(
-                gaussians, "b v c h w -> b v (h w) c")
+        assert len(depth_preds) == 1, "num_scales must be 1; multi-scale depth supervision is not supported"
 
-            assert len(depth_preds) == 1, "num_scales must be 1; multi-scale depth supervision is not supported"
+        # build gaussians
+        # scale
+        scales = torch.clamp(F.softplus(scales - self.cfg.gaussian_adapter.exp_scale_bias),
+                             min=self.cfg.gaussian_adapter.clamp_min_scale,
+                             max=self.cfg.gaussian_adapter.gaussian_scale_max
+                             )
 
-            # [B, V, H*W, C]
-            repeat = self.cfg.init_gaussian_multiple
-            num_sh = self.gaussian_adapter.d_sh
+        # Convert rotations to world-space
+        c2w_rotations = context["extrinsics"][..., :3, :3].unsqueeze(2)  # [B, V, 1, 3, 3]
+        # Here quaternions follow the xyzw format (scalar last)
+        rotations = rotate_quats(c2w_rotations, rotations_unnorm)
+        rotations_unnorm = rotations.clone()
+        # Create world-space covariance matrices.
+        covariances = build_covariance(scale=scales, rotation_xyzw=rotations)  # [B, V, H*W, 3, 3]
 
-            if self.cfg.no_pixel_offset:
-                rotations_unnorm, scales, opacities_raw, sh = raw_gaussians.split(
-                    [4 * repeat, 3 * repeat, 1 * repeat, 3 * num_sh * repeat],
-                    dim=-1,
-                )
-            else:
-                rotations_unnorm, scales, opacities_raw, offset, sh = raw_gaussians.split(
-                    [4 * repeat, 3 * repeat, 1 * repeat, 2 * repeat, 3 * num_sh * repeat],
-                    dim=-1,
-                )
+        # means
+        # [B, V, H*W, 1, 2]
+        origins, directions = get_world_rays(xy_ray,
+                                             context["extrinsics"].unsqueeze(2).unsqueeze(2),
+                                             context["intrinsics"].unsqueeze(2).unsqueeze(2))
+        means = origins + directions * depths
 
-            latent_h, latent_w = gaussians.shape[-2:]
+        # sh: [B, V, HW, 3, SH]
+        sh = rearrange(sh, "... (xyz d_sh) -> ... xyz d_sh", xyz=3).clone()
 
-            if repeat > 1:
-                # reshape all the gaussian parameters
-                if True or self.cfg.latent_new_reshape:
-                    # this works
-                    r = int(np.sqrt(repeat))
-                    rotations_unnorm = rearrange(rotations_unnorm, "b v (h w) (c x y) -> b v (h x w y) c",
-                                                 h=latent_h, w=latent_w, x=r, y=r)
-                    scales = rearrange(scales, "b v (h w) (c x y) -> b v (h x w y) c", h=latent_h, w=latent_w, x=r,
-                                       y=r)
-                    opacities_raw = rearrange(opacities_raw, "b v (h w) (c x y) -> b v (h x w y) c", h=latent_h,
-                                              w=latent_w, x=r, y=r)
-                    offset = rearrange(offset, "b v (h w) (c x y) -> b v (h x w y) c", h=latent_h, w=latent_w, x=r,
-                                       y=r)
-                    sh = rearrange(sh, "b v (h w) (c x y) -> b v (h x w y) c", h=latent_h, w=latent_w, x=r, y=r)
-                else:
-                    # doesn't work
-                    rotations_unnorm = rearrange(rotations_unnorm, "b v hw (k c) -> b v (hw k) c", k=repeat)
-                    scales = rearrange(scales, "b v hw (k c) -> b v (hw k) c", k=repeat)
-                    opacities_raw = rearrange(opacities_raw, "b v hw (k c) -> b v (hw k) c", k=repeat)
-                    offset = rearrange(offset, "b v hw (k c) -> b v (hw k) c", k=repeat)
-                    sh = rearrange(sh, "b v hw (k c) -> b v (hw k) c", k=repeat)
+        # [B, V, H*W, 3]
+        sh_input_images = rearrange(sh_input_images, "b v c h w -> b v (h w) c")
+        # init sh with input images
+        sh[..., 0] = sh[..., 0] + RGB2SH(sh_input_images)
 
-            opacities = opacities_raw.sigmoid()  # [B, V, H*W*K, 1]
-
-            if self.cfg.latent_downsample == 4 and self.cfg.init_gaussian_multiple == 4:
-                scale_factor = 2
-            elif self.cfg.latent_downsample == 2 and self.cfg.init_gaussian_multiple == 4:
-                scale_factor = 2
-            elif self.cfg.latent_downsample == 4 and self.cfg.init_gaussian_multiple == 16:
-                scale_factor = 4
-            elif self.cfg.latent_downsample == 8 and self.cfg.init_gaussian_multiple == 4:
-                scale_factor = 2
-            elif self.cfg.latent_downsample == 8 and self.cfg.init_gaussian_multiple == 16:
-                scale_factor = 4
-            else:
-                scale_factor = 1
-
-            h, w = latent_h * scale_factor, latent_w * scale_factor
-
-            # unproject depth
-            xy_ray, _ = sample_image_grid((h, w), device)
-            xy_ray = rearrange(xy_ray, "h w xy -> (h w) () xy")
-
-            if self.cfg.no_pixel_offset:
-                offset_xy = torch.ones_like(raw_gaussians[..., :2]).unsqueeze(-2).to(
-                    raw_gaussians.device) * 0.5  # [B, V, H*W, 1, 2]
-            else:
-                offset_xy = offset.sigmoid().unsqueeze(-2)  # [B, V, H*W, 1, 2]
-
-            pixel_size = 1 / \
-                         torch.tensor((w, h), dtype=torch.float32, device=device)
-            # [H*W, 1, 2]
-            if self.cfg.deform_sample_depth and not self.cfg.deform_sample_depth_debug:
-                # (offset_xy - 0.5) in -0.5 to 0.5, without multiplying by pixel size such that the points can move in the image space
-                xy_ray = (xy_ray + (offset_xy - 0.5)).clamp(min=0., max=1.)
-            else:
-                xy_ray = xy_ray + (offset_xy - 0.5) * pixel_size
-
-            if self.cfg.deform_sample_depth:
-                # use low-res xy_ray to sample full-res depth
-
-                sample_grid = rearrange(xy_ray, "b v (h w) c xy -> (b v) h w (c xy)", h=h, w=w)  # in [0, 1]
-                # to [-1, 1]
-                sample_grid = 2 * (sample_grid - 0.5)  # [BV, h, w, 2]
-
-                fullres_depth = rearrange(depth, "b v h w -> (b v) () h w")  # [BV, 1, H, W]
-                sampled_depth = F.grid_sample(fullres_depth, sample_grid, mode='bilinear', align_corners=True,
-                                              padding_mode="border")  # [BV, 1, h, w]
-                # reshape
-                depths = rearrange(sampled_depth, "(b v) () h w -> b v (h w) () ()", b=b, v=v, h=h, w=w)
-
-            if self.cfg.latent_gs:
-                sh_input_images = rearrange(context["image"], "b v c h w -> (b v) c h w")
-                if self.cfg.latent_downsample == 4 and self.cfg.init_gaussian_multiple == 4:
-                    sh_input_images = F.interpolate(sh_input_images, scale_factor=0.5, mode='area')
-                elif self.cfg.latent_downsample == 4 and self.cfg.init_gaussian_multiple == 16:
-                    pass
-                elif self.cfg.latent_downsample == 2 and self.cfg.init_gaussian_multiple == 4:
-                    pass
-                elif self.cfg.latent_downsample == 8 and self.cfg.init_gaussian_multiple == 4:
-                    sh_input_images = F.interpolate(sh_input_images, scale_factor=0.25, mode='area')
-                elif self.cfg.latent_downsample == 8 and self.cfg.init_gaussian_multiple == 16:
-                    sh_input_images = F.interpolate(sh_input_images, scale_factor=0.5, mode='area')
-                else:
-                    sh_input_images = F.interpolate(sh_input_images, scale_factor=1. / self.cfg.latent_downsample,
-                                                    mode='area')
-
-                sh_input_images = rearrange(sh_input_images, "(b v) c h w -> b v c h w", b=b, v=v)
-
-            else:
-                sh_input_images = context["image"]
-
-            assert len(depth_preds) == 1, "num_scales must be 1; multi-scale depth supervision is not supported"
-
-            # build gaussians
-            # scale
-            scales = torch.clamp(F.softplus(scales - self.cfg.gaussian_adapter.exp_scale_bias),
-                                 min=self.cfg.gaussian_adapter.clamp_min_scale,
-                                 max=self.cfg.gaussian_adapter.gaussian_scale_max
-                                 )
-
-            # Convert rotations to world-space
-            c2w_rotations = context["extrinsics"][..., :3, :3].unsqueeze(2)  # [B, V, 1, 3, 3]
-            # Here quaternions follow the xyzw format (scalar last)
-            rotations = rotate_quats(c2w_rotations, rotations_unnorm)
-            rotations_unnorm = rotations.clone()
-            # Create world-space covariance matrices.
-            covariances = build_covariance(scale=scales, rotation_xyzw=rotations)  # [B, V, H*W, 3, 3]
-
-            # means
-            # [B, V, H*W, 1, 2]
-            origins, directions = get_world_rays(xy_ray,
-                                                 context["extrinsics"].unsqueeze(2).unsqueeze(2),
-                                                 context["intrinsics"].unsqueeze(2).unsqueeze(2))
-            means = origins + directions * depths
-
-            # sh: [B, V, HW, 3, SH]
-            sh = rearrange(sh, "... (xyz d_sh) -> ... xyz d_sh", xyz=3).clone()
-
-            # [B, V, H*W, 3]
-            sh_input_images = rearrange(sh_input_images, "b v c h w -> b v (h w) c")
-            # init sh with input images
-            sh[..., 0] = sh[..., 0] + RGB2SH(sh_input_images)
-
-            gaussians = Gaussians(
-                means=rearrange(means, "b v r spp xyz -> b (v r spp) xyz"),
-                covariances=rearrange(covariances, "b v r i j -> b (v r) i j"),
-                harmonics=rearrange(sh, "b v r c d_sh -> b (v r) c d_sh"),
-                opacities=rearrange(opacities, "b v r spp -> b (v r spp)"),
-                scales=rearrange(scales, "b v r xyz -> b (v r) xyz"),
-                rotations=rearrange(rotations, "b v r wxyz -> b (v r) wxyz"),
-                rotations_unnorm=rearrange(rotations_unnorm, "b v r wxyz -> b (v r) wxyz")
-            )
+        gaussians = Gaussians(
+            means=rearrange(means, "b v r spp xyz -> b (v r spp) xyz"),
+            covariances=rearrange(covariances, "b v r i j -> b (v r) i j"),
+            harmonics=rearrange(sh, "b v r c d_sh -> b (v r) c d_sh"),
+            opacities=rearrange(opacities, "b v r spp -> b (v r spp)"),
+            scales=rearrange(scales, "b v r xyz -> b (v r) xyz"),
+            rotations=rearrange(rotations, "b v r wxyz -> b (v r) wxyz"),
+            rotations_unnorm=rearrange(rotations_unnorm, "b v r wxyz -> b (v r) wxyz")
+        )
 
         # Dump visualizations if needed.
         if visualization_dump is not None:
             visualization_dump["depth"] = rearrange(
                 depths, "b v (h w) srf s -> b v h w srf s", h=h, w=w
             )
-            # if self.cfg.pt_downsample > 0:
-            #     visualization_dump["scales"] = gaussians.scales
-            #     visualization_dump["rotations"] = gaussians.rotations
-            # else:
-            #     visualization_dump["scales"] = rearrange(
-            #         gaussians.scales, "b v r srf spp xyz -> b (v r srf spp) xyz"
-            #     )
-            #     visualization_dump["rotations"] = rearrange(
-            #         gaussians.rotations, "b v r srf spp xyzw -> b (v r srf spp) xyzw"
-            #     )
 
         if self.cfg.return_depth:
             # return depth prediction for supervision
@@ -1279,22 +943,6 @@ class ResplatInitializer(LearnedInitializer[ResplatInitializerCfg]):
         batch["context"]["far"] = batch["context"]["depth"].max(dim=3)[0].max(dim=2)[0].clamp(max=1000.)
         batch["target"]["near"] = batch["target"]["depth"].min(dim=3)[0].min(dim=2)[0].clamp(min=0.01)
         batch["target"]["far"] = batch["target"]["depth"].max(dim=3)[0].max(dim=2)[0].clamp(max=1000.)
-
-    def update_depth_range_from_disparity(self, batch):
-        b, v, _, h, w = batch["context"]["image"].shape
-        # TODO: support multi-view later
-        assert v == 2
-        assert self.decoder.cfg.scale_invariant is False
-        w = batch["context"]["image"].shape[-1]
-        # compute the depth range based on disparity range
-        dist = (batch["context"]["extrinsics"][:, 0, :3, 3] - batch["context"]["extrinsics"][:, 1, :3, 3]).norm(
-            dim=1, keepdim=True)
-        focal = batch["context"]["intrinsics"][:, :, 0, 0] * w
-        min_depth = dist * focal / self.train_cfg.max_disparity
-        max_depth = dist * focal / self.train_cfg.min_disparity
-        batch["context"]["near"] = min_depth
-        batch["context"]["far"] = max_depth
-        # TODO: also update target near and far
 
     def predict_scale(self, batch):
         context = batch["context"]
@@ -1354,13 +1002,10 @@ class ResplatInitializer(LearnedInitializer[ResplatInitializerCfg]):
             batch["context"]["extrinsics"][:, :, :3, -1] /= norm_factor.view(b, 1, 1)
             batch["target"]["extrinsics"][:, :, :3, -1] /= norm_factor.view(b, 1, 1)
 
-    def preprocessing(self, batch, train_cfg):
+    def eval_preprocessing(self, batch, train_cfg):
         # use gt depth range instead of a fixed one
         if train_cfg.use_gt_depth_range:
             self.update_gt_depth_range(batch)
-        # compute depth range from camera distance and disparity range
-        if train_cfg.depth_range_from_disparity:
-            self.update_depth_range_from_disparity(batch)
 
         # use a pretrained depth model to predict scale
         if self.cfg.predict_scale:

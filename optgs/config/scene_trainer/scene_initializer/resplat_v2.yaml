@@ -77,19 +77,13 @@ init_pt_with_mv_attn_lowres: true
 pt_head_channels: null
 pt_head_concat_img: false
 pt_head_conv: false
-multi_scale_pt: false
 attn_proj_channels: 64
-fps_num_samples: null
 knn_samples: 16
 post_norm: false
 no_rpe: true
 no_knn_attn: false
 num_blocks: 6
-pt_downsample: 0
-fps_agg_func: attn
-subsample_method: fps
 add_pt_residual: true
-pt_pred_residual_position: false
 
 # freeze depth
 freeze_depth: false
@@ -104,10 +98,6 @@ sample_log_depth: true
 bilinear_upsample_depth: false
 no_upsample_depth: false
 return_lowres_depth: false
-
-# lvsm gaussian regressor
-lvsm_gaussian_regressor: false
-lvsm_layers: 6
 
 # latent gaussian instead of pixel aligned gaussians
 latent_gs: true

@@ -8,13 +8,11 @@ from typing import Literal, Optional
 import numpy as np
 import torch
 import torchvision.transforms as tf
-import torch.nn.functional as F
 from einops import rearrange, repeat
 from jaxtyping import Float, UInt8
 from PIL import Image
 from torch import Tensor
 from torch.utils.data import IterableDataset
-import cv2
 
 from ..geometry.projection import get_fov
 from .dataset import DatasetCfgCommon
@@ -22,38 +20,25 @@ from .shims.augmentation_shim import apply_augmentation_shim
 from .shims.crop_shim import apply_crop_shim
 from .data_types import Stage
 from .view_sampler import ViewSampler
-from .dataset_dl3dv import get_remaining_indices
 
 
 @dataclass
 class DatasetRE10kCfg(DatasetCfgCommon):
     name: Literal["re10k"]
     roots: list[Path]
-    baseline_epsilon: float
     max_fov: float
-    make_baseline_1: bool
     augment: bool
     test_len: int
     test_chunk_interval: int
-    average_pose: bool 
     skip_bad_shape: bool = True
     near: float = -1.0
     far: float = -1.0
-    baseline_scale_bounds: bool = True
     shuffle_val: bool = True
     train_times_per_scene: int = 1
     highres: bool = False
     scannet: bool = False
     tartanair: bool = False
-    use_index_to_load_chunk: Optional[bool] = False
     load_depth: bool = False
-    pose_align_first_view: bool = False  # align the camera pose to the first view
-    center_pose: bool = False  # center and normalize the pose by the distance to the center
-
-    scale_extrinsics: float = 1.
-
-    # load remaining context views
-    load_remain_context: bool = False
 
 
 class DatasetRE10k(IterableDataset):
@@ -86,14 +71,9 @@ class DatasetRE10k(IterableDataset):
         self.chunks = []
         for i, root in enumerate(cfg.roots):
             root = root / self.data_stage
-            if self.cfg.use_index_to_load_chunk:
-                with open(root / "index.json", "r") as f:
-                    json_dict = json.load(f)
-                root_chunks = sorted(list(set(json_dict.values())))
-            else:
-                root_chunks = sorted(
-                    [path for path in root.iterdir() if path.suffix == ".torch"]
-                )
+            root_chunks = sorted(
+                [path for path in root.iterdir() if path.suffix == ".torch"]
+            )
 
             self.chunks.extend(root_chunks)
         if self.cfg.overfit_to_scene is not None:
@@ -110,7 +90,7 @@ class DatasetRE10k(IterableDataset):
     def __iter__(self):
         # Chunks must be shuffled here (not inside __init__) for validation to show
         # random chunks.
-        if self.stage in (("train", "val") if self.cfg.shuffle_val else ("train")):
+        if self.stage == "train" or (self.cfg.shuffle_val and self.stage == "val"):
             self.chunks = self.shuffle(self.chunks)
 
         # When testing, the data loaders alternate chunks.
@@ -134,7 +114,7 @@ class DatasetRE10k(IterableDataset):
                 assert len(item) == 1
                 chunk = item * len(chunk)
 
-            if self.stage in (("train", "val") if self.cfg.shuffle_val else ("train")):
+            if self.stage == "train" or (self.cfg.shuffle_val and self.stage == "val"):
                 chunk = self.shuffle(chunk)
 
             times_per_scene = (
@@ -163,23 +143,6 @@ class DatasetRE10k(IterableDataset):
                 if (get_fov(intrinsics).rad2deg() > self.cfg.max_fov).any():
                     continue
 
-                # load remaining context views
-                if self.cfg.load_remain_context:
-                    # randomly select fixed number of remaining views such that they can be batched
-                    remaining_indices = get_remaining_indices(context_indices, target_indices, 
-                        0)
-
-                    # Load the images.
-                    remain_context_images = [
-                        example["images"][index.item()] for index in remaining_indices
-                    ]
-
-                    try:
-                        remain_context_images = self.convert_images(remain_context_images)
-                    except OSError:
-                        # some data might be corrupted
-                        continue
-
                 # Load the images.
                 context_images = [
                     example["images"][index.item()] for index in context_indices
@@ -207,21 +170,12 @@ class DatasetRE10k(IterableDataset):
                     )
                     continue
 
-                if self.cfg.load_remain_context:
-                    remain_context_invalid = remain_context_images.shape[1:] != expected_shape
-
-                    if self.cfg.skip_bad_shape and remain_context_invalid:
-                        continue
-
                 # check the extrinsics
                 if any(torch.isnan(torch.det(extrinsics[context_indices][:, :3, :3]))):
                     continue
 
                 if any(torch.isnan(torch.det(extrinsics[target_indices][:, :3, :3]))):
                     continue
-
-                if self.cfg.average_pose:
-                    extrinsics = self.preprocess_poses(extrinsics)
 
                 # load depth
                 if self.cfg.load_depth:
@@ -245,15 +199,12 @@ class DatasetRE10k(IterableDataset):
                     else:
                         raise NotImplementedError
 
-                # align pose to the first view
-                if self.cfg.pose_align_first_view:
-                    extrinsics = camera_normalization(extrinsics[context_indices][0:1], extrinsics)
-
-                if self.cfg.center_pose:
-                    extrinsics = center_norm_pose(extrinsics)
-
-                # scale the scene when necessary: only scale the extrinsics
-                extrinsics[:, :3, 3] *= self.cfg.scale_extrinsics
+                # align pose to the middle view
+                if self.cfg.pose_align_middle_view:
+                    mid_index = context_indices.shape[0] // 2
+                    extrinsics = camera_normalization(
+                        extrinsics[context_indices][mid_index:mid_index + 1], extrinsics
+                    )
 
                 example = {
                     "context": {
@@ -274,19 +225,6 @@ class DatasetRE10k(IterableDataset):
                     },
                     "scene": scene,
                 }
-
-                if self.cfg.load_remain_context:
-                    example.update({
-                        "context_remain": {
-                            "extrinsics": extrinsics[remaining_indices],
-                            "intrinsics": intrinsics[remaining_indices],
-                            "image": remain_context_images,
-                            "near": self.get_bound("near", len(remaining_indices)),
-                            "far": self.get_bound("far", len(remaining_indices)),
-                            "index": remaining_indices,
-                        }
-                        }
-                    )
 
                 if self.cfg.load_depth:
                     example['context']['depth'] = context_depths
@@ -400,65 +338,20 @@ class DatasetRE10k(IterableDataset):
             else len(self.index.keys()) * self.cfg.train_times_per_scene
         )
 
-    def preprocess_poses(
-        self,
-        in_c2ws: torch.Tensor,
-        scene_scale_factor=1.35,
-    ):
-        """
-        Ref: https://github.com/Haian-Jin/LVSM/blob/main/data/dataset_scene.py
-        Preprocess the poses to:
-        1. translate and rotate the scene to align the average camera direction and position
-        2. rescale the whole scene to a fixed scale
-        """
-
-        # Translation and Rotation
-        # align coordinate system (OpenCV coordinate) to the mean camera
-        # center is the average of all camera centers
-        # average direction vectors are computed from all camera direction vectors (average down and forward)
-        center = in_c2ws[:, :3, 3].mean(0)
-        avg_forward = F.normalize(in_c2ws[:, :3, 2].mean(0), dim=-1) # average forward direction (z of opencv camera)
-        avg_down = in_c2ws[:, :3, 1].mean(0) # average down direction (y of opencv camera)
-        avg_right = F.normalize(torch.cross(avg_down, avg_forward, dim=-1), dim=-1) # (x of opencv camera)
-        avg_down = F.normalize(torch.cross(avg_forward, avg_right, dim=-1), dim=-1) # (y of opencv camera)
-
-        avg_pose = torch.eye(4, device=in_c2ws.device) # average c2w matrix
-        avg_pose[:3, :3] = torch.stack([avg_right, avg_down, avg_forward], dim=-1)
-        avg_pose[:3, 3] = center 
-        avg_pose = torch.linalg.inv(avg_pose) # average w2c matrix
-        in_c2ws = avg_pose @ in_c2ws 
-
-
-        # Rescale the whole scene to a fixed scale
-        scene_scale = torch.max(torch.abs(in_c2ws[:, :3, 3]))
-        scene_scale = scene_scale_factor * scene_scale
-
-        in_c2ws[:, :3, 3] /= scene_scale
-
-        return in_c2ws
-
 
 def camera_normalization(pivotal_pose: torch.Tensor, poses: torch.Tensor):
     # [1, 4, 4], [N, 4, 4]
 
-    camera_norm_matrix = torch.inverse(pivotal_pose)
-    
+    # Manually calculate the inverse of SE(3) to avoid numerical issues
+    R = pivotal_pose[:, :3, :3]  # [1, 3, 3]
+    t = pivotal_pose[:, :3, 3:]  # [1, 3, 1]
+    R_inv = R.transpose(-1, -2)  # [1, 3, 3]
+    t_inv = -R_inv @ t  # [1, 3, 1]
+    camera_norm_matrix_manuall = torch.eye(4, dtype=poses.dtype, device=poses.device).unsqueeze(0)  # [1, 4, 4]
+    camera_norm_matrix_manuall[:, :3, :3] = R_inv
+    camera_norm_matrix_manuall[:, :3, 3:] = t_inv
+
     # normalize all views
-    poses = torch.bmm(camera_norm_matrix.repeat(poses.shape[0], 1, 1), poses)
+    normalized_poses = camera_norm_matrix_manuall @ poses  # [N, 4, 4]
 
-    return poses
-
-
-def center_norm_pose(extrinsics):
-    # extrinsics: [V, 4, 4]
-    cam_centers = extrinsics[:, :3, 3]  # [V, 3]
-    avg_center = cam_centers.mean(dim=0, keepdim=True)  # [1, 3]
-    dist = (cam_centers - avg_center).norm(dim=1, keepdim=True)  # [V, 1]
-    scale = dist.max()
-
-    # translate
-    extrinsics = extrinsics.clone()
-    extrinsics[:, :3, 3] -= avg_center
-    extrinsics[:, :3, 3] /= scale
-
-    return extrinsics
+    return normalized_poses

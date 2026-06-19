@@ -1,7 +1,16 @@
+"""Inner per-scene loop of the two-level pipeline.
+
+`SceneTrainer` composes the three pipeline stages for a single scene: an Initializer produces the
+starting Gaussians from the input views, an Optimizer iteratively refines them, and a Decoder renders
+novel views. Each stage is chosen by name from its registry (see the package `__init__.py` files). The
+outer meta-loop that drives many scenes and computes losses lives in `meta_trainer.py`.
+"""
+
 import math
 import random
 from pathlib import Path
 from typing import Optional, Mapping, Any
+from warnings import warn
 
 import torch
 from einops import rearrange
@@ -14,9 +23,10 @@ from optgs.dataset.data_types import BatchedExample
 from optgs.dataset.view_sampler.view_sampler_bounded_v2 import farthest_point_sample
 from optgs.loss.loss_monodepth import get_monodepth_model
 from optgs.misc.benchmarker import Benchmarker
+from optgs.misc.general_utils import SkipBatchException
 from optgs.misc.io import FrequencyScheduler
 from optgs.misc.step_tracker import StepTracker
-from optgs.model.decoder.decoder import Decoder
+from optgs.model.decoder.decoder import Decoder, DepthRenderingMode
 from optgs.model.types import Gaussians
 from optgs.paths import DEBUG
 from optgs.scene_trainer.initializer import get_scene_initializer
@@ -24,8 +34,8 @@ from optgs.scene_trainer.initializer.initializer import InitializerOutput
 from optgs.scene_trainer.optimizer import get_scene_optimizer
 from optgs.scene_trainer.optimizer.optimizer import OptimizerInput, Optimizer, OptimizerOutput, OptimizerPreviousOutput
 from optgs.scene_trainer.postprocessing import PostProcessing3DGS
-from optgs.scene_trainer.scene_trainer_cfg import SceneTrainerCfg, TestCfg, TrainCfg
-from optgs.scripts.dev.debugging_optimizer import debugging_convergence, debugging_invisible_gaussians
+from optgs.scene_trainer.scene_trainer_cfg import SceneTrainerCfg
+from optgs.meta_trainer.meta_trainer_cfg import TestCfg, TrainCfg
 
 
 class SceneTrainer(nn.Module):
@@ -43,6 +53,7 @@ class SceneTrainer(nn.Module):
             scene_trainer_cfg: SceneTrainerCfg,
             decoder: Decoder,
             step_tracker: StepTracker | None,
+            benchmarker: Benchmarker,
             eval_data_cfg: Optional[DatasetCfg | None] = None,
     ) -> None:
         super().__init__()
@@ -71,7 +82,8 @@ class SceneTrainer(nn.Module):
 
         self.decoder = decoder
 
-        self.benchmarker = Benchmarker()
+        # Shared with the MetaTrainer so init/decoder timings land in one place.
+        self.benchmarker = benchmarker
 
         if self.train_cfg.monodepth_loss_weight > 0:
             self.pretrained_monodepth = get_monodepth_model()
@@ -135,6 +147,7 @@ class SceneTrainer(nn.Module):
             debug_dict=None,
             num_update_steps=None,
             disable_tqdm=False,
+            allow_partial_on_skip=False,
             **kwargs,
     ) -> OptimizerOutput:
         """
@@ -155,6 +168,10 @@ class SceneTrainer(nn.Module):
                 Should be 0 when starting a new scene.
             debug_dict: Optional[dict], a dictionary to store debug information.
             num_update_steps: Optional[int], number of update steps to perform. If None, use default from config.
+            allow_partial_on_skip: if True, a SkipBatchException or CUDA OOM raised during an update step
+                stops the loop early and returns the steps completed so far (with any partial appends from
+                the failed step rolled back) instead of propagating. Used by the test path so a scene that
+                fails mid-optimization still reports metrics for its successful steps.
         Returns:
             OptimizerOutput: The output from the optimizer containing the optimized Gaussians and renderings for
                 intermediate optimization steps.
@@ -170,7 +187,6 @@ class SceneTrainer(nn.Module):
             target=batch["target"],
             prev_output=prev_output,
             renderer=self.decoder,
-            num_refine=num_update_steps,
             iter_batch_size=self.scene_trainer_cfg.iter_batch_size,  # For rendering in batches
             debug_dict=debug_dict,
         )
@@ -189,10 +205,9 @@ class SceneTrainer(nn.Module):
 
         # Insert the initialization into position 0 of the output lists so downstream
         # consumers (evaluation, plotting, replay buffer) can treat init uniformly with
-        # the optimizer steps. No-op when there's no init render to attach (train path
-        # before init renders are wired through; replay buffer continuations).
-        if isinstance(prev_output, InitializerOutput):
-            self._insert_init_into_output(optimizer_output, prev_output)
+        # the optimizer steps. Handles both InitializerOutput and OptimizerPreviousOutput,
+        # and skips insertion during the rollout that saves no per-step outputs.
+        self._insert_init_into_output(optimizer_output, prev_output)
 
         # SH degree scheduling (inspired by gsplat simple_trainer):
         # sh_degree_to_use = min(step // sh_degree_interval, max_sh_degree)
@@ -200,10 +215,26 @@ class SceneTrainer(nn.Module):
         if sh_degree_interval > 0:
             max_sh_degree = int(math.sqrt(optimizer_input.prev_output.gaussians.harmonics.shape[-1])) - 1
 
+        # Test path only (allow_partial_on_skip): references to the output lists that must stay
+        # mutually aligned for the save/score paths. Built once -- the list objects don't change
+        # across steps (the optimizer mutates them in place); only their lengths grow. Off
+        # (training/validation): skipped entirely and the step loop runs exactly as before.
+        if allow_partial_on_skip:
+            aligned_lists = [
+                optimizer_output.target_render_list, optimizer_output.context_render_list,
+                optimizer_output.gaussian_list,
+                optimizer_output.target_index_list, optimizer_output.context_index_list,
+            ]
+
         # Loop over update steps
         for step in tqdm(range(num_update_steps),
                          disable=(self.training or num_update_steps < 20 or DEBUG) or disable_tqdm,
                          total=num_update_steps):
+
+            # Snapshot the aligned lists' lengths so a step that fails partway can be rolled back
+            # to the steps that fully completed (lengths grow per step, so this is per-step).
+            if allow_partial_on_skip:
+                pre_step_lens = [len(lst) for lst in aligned_lists]
 
             # Sample minibatch of context/target views and move to device
             optimizer_input.context, batch_idx = self.batchify_views(batch, "context", self.device)
@@ -220,20 +251,42 @@ class SceneTrainer(nn.Module):
 
             # Single optimization step
             # Optimizer output is updated in place, but we return it for clarity
-            optimizer_output = self.optimizer(
-                step,
-                optimizer_input,
-                optimizer_output,
-                full_context=batch["context"],
-                full_target=batch["target"],
-                **step_kwargs
-            )
+            try:
+                optimizer_output = self.optimizer(
+                    step,
+                    optimizer_input,
+                    optimizer_output,
+                    full_context=batch["context"],
+                    full_target=batch["target"],
+                    **step_kwargs
+                )
+            # torch.cuda.OutOfMemoryError is an alias of torch.OutOfMemoryError; one covers both.
+            # Kept specific to the two expected failures so a generic RuntimeError (a real bug)
+            # still propagates and drops the scene rather than being half-recovered.
+            except (SkipBatchException, torch.OutOfMemoryError) as e:
+                if not allow_partial_on_skip:
+                    raise
+                torch.cuda.empty_cache()
+                # No step completed -> nothing to score; re-raise so the caller drops the scene.
+                if optimizer_output.t == curr_iter:
+                    raise
+                # >=1 step completed: roll back the failed step's partial appends so the output lists
+                # stay aligned to the fully-completed steps, then stop early and score those. (At test
+                # time SkipBatch fires before any append, so the rollback only matters for an OOM
+                # mid-step.) The per-iteration module logs may keep one extra (unread) entry; downstream
+                # indexes them by completed-step number, so that is harmless.
+                warn(f"Optimization stopped early at step {step}/{num_update_steps} ({type(e).__name__}: {e}); "
+                     f"scoring the {step} completed step(s).")
+                for lst, n in zip(aligned_lists, pre_step_lens):
+                    del lst[n:]
+                break
             optimizer_output.t += 1
 
         # Sync GPU before reading scene_start elapsed time (events were recorded before the loop).
         torch.cuda.synchronize()
-        self.optimizer.scene_start_ms = self.optimizer.scene_start_event_start.elapsed_time(
-            self.optimizer.scene_start_event_end
+        self.optimizer.benchmarker.record(
+            "scene_start",
+            self.optimizer.scene_start_event_start.elapsed_time(self.optimizer.scene_start_event_end),
         )
 
         self.optimizer.on_scene_end()
@@ -485,6 +538,7 @@ class SceneTrainer(nn.Module):
                                  depths=all_pred_depths)
 
     def debugging(self, optimizer_output, output_path: Path, scene_name: str):  # TODO (release): remove in public code
+        from optgs.scripts.dev.debugging_optimizer import debugging_convergence, debugging_invisible_gaussians
 
         # Debugging reprojection errors
         # if 'reprojection_error' in visualization_dump:
@@ -544,68 +598,142 @@ class SceneTrainer(nn.Module):
     def _insert_init_into_output(
             self,
             optimizer_output: OptimizerOutput,
-            init_output: InitializerOutput,
+            prev_output: InitializerOutput | OptimizerPreviousOutput,
     ) -> None:
-        """Prepend the init render/gaussians at position 0 of the optimizer_output lists.
+        """Insert the init/resumed render + gaussians at position 0 of the optimizer_output lists.
 
-        No-op if no init render exists yet (train path before init renders are wired
-        through). Otherwise inserts gaussians plus whichever of context/target renders
-        are populated. detach_and_cpu mirrors the per-step append policy.
+        Accepts either InitializerOutput (a fresh scene) or OptimizerPreviousOutput (a ckpt-buffer
+        resume); both expose `gaussians`, `context_render`, `target_render`. Position 0 holds the
+        init, so the per-step lists line up by position (gaussian_list[k] and the render lists at
+        index k refer to the same step). The init/resume views are rendered before optimizing, so a
+        missing render here means they were not rendered and we raise.
+
+        The exception is the rollout that promotes a sample to the ckpt buffer: there the optimizer
+        runs in eval mode with all save tags off and saves no per-step renders or gaussians, so
+        position 0 has nothing to align with. In that case there is nothing to insert (and
+        prev_output carries no render), so this returns early.
+
+        Inserts the gaussians together with whichever of context/target renders are present.
+        detach_and_cpu matches the per-step append policy.
+        View indices (set when rendering a subset of views in training) are inserted into the index
+        lists too, so index_list[0] = init and index_list[1..N] = steps, aligned with the render lists.
         """
-        if init_output.context_render is None and init_output.target_render is None:
+        # Per-step renders are saved every step in training, and at the save_every iterations at test
+        # time; the rollout turns both off, so no per-step entry exists for position 0 to sit before.
+        saves_per_step = self.training or any(
+            self.optimizer.save_every.enabled_tags[tag] for tag in ("target", "context")
+        )
+        if not saves_per_step:
             return
 
-        optimizer_output.gaussian_list.insert(0, init_output.gaussians)
-        if init_output.context_render is not None:
-            optimizer_output.context_render_list.insert(
-                0, init_output.context_render, detach_and_cpu=not self.training
+        if prev_output.context_render is None and prev_output.target_render is None:
+            raise ValueError(
+                "prev_output has no render attached, so the init cannot be placed at position 0 of "
+                "the optimizer output. Render the init/resume views before optimizing."
             )
-        if init_output.target_render is not None:
-            optimizer_output.target_render_list.insert(
-                0, init_output.target_render, detach_and_cpu=not self.training
-            )
+
+        # Insert the init gaussians together with the init render so that position k of gaussian_list
+        # and of the render lists always refer to the same step.
+        optimizer_output.gaussian_list.insert(0, prev_output.gaussians)
+        for tag in ("context", "target"):
+            render = prev_output.get_render(tag)
+            if render is None:
+                continue
+            optimizer_output.get_render_list(tag).insert(0, render, detach_and_cpu=not self.training)
+            index = prev_output.get_render_index(tag)
+            if index is not None:
+                optimizer_output.get_index_list(tag).insert(0, index)
 
     def init_gaussians_and_render(
             self, batch, visualization_dump,
             render_context: bool, render_target: bool, grad_enabled: bool,
+            depth_mode: DepthRenderingMode | None = None,
+            benchmark_decoder: bool = False,
+            to_cpu: bool | None = None,
             **kwargs,
     ) -> InitializerOutput:
         """Run the initializer and optionally render its output to context/target views.
 
-        Used in both training (grad_enabled=True, outputs stay on GPU so the init-loss term
-        can backward through them) and test (grad_enabled=False, outputs moved to CPU to save
-        memory since they're only consumed for evaluation/saving).
-        """
+        Single entry point for "initialize then render" across training and the test/validation
+        eval pipelines.
 
-        # run initializer
+        By default renders go off the GPU when grads are disabled (test/eval, to save memory) and
+        stay on the GPU with grads enabled (training, so the init-loss term can backward through
+        them). Pass `to_cpu` to override -- the eval pipeline keeps the render on the GPU even with
+        grads disabled because it feeds straight into the optimizer.
+
+        The "initializer" timer always records (the init model is timed in every path). The init
+        render's "decoder" timer is gated by `benchmark_decoder`: only the eval pipeline reports it,
+        so the main test path's "decoder" metric stays the optimizer-phase decode time.
+        """
         with self.benchmarker.time("initializer"):
             init_output: InitializerOutput = self.get_init_gaussians(batch, is_training=grad_enabled, **kwargs)
 
+        self.render_init_views(batch, init_output, render_context, render_target, grad_enabled,
+                               depth_mode, benchmark_decoder=benchmark_decoder, to_cpu=to_cpu)
+        return init_output
+
+    def render_init_views(
+            self,
+            batch,
+            init_output: InitializerOutput | OptimizerPreviousOutput,
+            render_context: bool,
+            render_target: bool,
+            grad_enabled: bool,
+            depth_mode: DepthRenderingMode | None = None,
+            benchmark_decoder: bool = False,
+            to_cpu: bool | None = None,
+    ) -> None:
+        """Render context/target views into any output that exposes get_render/set_render.
+
+        Mutates `init_output` in place; returns None. Skips a view if it's already rendered.
+        Accepts either InitializerOutput (dataloader path) or OptimizerPreviousOutput
+        (replay-buffer path, where renders are needed to populate the splice but no
+        initializer model runs).
+        """
         # to_cpu freezes the render off the GPU for evaluation/saving; with grads enabled we
-        # keep it on GPU so the init-loss term can backward through it.
-        to_cpu = not grad_enabled
+        # keep it on GPU so the init-loss term can backward through it. The eval pipeline overrides
+        # it (to_cpu=False) since the render feeds straight into the optimizer.
+        if to_cpu is None:
+            to_cpu = not grad_enabled
+
+        # In optimizer-training mode (self.training=True, grad_enabled=False), render only a
+        # random subset of views — matching what the optimizer does per step — to avoid the
+        # cost of rendering all views (which may not fit in one batch).
+        use_subset = self.training and not grad_enabled
 
         with torch.set_grad_enabled(grad_enabled):
             for input_str, should_render in (
                 ("context", render_context),
                 ("target", render_target),
             ):
-                attr = f"{input_str}_render"
-                if not should_render or getattr(init_output, attr) is not None:
+                if not should_render or init_output.get_render(input_str) is not None:
                     continue
-                views = batch[input_str]
-                h, w = views["image"].shape[-2:]
-                rendered = self.decoder.forward_batch(
-                    init_output.gaussians.to(batch["target"]["image"].device),
-                    batch, (h, w),
-                    input_str=input_str,
-                    to_cpu=to_cpu,
-                    iter_batch_size=self.scene_trainer_cfg.iter_batch_size,
-                )
-                # TODO Naama: should we make it a render list as in OptimizerOutput and then the flow will be more unified?
-                setattr(init_output, attr, rendered)
-
-        return init_output
+                if use_subset:
+                    subset_views, index = self.batchify_views(batch, input_str, self.device)
+                    rendered = self.decoder.forward_batch_subset(
+                        init_output.gaussians.to(self.device),
+                        subset_views,
+                        iter_batch_size=self.scene_trainer_cfg.iter_batch_size,
+                    )
+                    init_output.set_render_index(input_str, index)
+                else:
+                    views = batch[input_str]
+                    h, w = views["image"].shape[-2:]
+                    n_views = views["image"].shape[1]
+                    # The initializer produces a single render per view set, so it is stored as one
+                    # DecoderOutput per tag; the optimizer keeps one render per step in a list. The
+                    # init render becomes position 0 of that list (see _insert_init_into_output).
+                    with self.benchmarker.time("decoder", num_calls=n_views, disable=not benchmark_decoder):
+                        rendered = self.decoder.forward_batch(
+                            init_output.gaussians.to(batch["target"]["image"].device),
+                            batch, (h, w),
+                            input_str=input_str,
+                            to_cpu=to_cpu,
+                            iter_batch_size=self.scene_trainer_cfg.iter_batch_size,
+                            depth_mode=depth_mode,
+                        )
+                init_output.set_render(input_str, rendered)
 
     def test_postprocess_gaussians(self, batch, gaussians, visualization_dump) -> OptimizerOutput | None:
         """Run optional post-processing on the final Gaussians. Returns None if disabled."""

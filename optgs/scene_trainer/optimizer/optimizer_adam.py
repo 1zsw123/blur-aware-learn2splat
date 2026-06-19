@@ -6,7 +6,6 @@ import torch
 from torch import Tensor
 
 from optgs.dataset.data_types import BatchedViews
-from optgs.misc.general_utils import get_expon_lr_func
 from optgs.misc.io import FrequencyScheduler
 from optgs.model.decoder.decoder import Decoder
 from optgs.model.types import Gaussians
@@ -33,17 +32,8 @@ class AdamOptimizerCfg(OptimizerCfg):
     eps: float
     weight_decay: float
 
-    # learning rates
-    base_lr: int | float
-    means_lr_init: float
-    means_lr_final: float
-    means_lr_delay_mult: float
-    means_lr_max_steps: int  # should be equal to total optimization steps
-    scales_lr: float
-    rotations_lr: float
-    opacities_lr: float
-    sh0s_lr: float
-    shNs_lr: float  # 20 times less as sh0s_lr in original paper
+    # Per-param learning rates and the means decay schedule come from the inherited
+    # lr_scheduler cfg (lr_data / apply_scheduler + the expon scheduler params).
 
     def update(self, initializer_cfg: InitializerCfg):
         pass
@@ -102,13 +92,11 @@ class AdamOptimizer(NonlearnedOptimizer[AdamOptimizerCfg]):
             scene_scale = torch.ones(1, 1, device=device)
         scene_scale = scene_scale[0].item()
 
-        # initialize learning rate scheduler for means
-        self.means_lr_scheduler = get_expon_lr_func(
-            lr_init=self.cfg.means_lr_init * scene_scale,
-            lr_final=self.cfg.means_lr_final * scene_scale,
-            lr_delay_mult=self.cfg.means_lr_delay_mult,
-            max_steps=self.cfg.means_lr_max_steps
-        )
+        # Means LR follows the lr_scheduler's expon decay, scaled by scene extent. The schedule is
+        # linear in its endpoints, so multiplying its output by scene_scale matches scaling both
+        # endpoints (the original 3DGS recipe). Exposed as means_lr_scheduler so the shared ADC
+        # path (MCMC noise injection) can read the same per-step means LR.
+        self.means_lr_scheduler = lambda step: self.scheduler.get_lr(step, "means") * scene_scale
 
     def on_scene_end(self) -> None:
         super().on_scene_end()
@@ -126,106 +114,70 @@ class AdamOptimizer(NonlearnedOptimizer[AdamOptimizerCfg]):
             **kwargs
     ) -> OptimizerOutput:
 
-        # Timing
-        self.iter_start.record()
+        with self.benchmarker.time("iter"):
+            # Unpack
+            iter_context: BatchedViews = optimizer_input.context
+            target: BatchedViews = optimizer_input.target
+            renderer: Decoder = optimizer_input.renderer
+            b, v, _, h, w = iter_context["image"].shape
+            assert b == 1, "Batch size > 1 not supported for post-processing"
 
-        # Unpack
-        iter_context: BatchedViews = optimizer_input.context
-        target: BatchedViews = optimizer_input.target
-        renderer: Decoder = optimizer_input.renderer
-        b, v, _, h, w = iter_context["image"].shape
-        assert b == 1, "Batch size > 1 not supported for post-processing"
+            # Log number of gaussians
+            self.benchmarker.record("gaussians", optimizer_input.prev_output.gaussians.means.shape[1])
 
-        # Log number of gaussians
-        self.nr_gaussians_log.append(
-            optimizer_input.prev_output.gaussians.means.shape[1]
-        )
+            # One optimization step
+            res = self._apply_step(i, optimizer_input, optimizer_output, sh_degree=kwargs.get("sh_degree", None))
+            gaussians: Gaussians = res[0]
+            meta_for_adc: dict = res[1]
+            updates: dict[str, Tensor] = res[2]
+            grads_raw: dict[str, Tensor] = res[3]
+            normalized_grads: dict[str, Tensor] = res[4]
+            learning_rates: dict[str, float] = res[5]
 
-        # One optimization step
-        res = self.apply_one_update_step(i, optimizer_input, optimizer_output, sh_degree=kwargs.get("sh_degree", None))
-        gaussians: Gaussians = res[0]
-        meta_for_adc: dict = res[1]
-        updates: dict[str, Tensor] = res[2]
-        grads_raw: dict[str, Tensor] = res[3]
-        normalized_grads: dict[str, Tensor] = res[4]
-        learning_rates: dict[str, float] = res[5]
+            # Densification and Pruning
+            if self.cfg.any_adc:
+                # Apply ADC
+                self.apply_adc(
+                    i=i, v=v, h=h, w=w,
+                    adc_state=optimizer_input.prev_output.state.adc_state,
+                    gaussians=gaussians,
+                    meta=meta_for_adc,
+                    object_dict_to_adjust=self.smoothers
+                )
+                # ADC changes N → cached buffers are invalid; re-make tensors as fresh leaves.
+                buf_nr_gaussians = self._meta_bufs['N']
+                actual_nr_gaussians = gaussians.means.shape[1]
+                if buf_nr_gaussians != actual_nr_gaussians:
+                    self._meta_bufs.clear()
+                    # ADC rebuilt these tensors. Re-make them as clean leaves that require grad —
+                    # the invariant the i==0 setup establishes and that the next step's in-place
+                    # updates and autograd.grad both assume.
+                    gaussians.means = gaussians.means.detach().requires_grad_(True)
+                    gaussians.scales = gaussians.scales.detach().requires_grad_(True)
+                    gaussians.rotations_unnorm = gaussians.rotations_unnorm.detach().requires_grad_(True)
+                    gaussians.opacities = gaussians.opacities.detach().requires_grad_(True)
+                    gaussians.harmonics = gaussians.harmonics.detach().requires_grad_(True)
 
-        # Densification and Pruning
-        if self.cfg.any_adc:
-            # Apply ADC
-            self.apply_adc(
-                i=i, v=v, h=h, w=w,
-                adc_state=optimizer_input.prev_output.state.adc_state,
-                gaussians=gaussians,
-                meta=meta_for_adc,
-                object_dict_to_adjust=self.smoothers
-            )
-            # ADC changes N → cached buffers are invalid; re-make tensors as fresh leaves.
-            # torch.cat (used by add_new/relocate) produces a non-leaf even with requires_grad=True,
-            # so .grad is never populated by backward(). detach() cuts the grad_fn first.
-            buf_nr_gaussians = self._meta_bufs['N']
-            actual_nr_gaussians = gaussians.means.shape[1]
-            if buf_nr_gaussians != actual_nr_gaussians:
-                self._meta_bufs.clear()
-                # TODO Naama: need to think if the detach is necessary (was added during mcmc implementation)
-                gaussians.means = gaussians.means.detach().requires_grad_(True)
-                gaussians.scales = gaussians.scales.detach().requires_grad_(True)
-                gaussians.rotations_unnorm = gaussians.rotations_unnorm.detach().requires_grad_(True)
-                gaussians.opacities = gaussians.opacities.detach().requires_grad_(True)
-                gaussians.harmonics = gaussians.harmonics.detach().requires_grad_(True)
-
-        # Timing
-        self._record_iter_timing()
-
-        # TODO Naama: we can log stats with save_every, but need to change stuff later.
-        # Log stats — guard with save_every
-        if grads_raw is not None:  # and self.save_every(i + 1, tag="info"):
+        # Log stats — one entry per step (consumer indexes nr_nonzero_grad_log by step index)
+        if grads_raw is not None:
             G = grads_raw["means"].shape[0]
             nonzero_grads = [(g.reshape(G, -1) != 0).any(dim=-1) for g in grads_raw.values() if g is not None]
             nonzero_grads = torch.stack(nonzero_grads)  # [num_params, G]
             nonzero_grads = nonzero_grads.any(dim=0)  # [G]
-            self.nr_nonzero_grad_log.append(nonzero_grads.sum().item())
+            self.benchmarker.record("nonzero_grads", nonzero_grads.sum().item())
 
         # Save updated gaussians (for next iteration)
         optimizer_input.prev_output.gaussians = gaussians
 
         # Info
         if self.save_every(i + 1, tag="info"):
-
-            # save gaussians
-            optimizer_output.gaussian_list.append(gaussians, detach_and_cpu=True, save_to_disk=False, no_cache=False)
-
-            # Save delta stats
-            assert optimizer_output.info is not None
-
-            # log deltas
-            if "deltas" not in optimizer_output.info:
-                optimizer_output.info["deltas"] = []
-            optimizer_output.info["deltas"].append({k: v.cpu() for k, v in updates.items() if v is not None})
-
-            # log gradients
-            if "grads" not in optimizer_output.info:
-                optimizer_output.info["grads"] = []
-            optimizer_output.info["grads"].append({k: v.cpu() for k, v in grads_raw.items() if v is not None})
-
-            # log normalized gradients
-            if "normalized_grads" not in optimizer_output.info:
-                optimizer_output.info["normalized_grads"] = []
-            optimizer_output.info["normalized_grads"].append(
-                {k: v.cpu() for k, v in normalized_grads.items() if v is not None})
-
-            # log learning rates
-            if "learning_rates" not in optimizer_output.info:
-                optimizer_output.info["learning_rates"] = []
-            optimizer_output.info["learning_rates"].append(learning_rates)
-
-            # Check if output_path in kwargs
-            output_path = kwargs.get("output_path", None)
-            scene_name = kwargs.get("scene_name", None)
-
-            # Plot stats
-            # if self.cfg.any_adc:
-            #     self.plot_info(i, output_path=output_path, scene_name=scene_name)
+            self._append_info(
+                optimizer_output, gaussians,
+                deltas={k: v.cpu() for k, v in updates.items() if v is not None},
+                grads={k: v.cpu() for k, v in grads_raw.items() if v is not None},
+                normalized_grads={k: v.cpu() for k, v in normalized_grads.items() if v is not None},
+                learning_rates=learning_rates,
+            )
 
         # Post-update context + target renders
         self._save_post_update_renders(
@@ -236,7 +188,7 @@ class AdamOptimizer(NonlearnedOptimizer[AdamOptimizerCfg]):
         # Optimizer output is being changed in place, but for clarity we return it
         return optimizer_output
 
-    def apply_one_update_step(
+    def _apply_step(
             self, i, optimizer_input: OptimizerInput, optimizer_output: OptimizerOutput, sh_degree: int | None = None
     ) -> tuple[Gaussians, dict | None, dict, dict[str, Tensor], dict[str, Tensor], dict[str, float]]:
 
@@ -264,23 +216,16 @@ class AdamOptimizer(NonlearnedOptimizer[AdamOptimizerCfg]):
             # assert gaussians does not store activated values
             assert not gaussians.stores_activated, "Gaussians must not store activated values."
 
-        # learning rates
-        # TODO Naama: use current cfg field lr_scheduler, which also defines the lr per param
+        # learning rates — all from the lr_scheduler cfg (lr_data per-param values, with the
+        # expon decay applied only where apply_scheduler is set, i.e. means). Means is additionally
+        # scaled by scene extent via means_lr_scheduler.
         assert self.means_lr_scheduler is not None, "means_lr_scheduler is not initialized"
-        means_lr = self.means_lr_scheduler(i) * self.cfg.base_lr
-        scales_lr = self.cfg.scales_lr * self.cfg.base_lr
-        rotations_lr = self.cfg.rotations_lr * self.cfg.base_lr
-        opacities_lr = self.cfg.opacities_lr * self.cfg.base_lr
-        sh0s_lr = self.cfg.sh0s_lr * self.cfg.base_lr
-        shNs_lr = self.cfg.shNs_lr * self.cfg.base_lr
-
-        # scale learning rates by number of views in the batch
-        # means_lr *= v
-        # scales_lr *= v
-        # rotations_lr *= v
-        # opacities_lr *= v
-        # sh0s_lr *= v
-        # shNs_lr *= v
+        means_lr = self.means_lr_scheduler(i)
+        scales_lr = self.scheduler.get_lr(i, "scales")
+        rotations_lr = self.scheduler.get_lr(i, "rotations")
+        opacities_lr = self.scheduler.get_lr(i, "opacities")
+        sh0s_lr = self.scheduler.get_lr(i, "sh0")
+        shNs_lr = self.scheduler.get_lr(i, "shN")
 
         assert (
                 iter_context["extrinsics"].shape[0] == iter_context["extrinsics"].shape[0] == 1
@@ -293,23 +238,22 @@ class AdamOptimizer(NonlearnedOptimizer[AdamOptimizerCfg]):
         opacities_raw = gaussians.opacities  # [B, N]
         shs = gaussians.harmonics  # [B, N, 3, sh_d]
 
-        self.decoder_event_start.record()
-        loss, grads_raw, meta_for_adc = calc_input_gradients(
-            iter_context,
-            means,
-            scales_raw,
-            rotations_unnorm,
-            opacities_raw,
-            shs,
-            renderer,
-            need_2d_grads=self.cfg.need_2d_grads,
-            chunk_size=self.cfg.input_gradients_chunk_size,
-            any_adc=self.cfg.any_adc,
-            sh_degree=sh_degree,
-            meta_bufs=self._meta_bufs,
-            opacity_reg_lambda=self.cfg.opacity_reg_lambda,
-        )
-        self.decoder_event_end.record()
+        with self.benchmarker.time("decoder"):
+            loss, grads_raw, meta_for_adc = calc_input_gradients(
+                iter_context,
+                means,
+                scales_raw,
+                rotations_unnorm,
+                opacities_raw,
+                shs,
+                renderer,
+                need_2d_grads=self.cfg.need_2d_grads,
+                chunk_size=self.cfg.input_gradients_chunk_size,
+                any_adc=self.cfg.any_adc,
+                sh_degree=sh_degree,
+                meta_bufs=self._meta_bufs,
+                opacity_reg_lambda=self.cfg.opacity_reg_lambda,
+            )
 
         # get updates from adam optimizer
         grads_raw = squeeze_grad_dict(grads_raw)
@@ -320,25 +264,25 @@ class AdamOptimizer(NonlearnedOptimizer[AdamOptimizerCfg]):
         # Batch delta computation for contiguous params with _foreach_mul to reduce kernel launches.
         # no_refine flags are handled by excluding the param from the batch (delta stays None).
         _grad_lr_pairs = [
-            (grads_adam["means"], -means_lr, self.cfg.no_refine_mean),
-            (grads_adam["scales"], -scales_lr, self.cfg.no_refine_scale),
-            (grads_adam["rotations"], -rotations_lr, self.cfg.no_refine_rotation),
-            (grads_adam["opacities"], -opacities_lr, self.cfg.no_refine_opacity),
+            (grads_adam["means"], -means_lr, self.cfg.freeze_mean),
+            (grads_adam["scales"], -scales_lr, self.cfg.freeze_scale),
+            (grads_adam["rotations"], -rotations_lr, self.cfg.freeze_rotation),
+            (grads_adam["opacities"], -opacities_lr, self.cfg.freeze_opacity),
         ]
         _active_grads = [g for g, lr, skip in _grad_lr_pairs if not skip]
         _active_lrs = [lr for g, lr, skip in _grad_lr_pairs if not skip]
         _active_deltas = torch._foreach_mul(_active_grads, _active_lrs) if _active_grads else []
 
         _delta_iter = iter(_active_deltas)
-        delta_means = next(_delta_iter) if not self.cfg.no_refine_mean else None
-        delta_scales_raw = next(_delta_iter) if not self.cfg.no_refine_scale else None
-        delta_rotations_unnorm = next(_delta_iter) if not self.cfg.no_refine_rotation else None
-        delta_opacities_raw = next(_delta_iter) if not self.cfg.no_refine_opacity else None
+        delta_means = next(_delta_iter) if not self.cfg.freeze_mean else None
+        delta_scales_raw = next(_delta_iter) if not self.cfg.freeze_scale else None
+        delta_rotations_unnorm = next(_delta_iter) if not self.cfg.freeze_rotation else None
+        delta_opacities_raw = next(_delta_iter) if not self.cfg.freeze_opacity else None
 
         # SH deltas stay separate (non-contiguous slice views)
-        delta_sh0s = None if self.cfg.no_refine_sh0 else -sh0s_lr * grads_adam["sh0s"]
+        delta_sh0s = None if self.cfg.freeze_sh0 else -sh0s_lr * grads_adam["sh0s"]
         delta_shNs = None
-        if grads_adam["shNs"] is not None and not self.cfg.no_refine_shN:
+        if grads_adam["shNs"] is not None and not self.cfg.freeze_shN:
             delta_shNs = -shNs_lr * grads_adam["shNs"]
 
         # step — batch contiguous params with _foreach_add_ to reduce kernel launches;

@@ -32,6 +32,8 @@ class LossSsimCfgWrapper:
 
 
 class LossSsim(Loss[LossSsimCfg, LossSsimCfgWrapper]):
+    """Structural-similarity reconstruction loss (1 - SSIM) between the rendered and ground-truth views."""
+
     def forward(
         self,
         prediction: DecoderOutput,

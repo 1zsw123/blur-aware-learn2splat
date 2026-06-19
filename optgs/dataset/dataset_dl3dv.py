@@ -12,9 +12,6 @@ from jaxtyping import Float, UInt8
 from PIL import Image
 from torch import Tensor
 from torch.utils.data import IterableDataset
-import numpy as np
-import os
-import random
 
 from ..geometry.projection import get_fov
 from .dataset import DatasetCfgCommon
@@ -28,47 +25,24 @@ from .view_sampler import ViewSampler
 class DatasetDL3DVCfg(DatasetCfgCommon):
     name: Literal["dl3dv"]
     roots: list[Path]
-    baseline_epsilon: float
     max_fov: float
-    make_baseline_1: bool
     augment: bool
     test_len: int
     test_chunk_interval: int
     train_times_per_scene: int
     test_times_per_scene: int
     ori_image_shape: list[int]
-    # random crop training
-    random_crop: bool
-    max_size: list[int] | None
-    min_size: list[int] | None
 
     skip_bad_shape: bool = True
     near: float = -1.0
     far: float = -1.0
-    baseline_scale_bounds: bool = True
     shuffle_val: bool = True
     no_mix_test_set: bool = True
-    load_depth: bool = False
     min_views: int = 0
     max_views: int = 0
-    highres: bool = False
     sort_target_index: Optional[bool] = False
     overfit_max_views: Optional[int] = None
     sort_context_index: Optional[bool] = False
-    use_index_to_load_chunk: Optional[bool] = False
-    pose_align_first_view: bool = False  # align the camera pose to the first view
-    scale_extrinsics: float = 1.
-    metric_scale_align_dl3dv: bool = False
-    center_pose: bool = False  # center and normalize the pose by the distance to the center
-
-    # mix re10k & dl3dv
-    mix_re10k: bool = False
-    re10k_min_view_dist: int = 40
-    re10k_max_view_dist: int = 300
-
-    # load remaining context views
-    load_remain_context: bool = False
-    num_remain_context: int = 8
 
     index_name: str = "index.json"
 
@@ -104,14 +78,9 @@ class DatasetDL3DV(IterableDataset):
         self.chunks = []
         for i, root in enumerate(cfg.roots):
             root = root / self.data_stage
-            if self.cfg.use_index_to_load_chunk:
-                with open(root / self.cfg.index_name, "r") as f:
-                    json_dict = json.load(f)
-                root_chunks = sorted(list(set(json_dict.values())))
-            else:
-                root_chunks = sorted(
-                    [path for path in root.iterdir() if path.suffix == ".torch"]
-                )
+            root_chunks = sorted(
+                [path for path in root.iterdir() if path.suffix == ".torch"]
+            )
 
             # mixed data training only evaluate on a single test set
             if cfg.no_mix_test_set and self.data_stage in ['val', 'test'] and i > 0:
@@ -133,41 +102,17 @@ class DatasetDL3DV(IterableDataset):
         if self.stage == "val":
             self.chunks = self.chunks * int(1e6 // len(self.chunks))
 
-        if self.cfg.metric_scale_align_dl3dv:
-            # read invalid scales
-            scale_dir = '/cluster/project/cvg/haofei/datasets/depthsplat/dl3dv_metric_scale_factor'
-            filename = os.path.join(scale_dir, 'dl3dv_invalid.txt')
-            with open(filename, "r") as f:
-                self.invalid_scale_scenes = [line.strip() for line in f]
-
         # Calculate actual number of scenes (keys of index file that their chunks exist).
+        chunk_set = set(self.chunks)  # self.chunks can be huge (val multiplies it) -> set lookup
         num_available_scenes = 0
         for scene, chunk_path in self.index.items():
-            if chunk_path in self.chunks:
+            if chunk_path in chunk_set:
                 num_available_scenes += 1
         self.num_available_scenes = num_available_scenes
 
     def shuffle(self, lst: list) -> list:
         indices = torch.randperm(len(lst))
         return [lst[x] for x in indices]
-
-    def _get_scale_factor(self, scene: str) -> float:
-        """Get the scale factor for a scene."""
-        if self.cfg.metric_scale_align_dl3dv:
-            scale_dir = '/cluster/project/cvg/haofei/datasets/depthsplat/dl3dv_metric_scale_factor'
-            if self.stage == 'train':
-                folder = scene.split('_')[1]
-            else:
-                folder = scene
-            filename = os.path.join(scale_dir, folder, 'scale_factor.txt')
-
-            if not os.path.exists(filename) or folder in self.invalid_scale_scenes:
-                return self.cfg.scale_extrinsics
-            else:
-                with open(filename, "r") as f:
-                    return float(f.read().strip())
-        else:
-            return self.cfg.scale_extrinsics
 
     def _process_example_to_batch(
             self,
@@ -176,26 +121,12 @@ class DatasetDL3DV(IterableDataset):
             intrinsics: Tensor,
             context_indices: Tensor,
             target_indices: Tensor,
-            scale_factor: float,
     ) -> Optional[dict]:
         """
         Process an example into a batch dict (original behavior).
         Returns None if the example should be skipped.
         """
         scene = example["key"]
-
-        # Load remaining context views if configured
-        if self.cfg.load_remain_context:
-            remaining_indices = get_remaining_indices(
-                context_indices, target_indices, self.cfg.num_remain_context
-            )
-            remain_context_images = [
-                example["images"][index.item()] for index in remaining_indices
-            ]
-            try:
-                remain_context_images = self.convert_images(remain_context_images)
-            except OSError:
-                return None
 
         # Load context images
         context_images = [
@@ -216,16 +147,7 @@ class DatasetDL3DV(IterableDataset):
             return None
 
         # Validate image shapes
-        if self.cfg.mix_re10k and 'dl3dv' not in scene:
-            if self.cfg.highres:
-                expected_shape = (3, 720, 1280)
-            else:
-                expected_shape = (3, 360, 640)
-        else:
-            expected_shape = tuple([3, *self.cfg.ori_image_shape])
-
-        if self.stage in ['test', 'val'] or 'dl3dv' in scene:
-            expected_shape = tuple([3, *self.cfg.ori_image_shape])
+        expected_shape = tuple([3, *self.cfg.ori_image_shape])
 
         if self.cfg.skip_bad_shape:
             if context_images.shape[1:] != expected_shape or target_images.shape[1:] != expected_shape:
@@ -236,21 +158,12 @@ class DatasetDL3DV(IterableDataset):
                 )
                 return None
 
-            if self.cfg.load_remain_context and remain_context_images.shape[1:] != expected_shape:
-                return None
-
         # Apply pose transformations
         if self.cfg.pose_align_middle_view:
             mid_index = context_indices.shape[0] // 2
             extrinsics = camera_normalization(
                 extrinsics[context_indices][mid_index:mid_index + 1], extrinsics
             )
-
-        if self.cfg.pose_align_first_view:
-            extrinsics = camera_normalization(extrinsics[context_indices][0:1], extrinsics)
-
-        if self.cfg.center_pose:
-            extrinsics = center_norm_pose(extrinsics)
 
         # Validate extrinsics
         if any(torch.isnan(torch.det(extrinsics[context_indices][:, :3, :3]))):
@@ -271,20 +184,6 @@ class DatasetDL3DV(IterableDataset):
                 extrinsics[target_indices][:, :3, :3].new_tensor(1)
         ):
             return None
-
-        if self.cfg.load_remain_context:
-            if any(torch.isnan(torch.det(extrinsics[remaining_indices][:, :3, :3]))):
-                return None
-            if (extrinsics[remaining_indices][:, :3, 3] > 1e3).any():
-                return None
-            if not torch.allclose(
-                    torch.det(extrinsics[remaining_indices][:, :3, :3]),
-                    extrinsics[remaining_indices][:, :3, :3].new_tensor(1)
-            ):
-                return None
-
-        # Apply scale factor
-        extrinsics[:, :3, 3] *= scale_factor
 
         # Build output
         example_out = {
@@ -307,22 +206,12 @@ class DatasetDL3DV(IterableDataset):
             "scene": scene,
         }
 
-        if self.cfg.load_remain_context:
-            example_out["context_remain"] = {
-                "extrinsics": extrinsics[remaining_indices],
-                "intrinsics": intrinsics[remaining_indices],
-                "image": remain_context_images,
-                "near": self.get_bound("near", len(remaining_indices)),
-                "far": self.get_bound("far", len(remaining_indices)),
-                "index": remaining_indices,
-            }
-
         return example_out
 
     def __iter__(self):
         # Chunks must be shuffled here (not inside __init__) for validation to show
         # random chunks.
-        if self.stage in (("train", "val") if self.cfg.shuffle_val else ("train")):
+        if self.stage == "train" or (self.cfg.shuffle_val and self.stage == "val"):
             self.chunks = self.shuffle(self.chunks)
 
         # When testing, the data loaders alternate chunks.
@@ -350,7 +239,7 @@ class DatasetDL3DV(IterableDataset):
                 else:
                     chunk = item * len(chunk)
 
-            if self.stage in (("train", "val") if self.cfg.shuffle_val else ("train")):
+            if self.stage == "train" or (self.cfg.shuffle_val and self.stage == "val"):
                 chunk = self.shuffle(chunk)
 
             times_per_scene = (
@@ -373,8 +262,6 @@ class DatasetDL3DV(IterableDataset):
                 if (get_fov(intrinsics).rad2deg() > self.cfg.max_fov).any():
                     continue
 
-                scale_factor = self._get_scale_factor(scene)
-
                 try:
                     extra_kwargs = {}
                     if self.cfg.overfit_to_scene is not None and self.stage != "test":
@@ -383,16 +270,12 @@ class DatasetDL3DV(IterableDataset):
                             else self.cfg.overfit_max_views
                         )
 
-                    is_re10k = self.cfg.mix_re10k and 'dl3dv' not in scene and self.stage == 'train'
-
                     out_data = self.view_sampler.sample(
                         scene,
                         extrinsics,
                         intrinsics,
                         min_context_views=self.cfg.min_views,
                         max_context_views=self.cfg.max_views,
-                        min_view_dist=self.cfg.re10k_min_view_dist if is_re10k else None,
-                        max_view_dist=self.cfg.re10k_max_view_dist if is_re10k else None,
                         **extra_kwargs,
                     )
 
@@ -421,7 +304,7 @@ class DatasetDL3DV(IterableDataset):
                 for context_indices, target_indices in zip(c_list, t_list):
                     example_out = self._process_example_to_batch(
                         example, extrinsics.clone(), intrinsics,
-                        context_indices, target_indices, scale_factor
+                        context_indices, target_indices,
                     )
 
                     if example_out is None:
@@ -440,13 +323,7 @@ class DatasetDL3DV(IterableDataset):
                     if self.cfg.image_shape == list(context_images.shape[2:]):
                         yield example_out
                     else:
-                        if self.stage == "train" and self.cfg.random_crop:
-                            crop_h = random.randint(self.cfg.min_size[0], self.cfg.max_size[0] + 1) // 64 * 64
-                            crop_w = random.randint(self.cfg.min_size[1], self.cfg.max_size[1] + 1) // 64 * 64
-                            crop_size = (crop_h, crop_w)
-                            yield apply_crop_shim(example_out, crop_size)
-                        else:
-                            yield apply_crop_shim(example_out, tuple(self.cfg.image_shape))
+                        yield apply_crop_shim(example_out, tuple(self.cfg.image_shape))
 
     def convert_poses(
             self,
@@ -472,22 +349,16 @@ class DatasetDL3DV(IterableDataset):
         w2c[:, :3] = rearrange(poses[:, 6:], "b (h w) -> b h w", h=3, w=4)
 
         if self.cfg.opencv_pose_format:
-            return self.opengl_to_opencv(w2c.inverse()), intrinsics
-        else:
-            return w2c.inverse(), intrinsics
-
-    def opengl_to_opencv(self, c2w):
-        # https://github.com/DL3DV-10K/Dataset/issues/4#issuecomment-2019441741
-        blender2opencv = np.array(
-            [[1, 0, 0, 0], [0, -1, 0, 0], [0, 0, -1, 0], [0, 0, 0, 1]]
-        )
-        blender2opencv = torch.tensor(blender2opencv, dtype=c2w.dtype, device=c2w.device).unsqueeze(0)
-        c2w = torch.matmul(c2w, blender2opencv)
-        c2w[:, 2, :] *= -1
-        c2w = c2w[:, torch.tensor(np.array([1, 0, 2, 3])), :]
-        c2w[:, 0:3, 1:3] *= -1
-
-        return c2w
+            # DL3DV chunk poses are already in OpenCV convention (verified: they match the
+            # COLMAP/OpenCV poses up to a world rotation), so opengl_to_opencv would corrupt
+            # them. Fail loudly instead of silently converting. NOTE: the resplat_v2 baseline
+            # in scripts/testing/_common/run_experiments.sh sets opencv_pose_format=true and
+            # will now hit this — update that path if resplat_v2 is still needed.
+            raise ValueError(
+                "opencv_pose_format=true is not supported for DL3DV: chunk poses are already "
+                "in OpenCV convention and need no conversion."
+            )
+        return w2c.inverse(), intrinsics
 
     def convert_images(
             self,
@@ -575,66 +446,3 @@ def camera_normalization(pivotal_pose: torch.Tensor, poses: torch.Tensor):
     normalized_poses = camera_norm_matrix_manuall @ poses  # [N, 4, 4]
 
     return normalized_poses
-
-
-def center_norm_pose(extrinsics):
-    # extrinsics: [V, 4, 4]
-    cam_centers = extrinsics[:, :3, 3]  # [V, 3]
-    avg_center = cam_centers.mean(dim=0, keepdim=True)  # [1, 3]
-    dist = (cam_centers - avg_center).norm(dim=1, keepdim=True)  # [V, 1]
-    scale = dist.max()
-
-    # translate
-    extrinsics = extrinsics.clone()
-    extrinsics[:, :3, 3] -= avg_center
-    extrinsics[:, :3, 3] /= scale
-
-    return extrinsics
-
-
-def get_remaining_indices(context_indices: torch.Tensor,
-                          target_indices: torch.Tensor,
-                          num_remain_context: int) -> torch.Tensor:
-    """
-    Randomly selects a fixed number of remaining indices in the range [min(context), max(context)],
-    excluding those in context or target. Pads by repeating if not enough remain.
-
-    Args:
-        context_indices (torch.Tensor): 1D tensor of context indices.
-        target_indices (torch.Tensor): 1D tensor of target indices.
-        num_remain_context (int): Number of remaining indices to return.
-
-    Returns:
-        torch.Tensor: 1D tensor of length `num_remain_context`.
-    """
-    if context_indices.numel() == 0:
-        raise ValueError("context_indices must not be empty.")
-
-    min_idx = torch.min(context_indices).item()
-    max_idx = torch.max(context_indices).item()
-
-    full_range = torch.arange(min_idx, max_idx + 1, dtype=torch.long)
-    exclude_indices = torch.cat([context_indices, target_indices])
-    mask = ~torch.isin(full_range, exclude_indices)
-
-    remaining = full_range[mask]
-
-    if remaining.numel() == 0:
-        # Nothing to sample from; repeat the first context index (or any fallback)
-        return context_indices[0].repeat(num_remain_context)
-
-    # return all
-    selected = remaining
-
-    # Randomly sample with or without replacement
-    # if remaining.numel() >= num_remain_context:
-    #     selected = remaining[torch.randperm(remaining.numel())[:num_remain_context]]
-    # else:
-    #     # return all
-    #     selected = remaining
-    #     # # Repeat with wrap-around to pad
-    #     # num_repeat = (num_remain_context + remaining.numel() - 1) // remaining.numel()
-    #     # padded = remaining.repeat(num_repeat)[:num_remain_context]
-    #     # selected = padded[torch.randperm(num_remain_context)]  # Shuffle for randomness
-
-    return selected.sort().values

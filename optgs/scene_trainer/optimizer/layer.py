@@ -1,6 +1,28 @@
+import functools
+
 import torch
 from jaxtyping import Float
 from torch import nn as nn, Tensor
+
+
+def _lazy_compile(**compile_kwargs):
+    """Like ``@torch.compile`` but defers the (heavy) dynamo/inductor import
+    until the function is first called. Applying ``torch.compile`` at import
+    eagerly loads the compile stack (~3.5s); this keeps it off the import path
+    and skips it entirely for runs that never call the wrapped function."""
+    def decorator(fn):
+        compiled = None
+
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            nonlocal compiled
+            if compiled is None:
+                compiled = torch.compile(fn, **compile_kwargs)
+            return compiled(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
 
 
 class SlicedG3RNorm(nn.Module):
@@ -8,11 +30,11 @@ class SlicedG3RNorm(nn.Module):
         """
         Apply G3R normalization to a slice of the input features.
 
-        Devide the input by the maximum absolute value in each channel.
+        Divide the input by the maximum absolute value in each channel.
 
         Args:
             num_features (int): Total number of features (channels).
-            input_slice (slice): Size of each slice to normalize independently.
+            input_slice (slice): Channel slice to normalize independently.
             eps (float): Small constant to prevent division by zero.
         """
         super().__init__()
@@ -44,50 +66,6 @@ class SlicedG3RNorm(nn.Module):
         return x
 
 
-class SlicedBatchNorm1d(nn.Module):
-    def __init__(self, num_features, input_slice, eps=1e-8, affine=False, track_running_stats=True):
-        """
-        Apply normalization independently to a slice of the input features.
-
-        Args:
-            num_features (int): Total number of features (channels).
-            input_slice (slice): Size of each slice to normalize independently.
-            eps (float): Small constant to prevent division by zero.
-            affine (bool): Whether to include learnable scale and bias per slice.
-        """
-        super().__init__()
-        self.input_slice = input_slice
-        dummy = torch.zeros(1, num_features)
-        chunk = dummy[:, input_slice]
-
-        self.slice_size = chunk.shape[-1]
-        self.eps = eps
-
-        # Create a BatchNorm1d module for each slice
-        self.slice_norm = nn.BatchNorm1d(self.slice_size, eps=eps, affine=affine,
-                                         track_running_stats=track_running_stats)
-
-    def forward(self, x):
-        """
-        Args:
-            x (Tensor): Shape (B, C) where C = num_features
-        Returns:
-            Tensor: Same shape, only subset of channels normalized
-        """
-        B, C = x.shape
-
-        # Split input into the slice to normalize and the rest
-        chunk = x[:, self.input_slice]
-
-        # Apply normalization to the selected slice
-        chunk = self.slice_norm(chunk)
-
-        # Replace the normalized slice back into the original input
-        x = x.clone()
-        x[:, self.input_slice] = chunk
-        return x
-
-
 class CustomGroupNorm(nn.Module):
     def __init__(self, group_sizes, eps=1e-8, affine=True):
         """
@@ -110,7 +88,7 @@ class CustomGroupNorm(nn.Module):
     def forward(self, x):
         """
         Args:
-            x (Tensor): Shape (B, C, H, W)
+            x (Tensor): Shape (B, C)
         Returns:
             Tensor: Same shape, group-wise normalized
         """
@@ -148,7 +126,7 @@ def slice_length(s, dim):
            max(0, (start - stop + (-step - 1)) // -step)
 
 
-@torch.compile(dynamic=True)
+@_lazy_compile(dynamic=True)
 def _adam_smooth_unmasked(m, v, t, chunk, beta1, beta2, eps) -> Tensor:
     """Fused moment update + bias-corrected output for the unmasked path."""
     m.lerp_(chunk, 1 - beta1)
@@ -160,7 +138,7 @@ def _adam_smooth_unmasked(m, v, t, chunk, beta1, beta2, eps) -> Tensor:
     return m.div(bias1).div_(denom)
 
 
-@torch.compile(dynamic=True)
+@_lazy_compile(dynamic=True)
 def _adam_smooth_masked(m, v, t, sel, chunk, beta1, beta2, eps) -> Tensor:
     """Fused moment update + bias-corrected output for the masked path."""
     m_sel = m[sel].lerp_(chunk, 1 - beta1)
@@ -291,7 +269,7 @@ class AdamInputSmoothing(nn.Module):
     def zero_out(self, zero_t=False) -> None:
         """Zero out the moments. Called when resetting gaussians opacities."""
         assert not self.is_reset(), (
-            "Cannot extend state that has not been initialized. Call forward() at least once first."
+            "Cannot zero out state that has not been initialized. Call forward() at least once first."
         )
         self.m = torch.zeros_like(self.m)
         self.v = torch.zeros_like(self.v)
@@ -301,7 +279,7 @@ class AdamInputSmoothing(nn.Module):
     def replace(self, from_indices: Tensor, dest_indices: Tensor, zero_t=False) -> None:
         """Replace the internal state to duplicate entries at the specified indices."""
         assert not self.is_reset(), (
-            "Cannot extend state that has not been initialized. Call forward() at least once first."
+            "Cannot replace state that has not been initialized. Call forward() at least once first."
         )
 
         self.m[dest_indices] = self.m[from_indices]

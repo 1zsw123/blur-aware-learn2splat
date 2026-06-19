@@ -5,19 +5,18 @@ name: knn_based
 
 # iterative refine
 no_render_error: false
-refine_sh_only: false
-num_basic_refine_blocks: 4
-num_refine_blocks: 1
+num_basic_blocks: 4
+num_blocks: 1
 concat_init_state: false
 replace_init_state: false
 state_channels: 256
-refine_block_rmsnorm: false
-refine_block_layernorm: false
+block_rmsnorm: false
+block_layernorm: false
 pt_qk_norm: false
 norm_pt_block: false
-refine_gaussian_multiple: 1
-refine_residual_init_state: false
-clamp_refine_max_scale: 3.0
+delta_gaussian_multiple: 1
+residual_init_state: false
+clamp_max_scale: 3.0
 clamp_min_scale: 1e-6
 clamp_min_raw_scales: -1e10
 clamp_max_raw_scales: 1e10
@@ -30,15 +29,14 @@ clamp_min_shs: -1e10
 clamp_max_shs: 1e10
 clamp_shs_soft: false
 
-update_attn_proj_channels: 64
-update_no_knn_attn: false
-update_no_tran_block_norm: false
-update_tran_block_act: gelu
+attn_proj_channels: 64
+no_knn_attn: false
+no_tran_block_norm: false
+tran_block_act: gelu
 multi_gaussian_scale_smaller: false
 init_gaussian_multiple: 1
-refine_condition_pt_feature: true
-reinit_gaussian_when_refine_multiple: false
-refine_same_num_points: false
+condition_pt_feature: true
+same_num_points: false
 input_error_rgb_no_shuffle: false
 input_error_cache_resnet_feature: false
 
@@ -50,20 +48,19 @@ init_state_scale: 0
 pt_heads: 1
 
 # refine with mv attention
-refine_with_mv_attn: false
-refine_with_mv_attn_lowres: false
-refine_no_mv_attn: false
+with_mv_attn: false
+with_mv_attn_lowres: false
+no_mv_attn: false
 mv_attn_conv_with_norm: false
-refine_mv_shuffle_attn: false
-refine_mv_attn_with_pos_enc: false
-refine_shuffle_attn_no_norm: false
-refine_mv_unimatch_attn: false
-refine_knn_samples: 16
-refine_multi_scale_pt: false
+mv_shuffle_attn: false
+mv_attn_with_pos_enc: false
+shuffle_attn_no_norm: false
+mv_unimatch_attn: false
+knn_samples: 16
+max_active_gaussians: 100_000
 
 # KNN
 use_fused_attn: true  # fused KNN gather + attention CUDA kernel (faster, less memory)
-prune_invisible_gaussians: false
 knn_idx_update_every: 1
 
 # inputs
@@ -103,25 +100,17 @@ input_gradient: false
 input_gradient_log: false
 input_gradient_log_clip_deltas: 0.001
 input_gradient_scale: 1.
-gradient_update_scale: 1.
+residual_grad_scale: 1.
 input_gradient_with_ssim_loss: false
 input_gradient_same_loss: false
 input_gradient_loss_reduction: mean
 scale_residual_grads: false
 
-window_local_refine: false
-window_global_refine: false
-window_local_global_refine: false
-
-# sliding window update to save training memory
-update_window_size: 0
-local_gaussian_render: false
-
-train_global_update_only: false
+train_global_only: false
 
 # random size refine
 # update more for low resolution, less for high
-random_update_with_size: false
+random_step_with_size: false
 
 
 use_amp: true
@@ -130,9 +119,6 @@ pt_update_amp: true
 
 use_checkpointing: false
 recurrent_use_checkpointing: false
-
-# Debugging
-debug_refine_update_module: true
 
 # Normalizing input
 input_gradient_normalize: false
@@ -146,21 +132,20 @@ predict_state_scale: false
 predict_state_scale_norm: false
 
 # Update head
-update_head_concat_img: false
-update_head_layer_num: 2
-update_head_act: gelu
-update_head_final_act: identity
-update_head_hidden_dim_matches: "input" # rebuttal version. switch to "output" for submission version
+delta_head_concat_img: false
+delta_head_layer_num: 2
+delta_head_act: gelu
+delta_head_final_act: identity
+delta_head_hidden_dim_matches: "input" # rebuttal version. switch to "output" for submission version
 
-update_head_scale_mag: false
-update_head_scalar_scale: false
-update_head_scalar_scale_act: relu
+delta_head_scalar_scale: false
+delta_head_scalar_scale_act: relu
 
 # Per-parameter-group heads (Feature A): separate heads per param group, each with own normalize+scale
-update_head_per_param_heads: false
-update_head_per_param_hidden_dim: 48  # tuned so total params ≈ baseline head (~81K)
-# Per-parameter scalar scales (Feature B): per-group scalar scales (requires update_head_scalar_scale=true)
-update_head_per_param_scales: false
+delta_head_per_param_heads: false
+delta_head_per_param_hidden_dim: 48  # tuned so total params ≈ baseline head (~81K)
+# Per-parameter scalar scales (Feature B): per-group scalar scales (requires delta_head_scalar_scale=true)
+delta_head_per_param_scales: false
 
 opt_scales_before_act: false
 

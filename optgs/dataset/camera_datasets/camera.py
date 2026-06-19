@@ -10,8 +10,6 @@ import os
 import json
 
 from optgs.geometry.projection import get_fov, get_projection_matrix
-from optgs.visualization.camera_trajectory.wobble import generate_wobble_transformation
-from optgs.visualization.camera_trajectory.interpolation import interpolate_extrinsics, interpolate_intrinsics
 
 
 def get_scene_scale(camtoworlds: Float[np.ndarray, "N 4 4"]) -> float:
@@ -143,133 +141,6 @@ class Camera(nn.Module):
                 indent=4,
             )
 
-    @classmethod
-    def load_camera(cls, cam_dir: Path, data_device: torch.device):
-        extrinsics = torch.load(cam_dir / "extrinsics.pt")
-        intrinsics = torch.load(cam_dir / "intrinsics.pt")
-        image = torch.load(cam_dir / "image.pt")
-
-        if (cam_dir / "gt_alpha_mask.pt").exists():
-            gt_alpha_mask = torch.load(cam_dir / "gt_alpha_mask.pt")
-        else:
-            gt_alpha_mask = None
-
-        with open(cam_dir / "cam_info.json", "r") as f:
-            cam_info = json.load(f)
-
-        return cls(
-            colmap_id=cam_info["colmap_id"],
-            extrinsics=extrinsics.to(data_device),
-            intrinsics=intrinsics.to(data_device),
-            image=image.to(data_device),
-            gt_alpha_mask=gt_alpha_mask.to(data_device) if gt_alpha_mask is not None else None,
-            raw_image_shape=tuple(cam_info["raw_image_shape"]),
-            image_name=cam_info["image_name"],
-            uid=cam_info["uid"],
-            near=torch.Tensor([cam_info["near"]]).to(data_device),
-            far=torch.Tensor([cam_info["far"]]).to(data_device),
-            data_device=data_device,
-        ).to(data_device)
-
-
-def generate_cam_params_for_wobble(t: Tensor, cam_a: Camera, cam_b: Camera):
-    origin_a = cam_a.extrinsics[:3, 3]
-    origin_b = cam_b.extrinsics[:3, 3]
-    cam_a_extrinsics = cam_a.extrinsics
-    cam_b_extrinsics = cam_b.extrinsics
-    cam_a_intrinsics = cam_a.intrinsics
-    cam_b_intrinsics = cam_b.intrinsics
-
-    delta = (origin_a - origin_b).norm(dim=-1)
-    
-    tf = generate_wobble_transformation(
-        radius=delta * 0.5,
-        t=t,
-        num_rotations=1,
-        scale_radius_with_t=False,
-    )
-
-    extrinsics = interpolate_extrinsics(
-        initial=cam_a_extrinsics,
-        final=cam_b_extrinsics,
-        t=(t - 2),
-    )
-    intrinsics = interpolate_intrinsics(
-        initial=cam_a_intrinsics,
-        final=cam_b_intrinsics,
-        t=(t - 2),
-    )
-    return extrinsics @ tf, intrinsics
-
-
-def generate_cam_params_for_interpolation(t: Tensor, cam_a: Camera, cam_b: Camera):
-    cam_a_extrinsics = cam_a.extrinsics
-    cam_a_extrinsics_render_view = cam_a.extrinsics_render_view
-    cam_b_extrinsics = cam_b.extrinsics
-    cam_b_extrinsics_render_view = cam_b.extrinsics_render_view
-    cam_a_intrinsics = cam_a.intrinsics
-    cam_a_intrinsics_render_view = cam_a.intrinsics_render_view
-    cam_b_intrinsics = cam_b.intrinsics
-    cam_b_intrinsics_render_view = cam_b.intrinsics_render_view
-
-    extrinsics = interpolate_extrinsics(
-        initial=cam_a_extrinsics,
-        final=cam_b_extrinsics,
-        t=(t - 2),
-    )
-    intrinsics = interpolate_intrinsics(
-        initial=cam_a_intrinsics,
-        final=cam_b_intrinsics,
-        t=(t - 2),
-    )
-    extrinsics_render_view = interpolate_extrinsics(
-        initial=cam_a_extrinsics_render_view,
-        final=cam_b_extrinsics_render_view,
-        t=(t - 2),
-    )
-    intrinsics_render_view = interpolate_intrinsics(
-        initial=cam_a_intrinsics_render_view,
-        final=cam_b_intrinsics_render_view,
-        t=(t - 2),
-    )
-    return extrinsics, intrinsics, extrinsics_render_view, intrinsics_render_view
-
-
-def get_intermediate_cameras(cam_a: Camera, cam_b: Camera, num_frames: int = 150, smooth: bool = False):
-    t = torch.linspace(0, 1, num_frames, dtype=torch.float32, device=cam_a.data_device)
-    if smooth: t = (torch.cos(torch.pi * (t + 1)) + 1) / 2
-    
-    extrinsics, intrinsics, extrinsics_render_view, intrinsics_render_view = (
-        generate_cam_params_for_interpolation(t, cam_a, cam_b)
-    )
-    extrinsics = extrinsics.squeeze(0)
-    intrinsics = intrinsics.squeeze(0)
-    extrinsics_render_view = extrinsics_render_view.squeeze(0)
-    intrinsics_render_view = intrinsics_render_view.squeeze(0)
-
-    cameras = [
-        Camera(
-            colmap_id=cam_a.colmap_id,
-            image_name=f"{cam_a.image_name}_{index:04d}",
-            uid=index,
-            near=cam_a.znear,
-            far=cam_a.zfar,
-            data_device=cam_a.data_device,
-            image=cam_a.original_image,     # These views have no ground truth image but we should never require images for mesh views
-            raw_image_shape=cam_a.raw_image_shape,
-            extrinsics=extrinsics[index],
-            intrinsics=intrinsics[index],
-            extrinsics_render_view=extrinsics_render_view[index],
-            intrinsics_render_view=intrinsics_render_view[index],
-            scale_matrix=cam_a.scale_matrix,
-            trans_matrix=cam_a.trans_matrix,
-            gt_alpha_mask=None
-        )
-        for index in range(num_frames)
-    ]
-    return cameras
-
-
 def patch_shim(cams: list[Camera], patch_size: int) -> list[Camera]:
     new_cams = []
 
@@ -318,18 +189,6 @@ def patch_shim(cams: list[Camera], patch_size: int) -> list[Camera]:
     
     return new_cams
 
-
-def calculate_cameras_extent(cam_centers: Tensor):
-    avg_cam_center = cam_centers.mean(dim=0, keepdim=True)
-    dist = torch.norm(cam_centers - avg_cam_center, dim=-1, keepdim=True)
-    diagonal = dist.max()
-
-    center = avg_cam_center.flatten()
-    radius = diagonal * 1.1
-
-    translate = -center
-    return translate, radius.item()
-        
 
 def save_cameras(cameras: list[Camera], save_dir: Path):
     os.makedirs(save_dir, exist_ok=True)

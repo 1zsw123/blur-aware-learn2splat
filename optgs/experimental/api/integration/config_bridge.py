@@ -190,22 +190,21 @@ def build_optimizer_cfg(cfg_path: Path) -> tuple["KnnBasedOptimizerCfg", int | N
 
     # Mirror SceneTrainerCfg (scene_trainer_cfg.py: scene_optimizer.update(
     # scene_initializer)): wire the checkpoint's initializer cfg into the
-    # optimizer cfg so the runtime-only fields init_gaussian_param_num /
-    # init_sh_d / sh_d — absent from every config file — are populated before
-    # the optimizer nn.Module is built.
+    # optimizer cfg so the runtime-only fields init_sh_d / sh_d — absent from
+    # every config file — are populated before the optimizer nn.Module is built.
     si = OmegaConf.select(cfg, "scene_trainer.scene_initializer")
     si_name = OmegaConf.select(cfg, "scene_trainer.scene_initializer.name")
     if si is None or si_name in (None, "none"):
         raise OptGSError(
             f"checkpoint config at {cfg_path} has no scene_initializer "
-            f"(name={si_name!r}); cannot derive init_gaussian_param_num "
-            f"required to build the optimizer."
+            f"(name={si_name!r}); cannot derive the optimizer's initializer "
+            f"settings required to build it."
         )
     init_cls = _initializer_cfg_class(str(si_name))
     if init_cls is None:
         raise OptGSError(
             f"unsupported scene_initializer.name={si_name!r} in {cfg_path}; "
-            f"cannot derive init_gaussian_param_num for the optimizer."
+            f"cannot derive the optimizer's initializer settings."
         )
     default_si = _compose_default_group("scene_initializer", str(si_name))
     if default_si is not None:
@@ -215,7 +214,7 @@ def build_optimizer_cfg(cfg_path: Path) -> tuple["KnnBasedOptimizerCfg", int | N
         merged_si = si
     try:
         init_cfg = load_typed_config(merged_si, init_cls)
-        opt_cfg.update(init_cfg)  # sets init_gaussian_param_num/init_sh_d/sh_d
+        opt_cfg.update(init_cfg)  # sets init_sh_d/sh_d
     except Exception as e:
         raise OptGSError(
             f"failed to wire scene_initializer ({si_name!r}) into the "
@@ -335,7 +334,7 @@ def build_adam_baseline(num_refine: int) -> "nn.Module":
         )
     OmegaConf.set_struct(composed, False)
     # gsplat decays the means LR over the full step budget.
-    composed.means_lr_max_steps = int(num_refine)
+    composed.lr_scheduler.max_steps = int(num_refine)
     # Disable densification — the baseline refines the same fixed Gaussian set
     # as the learned optimizer (a like-for-like comparison of the update rule).
     for flag in ("do_densify", "do_prune", "do_opacity_reset"):
@@ -357,14 +356,6 @@ def build_adam_baseline(num_refine: int) -> "nn.Module":
     return optimizer
 
 
-# Module-attribute renames applied when the legacy Resplat encoder was split
-# into separate initializer/optimizer modules (transcribed from
-# optgs/main.py:load_optimizer).
-_ORIG_OPTIMIZER_ATTR_RENAMES = {
-    "render_error_mv_attn": "update_error_attn",
-}
-
-
 def load_optimizer_state(
     optimizer: "nn.Module",
     ckpt_path: str,
@@ -378,6 +369,8 @@ def load_optimizer_state(
     full Hydra ``cfg`` and a ``scene_trainer``).
     """
     import torch
+
+    from optgs.misc.checkpointing import _rename_optimizer_attrs
 
     state = torch.load(ckpt_path, map_location="cpu")
     if isinstance(state, dict) and "state_dict" in state:
@@ -399,14 +392,10 @@ def load_optimizer_state(
             for k, v in state.items()
             if k.startswith("encoder.")
         }
-        renamed = {}
-        for k, v in osd.items():
-            for old, new in _ORIG_OPTIMIZER_ATTR_RENAMES.items():
-                if k == old or k.startswith(old + "."):
-                    k = new + k[len(old):]
-                    break
-            renamed[k] = v
-        osd = renamed
+
+    # Rename module attributes renamed in the update_/refine_ cleanup pass
+    # (and the resplat-era render_error_mv_attn).
+    osd = _rename_optimizer_attrs(osd)
 
     if not osd:
         raise OptGSError(
@@ -415,6 +404,6 @@ def load_optimizer_state(
         )
 
     if init_state_wo_features:
-        osd = {k: v for k, v in osd.items() if "update_proj" not in k}
+        osd = {k: v for k, v in osd.items() if "state_proj" not in k}
 
     optimizer.load_state_dict(osd, strict=strict)
