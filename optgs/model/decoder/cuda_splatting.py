@@ -1,3 +1,4 @@
+from inspect import signature
 from math import isqrt
 from typing import Literal
 
@@ -67,11 +68,15 @@ def render_cuda(
     use_sh: bool = True,
     gaussian_scales: Float[Tensor, "batch gaussian 3"] | None = None,
     gaussian_rotations: Float[Tensor, "batch gaussian 4"] | None = None,
+    means2d_out: Float[Tensor, "batch gaussian 2"] | None = None,
 ) -> tuple[
     Float[Tensor, "batch 3 height width"],
     Int[Tensor, "batch gaussian"],
-    Float[Tensor, "batch gaussian 2"],
 ]:
+    # means2d_out: a [B, N, 2] tensor whose slices become the rasterizer's screen-space means
+    # input. The 2D screen-space gradient is then reachable via torch.autograd.grad(loss,
+    # means2d_out) — no .backward()/.grad needed (see splatting_cuda_decoder). When None
+    # (e.g. the depth pass) a throwaway buffer is used.
     assert use_sh or gaussian_sh_coefficients.shape[-1] == 1
     # Exactly one of (covariances) or (scales+rotations) must be supplied.
     using_cov = gaussian_covariances is not None
@@ -111,20 +116,28 @@ def render_cuda(
     full_projection = view_matrix @ projection_matrix
 
     # The 3DGS-LM fork's settings carry cx/cy/prepare_for_gsgn_backward; stock Inria does not.
+    # The accelerated-3DGS build (graphdeco-inria@3dgs_accel) instead requires an `antialiasing` flag.
     _settings_fields = set(GaussianRasterizationSettings._fields)
     _fork_has_cxcy = "cx" in _settings_fields and "cy" in _settings_fields
     _fork_has_gsgn = "prepare_for_gsgn_backward" in _settings_fields
+    _has_antialiasing = "antialiasing" in _settings_fields
+    # The accelerated-3DGS build splits the SH DC term from the rest (separate `dc` arg);
+    # stock Inria / the 3DGS-LM fork take the full SH as a single `shs` arg.
+    _wants_dc = "dc" in signature(GaussianRasterizer.forward).parameters
+
+    n_gauss = gaussian_means.shape[1]
+    if means2d_out is None:
+        means2d_out = torch.zeros((b, n_gauss, 2), dtype=gaussian_means.dtype,
+                                  device=gaussian_means.device, requires_grad=True)
 
     all_images = []
     all_radii = []
-    all_means2d = []
     for i in range(b):
-        # Set up a tensor for the gradients of the screen-space means.
-        mean_gradients = torch.zeros_like(gaussian_means[i], requires_grad=True)
-        try:
-            mean_gradients.retain_grad()
-        except Exception:
-            pass
+        # Screen-space means input for the kernel: [means2d_out[i] | 0] so the rasterizer's
+        # backward routes the 2D gradient into means2d_out (reachable via autograd.grad).
+        # Stock Inria screenspace is [N, 3]; the extra column carries no useful gradient.
+        pad = torch.zeros((n_gauss, 1), dtype=gaussian_means.dtype, device=gaussian_means.device)
+        mean_gradients = torch.cat([means2d_out[i], pad], dim=1)  # [N, 3]
 
         settings_kwargs = dict(
             image_height=h,
@@ -145,16 +158,24 @@ def render_cuda(
             settings_kwargs["cy"] = float(cys[i].item())
         if _fork_has_gsgn:
             settings_kwargs["prepare_for_gsgn_backward"] = False
+        if _has_antialiasing:
+            settings_kwargs["antialiasing"] = False
         settings = GaussianRasterizationSettings(**settings_kwargs)
         rasterizer = GaussianRasterizer(settings)
 
         raster_kwargs = dict(
             means3D=gaussian_means[i],
             means2D=mean_gradients,
-            shs=shs[i] if use_sh else None,
             colors_precomp=None if use_sh else shs[i, :, 0, :],
             opacities=gaussian_opacities[i, ..., None],
         )
+        if use_sh and _wants_dc:
+            # Accelerated build: DC term split out; the rest stays a tensor (empty [N,0,3]
+            # at degree 0), not None — the kernel validates on `shs`.
+            raster_kwargs["dc"] = shs[i, :, :1].contiguous()
+            raster_kwargs["shs"] = shs[i, :, 1:].contiguous()
+        else:
+            raster_kwargs["shs"] = shs[i] if use_sh else None
         if using_cov:
             row, col = torch.triu_indices(3, 3)
             raster_kwargs["cov3D_precomp"] = gaussian_covariances[i, :, row, col]
@@ -166,8 +187,7 @@ def render_cuda(
         image, radii = out[0], out[1]
         all_images.append(image)
         all_radii.append(radii)
-        all_means2d.append(mean_gradients[:, :2])
-    return torch.stack(all_images), torch.stack(all_radii), torch.stack(all_means2d)
+    return torch.stack(all_images), torch.stack(all_radii)
 
 
 def render_cuda_orthographic(
@@ -291,7 +311,7 @@ def render_depth_cuda(
 
     # Render using depth as color.
     b, _ = fake_color.shape
-    images, _, _ = render_cuda(
+    images, _ = render_cuda(
         extrinsics,
         intrinsics,
         near,

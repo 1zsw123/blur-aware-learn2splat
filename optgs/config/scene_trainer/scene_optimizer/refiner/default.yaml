@@ -6,7 +6,6 @@ do_opacity_reset: true
 
 #
 cap_max: -1  # no cap
-noise_lr: 0.0
 
 # scheduling
 pause_refine_after_reset: 0

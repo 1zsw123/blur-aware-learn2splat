@@ -44,3 +44,5 @@ wheels/gsplat-1.5.3-cp312-cp312-linux_x86_64.whl filter=lfs diff=lfs merge=lfs -
 wheels/nerfacc-0.5.3-cp312-cp312-linux_x86_64.whl filter=lfs diff=lfs merge=lfs -text
 wheels/pointops-1.0-cp312-cp312-linux_x86_64.whl filter=lfs diff=lfs merge=lfs -text
 wheels/simple_knn-0.0.0-cp312-cp312-linux_x86_64.whl filter=lfs diff=lfs merge=lfs -text
+wheels/diff_gaussian_rasterization_fastgs-0.0.0-cp312-cp312-linux_x86_64.whl filter=lfs diff=lfs merge=lfs -text
+wheels/diff_gaussian_rasterization-0.0.0-cp312-cp312-linux_x86_64.whl filter=lfs diff=lfs merge=lfs -text

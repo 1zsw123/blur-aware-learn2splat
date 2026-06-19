@@ -291,7 +291,10 @@ def calc_input_gradients(
                 radii_all[:, start:stop]      = output_renderer.radii
                 visibility_all[:, start:stop] = output_renderer.visibility_filter
                 if need_2d_grads:
-                    means2d_grads_all[:, start:stop] = chunk_grads[5].detach()
+                    # Normalize to NDC per the renderer's convention so the ADC stays
+                    # renderer-agnostic (gsplat=pixel→×w/2,h/2; inria/fastgs already NDC).
+                    means2d_grads_all[:, start:stop] = renderer.means2d_grad_to_ndc(
+                        chunk_grads[5].detach(), (h, w))
 
     # --- Average grads for multi-chunk ---
     if nr_chunks > 1:

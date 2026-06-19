@@ -1,0 +1,40 @@
+name: fastgs
+
+do_densify: true
+do_prune: true
+do_opacity_reset: true
+
+#
+cap_max: -1  # no cap
+
+# scheduling (FastGS defaults match vanilla 3DGS)
+pause_refine_after_reset: 0
+refine_every: 100
+reset_every: 3000
+refine_start_iter: 500
+refine_stop_iter: 15000
+refine_scale2d_stop_iter: 0
+
+# thresholds
+grow_grad2d: 0.0002  # FastGS grad_thresh (clone, normal screen-grad)
+grow_scale3d: 0.001  # FastGS dense (clone<->split size split); FastGS lowers this from 3DGS's 0.01
+prune_scale3d: 0.1
+prune_scale2d: 0.15
+grow_scale2d: 0.05
+min_opacity: 0.005
+
+# Pruning parameters
+prune_zero_radii: false
+
+# Slightly reduce opacity every few steps
+reduce_opacity: false
+reduce_factor: 0.0  # not used
+reduce_every: 0  # not used
+
+fallback_means_lr: 0.0  # unused (noise_lr=0.0)
+
+# FastGS-specific (see adc/fastgs.py)
+grad_abs_thresh: 0.0012  # Abs-GS split threshold (split signal)
+importance_thresh: 5     # min averaged high-error view count to densify
+prune_budget_frac: 0.5   # fraction of eligible Gaussians pruned per step
+opacity_clamp: 0.8       # opacity ceiling applied after each densification

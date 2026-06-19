@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import torch
 import torch.nn.functional as F
@@ -16,6 +16,13 @@ from optgs.scene_trainer.adc.base import (
     _clone_objects,
 )
 from optgs.scene_trainer.gaussian_module import GaussiansModule
+
+
+@dataclass
+class VanillaStrategyCfg(BaseStrategyCfg):
+    """Vanilla 3DGS / EDGS densification (clone/split/prune). Adds no fields beyond the common
+    base; the narrowed ``name`` lets the StrategyCfg union discriminate this arm by name."""
+    name: Literal["default", "edgs", "none"]
 
 
 @dataclass
@@ -65,9 +72,10 @@ def update_vanilla_strategy_state(
         means2d_grads = means2d_grads.squeeze(0)  # [V, G, 2], assume batch size 1
         grads = means2d_grads[visibility_mask]  # [G_valid, 2]
 
-        # normalize grads to [-1, 1] screen space
-        grads[..., 0] *= w / 2.0 * v
-        grads[..., 1] *= h / 2.0 * v
+        # The per-renderer [-1, 1] NDC screen normalization now lives in the decoder
+        # (Decoder.means2d_grad_to_ndc), so means2d_grads already arrives in NDC and this strategy
+        # is renderer-agnostic. Only the view-count factor remains here.
+        grads = grads * v
 
         # accumulate 2D grads norm
         adc_state.grad2d_norm_accum.index_add_(0, gs_ids, grads.norm(dim=-1))
@@ -100,7 +108,7 @@ def reset_adc_state(
 
 def prune(
     gaussians: Gaussians | GaussiansModule,
-    adc_state: VanillaStrategyState,
+    adc_state: GenericStrategyState,  # Vanilla or FastGS state (FastGS reuses this helper)
     prune_mask: Tensor,
 ) -> None:
     """Gaussians are updated in place."""
@@ -137,7 +145,7 @@ def prune(
 
 def splitting(
     gaussians: Gaussians | GaussiansModule,
-    adc_state: VanillaStrategyState,
+    adc_state: GenericStrategyState,  # Vanilla or FastGS state (FastGS reuses this helper)
     split_mask: Tensor,
     N=2,
     revised_opacity: bool = False,
@@ -277,7 +285,7 @@ def splitting(
 
 def cloning(
     gaussians: Gaussians | GaussiansModule,
-    adc_state: VanillaStrategyState,
+    adc_state: GenericStrategyState,  # Vanilla or FastGS state (FastGS reuses this helper)
     clone_mask: Tensor,
 ) -> None:
     """Gaussians are updated in place."""

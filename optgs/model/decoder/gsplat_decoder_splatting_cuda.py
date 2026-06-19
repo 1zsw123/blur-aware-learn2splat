@@ -38,6 +38,13 @@ class GSplatDecoderSplattingCUDA(Decoder[GSplatDecoderSplattingCUDACfg]):
             persistent=False,
         )
 
+    def means2d_grad_to_ndc(self, grad, image_shape):
+        # gsplat's means2d is in pixel space, so its gradient scales with image size. Convert to
+        # the resolution-independent NDC convention by * (w/2, h/2). (Inria/FastGS already emit
+        # NDC and inherit the identity default — see Decoder.means2d_grad_to_ndc.)
+        h, w = image_shape
+        return grad * grad.new_tensor([w / 2.0, h / 2.0])
+
     def forward(
         self,
         gaussians: Gaussians | GaussiansModule,

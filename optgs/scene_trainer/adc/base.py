@@ -10,22 +10,26 @@ class GenericStrategyState:
 
 @dataclass
 class BaseStrategyCfg:
-    name: Literal["default", "edgs", "mcmc", "none"]
-    
+    """Common adaptive-density-control config: the densification knobs every strategy shares, plus
+    the two read on cross-strategy paths (``cap_max`` by the config bridge, ``fallback_means_lr`` by
+    the optimizer). Strategy-specific knobs live in the ``name``-narrowed subclasses —
+    ``VanillaStrategyCfg`` (vanilla.py), ``McmcStrategyCfg`` (mcmc.py), ``FastGSStrategyCfg``
+    (fastgs.py) — which the ``StrategyCfg`` union in ``__init__.py`` discriminates by ``name``."""
+    name: Literal["default", "edgs", "mcmc", "none", "fastgs"]
+
     do_densify: bool
     do_prune: bool
     do_opacity_reset: bool
-    
-    cap_max: int  # Maximum number of GSs, -1 for no cap
-    noise_lr: float  # MCMC samping noise learning rate, 0.0 for no MCMC sampling
-    
+
+    cap_max: int  # Maximum number of GSs, -1 for no cap (general densification cap; read by config_bridge)
+
     pause_refine_after_reset: int
     refine_every: int
     reset_every: int
     refine_start_iter: int
     refine_stop_iter: int
     refine_scale2d_stop_iter: int  # Until which iteration 2D scale based refinement / pruning is applied
-    
+
     grow_grad2d: float # GSs with image plane gradient above this value will be split/duplicated
     grow_scale3d: float # GSs with scale below this value will be duplicated. Above will be split
     prune_scale3d: float # GSs with scale above this value will be pruned
@@ -38,19 +42,9 @@ class BaseStrategyCfg:
     reduce_factor: float # Factor to reduce opacity by
     reduce_every: int # Reduce opacity every N iterations
 
-    # Fallback means lr used for MCMC noise injection when the optimizer has no means_lr_scheduler.
-    # Matches the original paper's intended scale: means_lr (~1.6e-4) * noise_lr (5e5) ≈ 80 world units.
+    # Fallback means lr used when the optimizer has no means_lr_scheduler (read on the shared apply
+    # path in optimizer.py; also sets the MCMC noise scale via McmcStrategyCfg.noise_lr).
     fallback_means_lr: float
-
-    # If True, relocated Gaussians inherit the optimizer state of the alive Gaussian they were
-    # sampled from (better initialization). If False, state is zeroed (original paper behaviour).
-    relocate_copy_state: bool = False
-
-    # MCMC noise: cap on the scales used for the noise covariance (does NOT affect rendered scales).
-    # Needed because knn_based saturates clamp_max_scale, producing covariances orders of
-    # magnitude larger than vanilla's Adam-evolved scales. The resulting MCMC noise overflows the
-    # renderer's tile-binning math and causes silent CUDA OOB. Rule of thumb: ~scene_scale / 5.
-    noise_scale_cap: float = 1.0
 
 
 def _prune_objects(prune_mask, objects):

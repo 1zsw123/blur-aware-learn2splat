@@ -25,6 +25,7 @@ from optgs.scene_trainer.optimizer.optimizer import OptimizerOutput
 from optgs.scene_trainer.optimizer.optimizer_utils import Number3DGSCfg
 from optgs.misc.detaching_cpu_list import DetachingCPUList
 from optgs.dataset.camera_datasets.camera import get_scene_scale
+from optgs.paths import DEBUG
 from optgs.misc.general_utils import get_expon_lr_func
 from fused_ssim import fused_ssim
 from optgs.model.decoder.decoder import DecoderOutput
@@ -35,6 +36,10 @@ class PostProcessADCCfg:
     """ADC (Adaptive Density Control) config for postprocessing.
     Defaults match vanilla 3DGS (config/scene_trainer/scene_optimizer/refiner/default.yaml).
     """
+    # Densification strategy: "vanilla" (3DGS) or "fastgs" (multi-view metric + Abs-GS split).
+    # "fastgs" requires the FastGS decoder (it needs the abs-gradient and metric-counts render).
+    strategy: str = "vanilla"
+
     do_densify: bool = True
     do_prune: bool = True
     do_opacity_reset: bool = True
@@ -57,7 +62,13 @@ class PostProcessADCCfg:
     prune_scale2d: float = 0.15
     min_opacity: float = 0.005
 
-    revised_opacity: bool = False
+    # FastGS strategy knobs (strategy == "fastgs"); see adc/fastgs.py.
+    grad_abs_thresh: float = 0.0012   # Abs-GS split threshold (split signal)
+    importance_thresh: int = 5        # min averaged high-error view count to densify (integer count)
+    prune_budget_frac: float = 0.5    # fraction of eligible Gaussians pruned per step
+    opacity_clamp: float = 0.8        # opacity ceiling applied after each densification
+    loss_thresh: float = 0.1          # normalized-L1 threshold for the high-error metric map
+    num_score_cams: int = 10          # context views sampled to score each densification
 
 
 @dataclass
@@ -134,6 +145,33 @@ def _deactivated_gaussians_to_module(gaussians: Gaussians, device: torch.device)
         scales=torch.exp(gaussians.scales[0]).to(device),
         rotations_unnorm=gaussians.rotations_unnorm[0].to(device),
     )
+
+
+def _to_strategy_cfg(adc_cfg: PostProcessADCCfg):
+    """Build the dispatch's strategy config (a BaseStrategyCfg subclass) from the postprocessing
+    ADC config, so postprocessing runs the shared apply_adc_strategy instead of its own copy of the
+    clone/split/prune logic. Postprocessing imposes no cap and no MCMC/reduce, so those base knobs
+    take inert defaults; loss_thresh / num_score_cams stay on PostProcessADCCfg (render params)."""
+    from optgs.scene_trainer.adc.vanilla import VanillaStrategyCfg
+    from optgs.scene_trainer.adc.fastgs import FastGSStrategyCfg
+
+    common = dict(
+        do_densify=adc_cfg.do_densify, do_prune=adc_cfg.do_prune, do_opacity_reset=adc_cfg.do_opacity_reset,
+        cap_max=-1, pause_refine_after_reset=adc_cfg.pause_refine_after_reset,
+        refine_every=adc_cfg.refine_every, reset_every=adc_cfg.reset_every,
+        refine_start_iter=adc_cfg.refine_start_iter, refine_stop_iter=adc_cfg.refine_stop_iter,
+        refine_scale2d_stop_iter=adc_cfg.refine_scale2d_stop_iter, grow_grad2d=adc_cfg.grow_grad2d,
+        grow_scale3d=adc_cfg.grow_scale3d, prune_scale3d=adc_cfg.prune_scale3d,
+        prune_scale2d=adc_cfg.prune_scale2d, grow_scale2d=adc_cfg.grow_scale2d, min_opacity=adc_cfg.min_opacity,
+        prune_zero_radii=False, reduce_opacity=False, reduce_factor=0.0, reduce_every=0, fallback_means_lr=0.0,
+    )
+    if adc_cfg.strategy == "fastgs":
+        return FastGSStrategyCfg(
+            name="fastgs", **common, grad_abs_thresh=adc_cfg.grad_abs_thresh,
+            importance_thresh=adc_cfg.importance_thresh, prune_budget_frac=adc_cfg.prune_budget_frac,
+            opacity_clamp=adc_cfg.opacity_clamp,
+        )
+    return VanillaStrategyCfg(name="default", **common)
 
 
 class PostProcessing3DGS:
@@ -213,6 +251,9 @@ class PostProcessing3DGS:
         if need_adc:
             N = gaussian_module.means.shape[0]
             means2d_grads_all = torch.zeros((1, v, N, 2), device=gaussian_module.means.device)
+            # FastGS Abs-GS split signal (only populated when the decoder exposes means2d_abs).
+            means2d_abs_grads_all = torch.zeros((1, v, N, 2), device=gaussian_module.means.device)
+            has_abs_grad = False
             radii_all = torch.zeros((1, v, N, 2), device=gaussian_module.means.device)
             visibility_all = torch.zeros((1, v, N), dtype=torch.bool, device=gaussian_module.means.device)
 
@@ -231,9 +272,11 @@ class PostProcessing3DGS:
             # Render
             chunk_output = decoder.forward_batch_subset(gaussian_module, chunk_context, render_res)
 
-            # Retain means2d grad for ADC
+            # Retain means2d grad(s) for ADC
             if need_adc and chunk_output.means2d is not None:
                 chunk_output.means2d.retain_grad()
+            if need_adc and chunk_output.means2d_abs is not None:
+                chunk_output.means2d_abs.retain_grad()
 
             # Loss and backward (gradients accumulate across chunks)
             chunk_loss = self._calc_loss(chunk_context, chunk_output)
@@ -246,7 +289,14 @@ class PostProcessing3DGS:
                 if chunk_output.visibility_filter is not None:
                     visibility_all[:, chunk_start:chunk_end] = chunk_output.visibility_filter.detach()
                 if chunk_output.means2d is not None and chunk_output.means2d.grad is not None:
-                    means2d_grads_all[:, chunk_start:chunk_end] = chunk_output.means2d.grad.detach()
+                    # Normalize to NDC per the renderer's convention so the ADC stays
+                    # renderer-agnostic (gsplat=pixel→×w/2,h/2; inria/fastgs already NDC).
+                    means2d_grads_all[:, chunk_start:chunk_end] = decoder.means2d_grad_to_ndc(
+                        chunk_output.means2d.grad.detach(), render_res)
+                if chunk_output.means2d_abs is not None and chunk_output.means2d_abs.grad is not None:
+                    means2d_abs_grads_all[:, chunk_start:chunk_end] = decoder.means2d_grad_to_ndc(
+                        chunk_output.means2d_abs.grad.detach(), render_res)
+                    has_abs_grad = True
 
         # Average gradients across chunks (matches vanilla behavior)
         if nr_chunks > 1:
@@ -260,100 +310,94 @@ class PostProcessing3DGS:
                 "radii": radii_all,
                 "visibility_filter": visibility_all,
                 "means_2d_grads": means2d_grads_all,
+                "means_2d_abs_grads": means2d_abs_grads_all if has_abs_grad else None,
             }
         return None
 
-    def _apply_adc(self, step, gaussian_module, adc_state, device):
-        """Apply ADC (clone/split/prune/opacity reset) using the same logic as vanilla 3DGS.
+    def _apply_adc(self, step, gaussian_module, adc_state, strategy_cfg, batch, decoder, render_res, device):
+        """Run the configured ADC strategy through the shared dispatch (apply_adc_strategy) — no
+        reimplementation of clone/split/prune. Returns (gaussian_module, optimizer_needs_rebuild)."""
+        from optgs.scene_trainer.adc import apply_adc_strategy
 
-        Returns (gaussian_module, optimizer_needs_rebuild).
-        """
-        from optgs.scene_trainer.adc.vanilla import cloning, splitting, prune, reset_adc_state
+        # FastGS multi-view scores: only at densification steps; vanilla ignores these (None).
+        scores = {}
+        if strategy_cfg.name == "fastgs" and self._is_densify_step(step, strategy_cfg):
+            imp, pr = self._compute_fastgs_scores(gaussian_module, batch, decoder, render_res, self.cfg.adc)
+            scores = dict(importance_score=imp, pruning_score=pr)
 
-        adc_cfg = self.cfg.adc
-        changed = False
-        nr_cloned, nr_splitted, nr_pruned = 0, 0, 0
-
-        # Convert to deactivated Gaussians for ADC (ADC functions expect Gaussians, not GaussiansModule)
+        # ADC mutates deactivated Gaussians in place; postprocessing rebuilds the optimizer on
+        # change, so it threads no smoothers (empty dict -> the strategy's object hooks are no-ops).
         gaussians = _module_to_deactivated_gaussians(gaussian_module)
-
-        if step < adc_cfg.refine_stop_iter:
-            grads = adc_state.grad2d_norm_accum / adc_state.denom.clamp_min(1.0)
-            scene_extent = adc_state.scene_extent
-
-            if (
-                step >= adc_cfg.refine_start_iter
-                and step % adc_cfg.refine_every == 0
-                and step % adc_cfg.reset_every >= adc_cfg.pause_refine_after_reset
-            ):
-                if adc_cfg.do_densify:
-                    scales = torch.exp(gaussians.scales.squeeze(0))  # activate
-                    is_grad_high = grads > adc_cfg.grow_grad2d
-                    is_small = scales.max(dim=-1).values <= adc_cfg.grow_scale3d * scene_extent
-
-                    clone_mask = is_grad_high & is_small
-                    split_mask = is_grad_high & ~is_small
-
-                    if step < adc_cfg.refine_scale2d_stop_iter:
-                        split_mask |= adc_state.radii2d > adc_cfg.grow_scale2d
-
-                    # Clone
-                    cloning(gaussians, adc_state, clone_mask)
-                    nr_cloned = int(clone_mask.sum().item())
-
-                    # Extend split_mask for newly cloned points (they should not be split)
-                    split_mask = torch.cat([
-                        split_mask,
-                        torch.zeros(nr_cloned, dtype=torch.bool, device=split_mask.device),
-                    ])
-
-                    # Split
-                    splitting(gaussians, adc_state, split_mask, N=2,
-                              revised_opacity=adc_cfg.revised_opacity)
-                    nr_splitted = int(split_mask.sum().item())
-
-                    changed = True
-
-                if adc_cfg.do_prune:
-                    opacities = torch.sigmoid(gaussians.opacities.squeeze(0))  # activate
-                    scales = torch.exp(gaussians.scales.squeeze(0))            # activate
-
-                    prune_mask = opacities < adc_cfg.min_opacity
-                    if step > adc_cfg.reset_every:
-                        is_too_big = scales.max(dim=-1).values > adc_cfg.prune_scale3d * scene_extent
-                        if step < adc_cfg.refine_scale2d_stop_iter:
-                            is_too_big |= adc_state.radii2d > adc_cfg.prune_scale2d
-                        prune_mask = prune_mask | is_too_big
-
-                    prune(gaussians, adc_state, prune_mask)
-                    nr_pruned = int(prune_mask.sum().item())
-                    changed = True
-
-                reset_adc_state(adc_state)
-                print(
-                    f"ADC @ iter {step}: cloned {nr_cloned}, split {nr_splitted}, "
-                    f"pruned {nr_pruned}, total {gaussians.means.shape[1]}"
-                )
-
-        # Opacity reset
-        if adc_cfg.do_opacity_reset:
-            if step % adc_cfg.reset_every == 0 and step > 0:
-                opacities = torch.sigmoid(gaussians.opacities)  # activate
-                value = adc_cfg.min_opacity * 2.0
-                new_opacities = torch.min(opacities, torch.ones_like(opacities) * value)
-                gaussians.opacities = torch.logit(new_opacities)  # deactivate back
-                changed = True
-                print(f"Opacity reset @ iter {step}")
+        nr_cloned, nr_splitted, nr_pruned, _, _ = apply_adc_strategy(
+            strategy_cfg, step=step, gaussians=gaussians, adc_state=adc_state, smoothers={}, **scores
+        )
 
         self.benchmarker.record("cloned", nr_cloned)
         self.benchmarker.record("splitted", nr_splitted)
         self.benchmarker.record("pruned", nr_pruned)
 
+        changed = self._strategy_modifies_module(step, strategy_cfg, nr_cloned, nr_splitted, nr_pruned)
         if changed:
-            # Rebuild GaussiansModule from modified Gaussians
             gaussian_module = _deactivated_gaussians_to_module(gaussians, device)
-
         return gaussian_module, changed
+
+    def _is_densify_step(self, step: int, cfg) -> bool:
+        """The densification gate shared by apply_vanilla / apply_fastgs — used to time the FastGS
+        score render and to detect module-modifying steps."""
+        return (
+            step < cfg.refine_stop_iter
+            and step > cfg.refine_start_iter
+            and step % cfg.refine_every == 0
+            and step % cfg.reset_every >= cfg.pause_refine_after_reset
+        )
+
+    def _strategy_modifies_module(self, step, cfg, nr_cloned, nr_splitted, nr_pruned) -> bool:
+        """Whether this ADC step changed the Gaussians (so the module + optimizer must be rebuilt):
+        any clone/split/prune, a periodic opacity reset, or — for FastGS — the per-densify opacity
+        clamp. Mirrors the gates inside apply_vanilla_strategy / apply_fastgs_strategy."""
+        if nr_cloned or nr_splitted or nr_pruned:
+            return True
+        # Periodic opacity reset: vanilla resets unconditionally; fastgs only while still densifying.
+        if cfg.do_opacity_reset and step > 0 and step % cfg.reset_every == 0:
+            if cfg.name != "fastgs" or step < cfg.refine_stop_iter:
+                return True
+        # FastGS clamps opacity to a ceiling on every densification step.
+        if cfg.name == "fastgs" and self._is_densify_step(step, cfg):
+            return True
+        return False
+
+    @torch.no_grad()
+    def _compute_fastgs_scores(self, gaussian_module, batch, decoder, render_res, adc_cfg):
+        """FastGS multi-view importance/pruning scores: sample context views, flag high-error
+        pixels, and ask the FastGS rasterizer which Gaussians contributed to them. Mirrors
+        ``compute_gaussian_score_fastgs`` in submodules/FastGS/utils/fast_utils.py."""
+        from optgs.scene_trainer.adc.fastgs import compute_fastgs_scores
+
+        ctx = batch["context"]
+        n_views = ctx["extrinsics"].shape[1]
+        n = min(adc_cfg.num_score_cams, n_views)
+        idx = torch.randperm(n_views, device=ctx["extrinsics"].device)[:n]
+        ext, intr = ctx["extrinsics"][:, idx], ctx["intrinsics"][:, idx]
+        near, far = ctx["near"][:, idx], ctx["far"][:, idx]
+        gt = ctx["image"][:, idx]  # [1, n, 3, H, W]
+
+        sub = {"extrinsics": ext, "intrinsics": intr, "near": near, "far": far}
+        render = decoder.forward_batch_subset(gaussian_module, sub, render_res).color  # [1, n, 3, H, W]
+
+        eps = torch.finfo(render.dtype).eps
+        metric_maps, losses = [], []
+        for j in range(n):
+            r, g = render[0, j], gt[0, j]  # [3, H, W]
+            l1 = (r - g).abs().mean(0)  # [H, W]
+            l1n = (l1 - l1.min()) / (l1.max() - l1.min()).clamp_min(eps)
+            metric_maps.append((l1n > adc_cfg.loss_thresh).int().reshape(-1))  # [H*W]
+            ssim = fused_ssim(r.unsqueeze(0), g.unsqueeze(0), padding="valid")
+            losses.append((0.8 * (r - g).abs().mean() + 0.2 * (1.0 - ssim)).item())
+
+        counts = decoder.render_metric_counts(
+            gaussian_module, ext, intr, near, far, render_res, torch.stack(metric_maps)
+        )  # [n, N]
+        return compute_fastgs_scores(list(counts), losses, densify=True)
 
     @torch.no_grad()
     def apply(
@@ -377,12 +421,11 @@ class PostProcessing3DGS:
         if self.cfg.steps == 0:
             return None
 
-        # [Improvement 1] Calculate scene_scale from both context + target (matches vanilla optimizer)
+        # Calculate scene_scale from both context + target (matches vanilla optimizer)
         camtoworlds_context = batch['context']['extrinsics'][0].cpu().numpy()  # [Vc, 4, 4]
         camtoworlds_target = batch['target']['extrinsics'][0].cpu().numpy()    # [Vt, 4, 4]
         camtoworlds = np.concatenate([camtoworlds_context, camtoworlds_target], axis=0)
         scene_scale = get_scene_scale(camtoworlds)
-        print("scene_scale:", scene_scale)
 
         device = batch['context']['image'].device
 
@@ -392,10 +435,6 @@ class PostProcessing3DGS:
         optimizer = self.get_optimizer(gaussian_module, scene_scale)
         scheduler = self.get_scheduler(optimizer, scene_scale=scene_scale, prior_steps=self.cfg.prior_steps)
 
-        # print all optimizer param groups
-        for i, param_group in enumerate(optimizer.param_groups):
-            print(f"Param group {i}: lr={param_group['lr']}, weight_decay={param_group.get('weight_decay', 0.0)}, requires_grad={param_group['params'][0].requires_grad}")
-
         assert batch["context"]["extrinsics"].shape[0] == batch["context"]["extrinsics"].shape[0] == 1, \
             "Batch size > 1 not supported for post-processing"
 
@@ -403,21 +442,25 @@ class PostProcessing3DGS:
 
         # controlling number of context views seen at each iteration (for rendering chunk size)
         _iter_batch_size = iter_batch_size if iter_batch_size > 0 else nr_context_views
-        print("using iter_batch_size =", _iter_batch_size)
 
         render_res = (h, w)
 
-        # [Improvement 3] Initialize ADC state if configured
+        # Initialize ADC state via the shared dispatch, from a real strategy config.
         adc_state = None
+        strategy_cfg = None
         if self.cfg.adc is not None:
-            from optgs.scene_trainer.adc.vanilla import VanillaStrategyState
+            from optgs.scene_trainer.adc import init_strategy_state
+
+            if self.cfg.adc.strategy == "fastgs" and not hasattr(decoder, "render_metric_counts"):
+                raise ValueError(
+                    "postprocessing adc.strategy='fastgs' requires the FastGS decoder "
+                    "(decoder=fastgs); it needs the abs-gradient and metric-counts render."
+                )
+            strategy_cfg = _to_strategy_cfg(self.cfg.adc)
             nr_points = gaussian_module.means.shape[0]
-            adc_state = VanillaStrategyState.initialize(
-                nr_points=nr_points,
-                device=device,
-                scene_extent=scene_scale,
+            adc_state = init_strategy_state(
+                strategy_cfg, nr_points=nr_points, device=device, scene_extent=scene_scale
             )
-            print(f"Initialized ADC state with {nr_points} points")
 
         # render before first step
         context_render_output = decoder.forward_batch_subset(gaussian_module, batch["context"], render_res, iter_batch_size=_iter_batch_size)
@@ -445,7 +488,7 @@ class PostProcessing3DGS:
                     # Sample context views using the same strategy as the optimizer
                     iter_context, _ = batchify_fn(batch, "context")
 
-                    # [Improvement 4] Render in chunks, accumulate gradients, collect ADC metadata
+                    # Render in chunks, accumulate gradients, collect ADC metadata
                     meta_for_adc = self._chunked_forward_backward(
                         gaussian_module, iter_context, decoder, render_res, adc_state
                     )
@@ -457,22 +500,24 @@ class PostProcessing3DGS:
                     if scheduler is not None:
                         scheduler.step()
 
-                # [Improvement 3] ADC: update state and apply densification/pruning
+                # ADC: update state and apply densification/pruning via the dispatch.
                 if adc_state is not None and meta_for_adc is not None:
-                    from optgs.scene_trainer.adc.vanilla import update_vanilla_strategy_state
+                    from optgs.scene_trainer.adc import update_strategy_state
 
                     v_chunk = iter_context["image"].shape[1]
-                    update_vanilla_strategy_state(
+                    # means_2d_abs_grads is the FastGS split signal; the dispatch ignores it for the
+                    # vanilla state and consumes it for the FastGS state.
+                    update_strategy_state(
                         adc_state,
                         radii_2d=meta_for_adc["radii"],
                         means2d_grads=meta_for_adc["means_2d_grads"],
+                        means2d_abs_grads=meta_for_adc.get("means_2d_abs_grads"),
                         visibility_mask=meta_for_adc["visibility_filter"],
-                        v=v_chunk,
-                        w=w,
-                        h=h,
+                        v=v_chunk, w=w, h=h,
                     )
-
-                    gaussian_module, adc_changed = self._apply_adc(i, gaussian_module, adc_state, device)
+                    gaussian_module, adc_changed = self._apply_adc(
+                        i, gaussian_module, adc_state, strategy_cfg, batch, decoder, render_res, device
+                    )
                     if adc_changed:
                         # Rebuild optimizer and scheduler after ADC changed the Gaussian count.
                         # Caveat: rebuilding drops the Adam moments (exp_avg/exp_avg_sq) for every
@@ -567,7 +612,6 @@ class PostProcessing3DGS:
             params.append((key, named_parameters[key], getattr(self.cfg.lr_data, lr_data_attr)))
 
         world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
-        print(f"World size: {world_size}")
 
         BS = batch_size * world_size
         # Build parameter groups for a single optimizer
@@ -599,14 +643,6 @@ class PostProcessing3DGS:
             **opt_params
         )
 
-        # Print out info for debugging
-        print("Optimizer with parameter groups:")
-        for i, group in enumerate(optimizer.param_groups):
-            print(
-                f"Group {i} ({group.get('name', 'unnamed')}): "
-                f"lr={group['lr']} params={len(group['params'])}"
-            )
-
         return optimizer
 
 
@@ -626,9 +662,7 @@ class PostProcessing3DGS:
         total_steps = prior_steps + self.cfg.steps
 
         if self.cfg.scheduler == "exponential":
-            print(f"Using exponential LR scheduler (total_steps={total_steps}, prior_steps={prior_steps})")
-
-            # [Improvement 2] Per-param-group scheduling:
+            # Per-param-group scheduling:
             # - Means: exponential decay optionally scaled by scene_extent (matching vanilla optimizer)
             # - Other params: constant LR
             lambdas = []

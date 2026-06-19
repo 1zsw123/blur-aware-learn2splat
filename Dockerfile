@@ -54,8 +54,10 @@ COPY --chown=user:user requirements.txt .
 RUN pip install -r requirements.txt
 
 # Prebuilt CUDA-extension wheels — gsplat, nerfacc, pycolmap, fused-ssim,
-# simple-knn, pointops, fused_knn_attn. Built on a matching machine (see
-# DEPLOY.md) so the HF builder never compiles CUDA and never OOMs.
+# simple-knn, pointops, fused_knn_attn, and the inria + fastgs rasterizers
+# (diff_gaussian_rasterization[_fastgs], for the demo's inria/fastgs renderers).
+# Built on a matching machine (see DEPLOY.md) so the HF builder never compiles
+# CUDA and never OOMs. The wildcard install picks up whatever wheels are present.
 COPY --chown=user:user wheels/ ./wheels/
 RUN pip install --no-deps ./wheels/*.whl
 

@@ -23,7 +23,14 @@ from optgs.dataset.data_types import BatchedViews
 from optgs.model.decoder import Decoder
 from optgs.model.decoder.decoder import DecoderOutput
 from optgs.model.types import Gaussians
-from optgs.scene_trainer.adc.base import BaseStrategyCfg
+# Per-strategy configs imported from their leaf submodules (not the adc package) to avoid the
+# adc/__init__ <-> optimizer import cycle that the lazy imports below guard against.
+from optgs.scene_trainer.adc.vanilla import VanillaStrategyCfg
+from optgs.scene_trainer.adc.mcmc import McmcStrategyCfg
+from optgs.scene_trainer.adc.fastgs import FastGSStrategyCfg
+
+# Discriminated by `name`; mirrors adc.StrategyCfg (kept inline here to dodge the package import).
+StrategyCfg = VanillaStrategyCfg | McmcStrategyCfg | FastGSStrategyCfg
 from optgs.scene_trainer.initializer.initializer import InitializerOutput
 from optgs.scene_trainer.initializer import InitializerCfg
 from optgs.misc.detaching_cpu_list import DetachingCPUList
@@ -154,7 +161,7 @@ class OptimizerCfg:
     # lr scheduler
     lr_scheduler: LrSchedulerCfgType
     
-    refiner: BaseStrategyCfg
+    refiner: StrategyCfg
 
     # gradients
     input_gradients_chunk_size: int | None  # if None, use full image

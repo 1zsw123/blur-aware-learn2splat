@@ -477,14 +477,14 @@ def _resolve_config_paths(cli_cfg) -> tuple[Path | None, Path | None]:
     config_path = None
     initializer_config_path = None
 
-    if pretrained_model is not None:
-        if should_load:
+    if pretrained_model is None and pretrained_optimizer is None and pretrained_initializer is None:
+        print(cyan("No pretrained_model, pretrained_optimizer, or pretrained_initializer specified, using cli config only."))
+    elif should_load:
+        if pretrained_model is not None:
             config_path = _find_config_for_checkpoint(pretrained_model)
             print(cyan(f"Loading config from pretrained_model checkpoint {config_path}"
                        if config_path else f"No config found for pretrained_model {pretrained_model}."))
-
-    elif pretrained_optimizer is not None:
-        if should_load:
+        elif pretrained_optimizer is not None:
             config_path = _find_config_for_checkpoint(pretrained_optimizer)
             print(cyan(f"Loading config from pretrained_optimizer checkpoint {config_path}"
                        if config_path else f"No config found for pretrained_optimizer {pretrained_optimizer}."))
@@ -492,15 +492,10 @@ def _resolve_config_paths(cli_cfg) -> tuple[Path | None, Path | None]:
                 initializer_config_path = _find_config_for_checkpoint(pretrained_initializer)
                 print(cyan(f"Loading initializer config from pretrained_initializer checkpoint {initializer_config_path}"
                            if initializer_config_path else f"No config found for pretrained_initializer {pretrained_initializer}."))
-
-    elif pretrained_initializer is not None:
-        if should_load:
+        elif pretrained_initializer is not None:
             initializer_config_path = _find_config_for_checkpoint(pretrained_initializer)
             print(cyan(f"Loading initializer-only config from pretrained_initializer checkpoint {initializer_config_path}"
                        if initializer_config_path else f"No config found for pretrained_initializer {pretrained_initializer}."))
-
-    else:
-        print(cyan("No pretrained_model, pretrained_optimizer, or pretrained_initializer specified, using cli config only."))
 
     # Resume overrides config_path to point at the output directory's saved config.
     if cli_cfg.checkpointing.resume and cli_cfg.checkpointing.load_existing_cfg:

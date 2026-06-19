@@ -317,6 +317,20 @@ class OptGS:
             views.viewpoint_stack = stack[:, bs:]
         return views.batchify_views(idx)
 
+    def configure_adc(self, strategy: str) -> "OptGS":
+        """Set the ADC (densification) strategy for subsequent ``optimize`` runs.
+
+        ``strategy`` is a raw refiner name: ``"none"`` (the default the checkpoints
+        ship with) leaves the Gaussian set fixed; ``"default"``/``"edgs"``/``"mcmc"``/…
+        enable clone/split/prune with the schedule rescaled to ``self.num_refine``
+        (see ``build_refiner_cfg``). Call before ``optimize``/``optimize_iter`` — the
+        ADC state is created in ``on_scene_start`` and gated on the refiner's flags.
+        """
+        from optgs.experimental.api.integration.config_bridge import build_refiner_cfg
+
+        self.optimizer.cfg.refiner = build_refiner_cfg(strategy, self.num_refine)
+        return self
+
     @torch.no_grad()
     def optimize(self, scene: object | None = None, *, optimizer=None):
         """Run the learned optimization.

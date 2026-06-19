@@ -78,7 +78,7 @@ class KnnBasedOptimizerCfg(OptimizerCfg):
     pt_qk_norm: bool
     norm_pt_block: bool
     delta_gaussian_multiple: int  # predict more gaussian residuals based on the previous gaussian center
-    residual_init_state: bool  # add residual connection in the prediction head to the inital state
+    residual_init_state: bool  # add residual connection in the prediction head to the initial state
     clamp_max_scale: float
     clamp_min_scale: float | int
     clamp_min_raw_scales: float | int
@@ -275,7 +275,7 @@ class KnnBasedOptimizerCfg(OptimizerCfg):
         elif isinstance(initializer_cfg,
                         (InitializerPlyCfg, InitializerColmapCfg, InitializerEdgsCfg, InitializerRandomCfg,
                          InitializerPointcloudCfg)):
-            # Since pixels and gaussians are not alligned, we can not use pixel attributes
+            # Since pixels and gaussians are not aligned, we cannot use pixel attributes
             assert not self.input_error, "The error calculation assumes per pixel gaussians"
             assert not self.delta_head_concat_img
             assert not self.input_alpha
@@ -2225,6 +2225,9 @@ class KnnBasedOptimizer(LearnedOptimizer[KnnBasedOptimizerCfg]):
 
             if self.cfg.need_2d_grads:
                 means2d_grads = torch.cat(means2d_grads_chunks, dim=1)  # [B, V, N, 2]
+                # Normalize to NDC per the renderer's convention so the ADC stays renderer-agnostic
+                # (gsplat=pixel→×w/2,h/2; inria/fastgs already NDC).
+                means2d_grads = renderer.means2d_grad_to_ndc(means2d_grads, (h, w))
                 if self.cfg.input_gradient_loss_reduction == "mean_pixels_sum_views":
                     means2d_grads = means2d_grads / v
             else:
@@ -2245,7 +2248,7 @@ class KnnBasedOptimizer(LearnedOptimizer[KnnBasedOptimizerCfg]):
                 grads_sign = grads_sign.detach()
 
         # Returning also the render output, but it can only be used for visualization,
-        # as we already backpropogate gradients through it
+        # as we already backpropagate gradients through it
         return gaussian_grads_raw, gaussian_grads, grads_sign, context_render_output, means2d_grads
 
 

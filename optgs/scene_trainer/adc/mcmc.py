@@ -1,11 +1,14 @@
 import math
 from dataclasses import dataclass
-from typing import Any, Callable, Optional, Tuple
+from typing import Any, Literal, Optional, Tuple
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import Tensor
+
+from gsplat import quat_scale_to_covar_preci
+from gsplat.relocation import compute_relocation
 
 from optgs.model.types import Gaussians
 from optgs.scene_trainer.adc.base import BaseStrategyCfg, GenericStrategyState
@@ -13,55 +16,22 @@ from optgs.scene_trainer.adc.base import _replace_objects, _add_to_objects
 from optgs.scene_trainer.gaussian_module import GaussiansModule
 
 
-def _make_lazy_cuda_func(name: str) -> Callable:
-    def call_cuda(*args, **kwargs):
-        # pylint: disable=import-outside-toplevel
-        from gsplat.cuda._backend import _C
+@dataclass
+class McmcStrategyCfg(BaseStrategyCfg):
+    """MCMC densification (3DGS-MCMC, arXiv:2404.09591). Only ``apply_mcmc_strategy`` /
+    ``inject_noise_to_position`` read these; the narrowed ``name`` discriminates the union arm."""
+    name: Literal["mcmc"]
+    noise_lr: float  # MCMC sampling noise learning rate, 0.0 for no MCMC sampling
 
-        return getattr(_C, name)(*args, **kwargs)
+    # If True, relocated Gaussians inherit the optimizer state of the alive Gaussian they were
+    # sampled from (better initialization). If False, state is zeroed (original paper behaviour).
+    relocate_copy_state: bool = False
 
-    return call_cuda
-
-
-class _QuatScaleToCovarPreci(torch.autograd.Function):
-    """Converts quaternions and scales to covariance and precision matrices."""
-
-    @staticmethod
-    def forward(
-            ctx,
-            quats: Tensor,  # [..., 4],
-            scales: Tensor,  # [..., 3],
-            compute_covar: bool = True,
-            compute_preci: bool = True,
-            triu: bool = False,
-    ) -> Tuple[Optional[Tensor], Optional[Tensor]]:
-        covars, precis = _make_lazy_cuda_func("quat_scale_to_covar_preci_fwd")(
-            quats, scales, compute_covar, compute_preci, triu
-        )
-        ctx.save_for_backward(quats, scales)
-        ctx.compute_covar = compute_covar
-        ctx.compute_preci = compute_preci
-        ctx.triu = triu
-        return covars, precis
-
-    @staticmethod
-    def backward(ctx, v_covars: Tensor, v_precis: Tensor):
-        quats, scales = ctx.saved_tensors
-        compute_covar = ctx.compute_covar
-        compute_preci = ctx.compute_preci
-        triu = ctx.triu
-        if compute_covar and v_covars.is_sparse:
-            v_covars = v_covars.to_dense()
-        if compute_preci and v_precis.is_sparse:
-            v_precis = v_precis.to_dense()
-        v_quats, v_scales = _make_lazy_cuda_func("quat_scale_to_covar_preci_bwd")(
-            quats,
-            scales,
-            triu,
-            v_covars.contiguous() if compute_covar else None,
-            v_precis.contiguous() if compute_preci else None,
-        )
-        return v_quats, v_scales, None, None, None
+    # Cap on the scales used for the noise covariance (does NOT affect rendered scales). Needed
+    # because knn_based saturates clamp_max_scale, producing covariances orders of magnitude larger
+    # than vanilla's Adam-evolved scales; the resulting noise overflows the renderer's tile-binning
+    # math and causes silent CUDA OOB. Rule of thumb: ~scene_scale / 5.
+    noise_scale_cap: float = 1.0
 
 
 @dataclass
@@ -149,7 +119,7 @@ def inject_noise_to_position(
         assert scales.shape == batch_dims + (3,), scales.shape
         quats = quats.contiguous()
         scales = scales.contiguous()
-        covars, precis = _QuatScaleToCovarPreci.apply(
+        covars, precis = quat_scale_to_covar_preci(
             quats, scales, compute_covar, compute_preci, triu
         )
         return covars if compute_covar else None, precis if compute_preci else None
@@ -246,19 +216,7 @@ def _compute_relocation(
         **new_scales**: The scales of the Gaussians. [N, 3]
     """
 
-    N = opacities.shape[0]
-    n_max, _ = binoms.shape
-    assert scales.shape == (N, 3), scales.shape
-    assert ratios.shape == (N,), ratios.shape
-    opacities = opacities.contiguous()
-    scales = scales.contiguous()
-    ratios.clamp_(min=1, max=n_max - 1)
-    ratios = ratios.int().contiguous()
-
-    new_opacities, new_scales = _make_lazy_cuda_func("relocation")(
-        opacities, scales, ratios, binoms, n_max
-    )
-    return new_opacities, new_scales
+    return compute_relocation(opacities, scales, ratios, binoms)
 
 
 def relocate(
@@ -439,7 +397,7 @@ def add_new(
 
 @torch.no_grad()
 def apply_mcmc_strategy(
-        cfg: BaseStrategyCfg,
+        cfg: McmcStrategyCfg,
         step: int,
         gaussians: Gaussians | GaussiansModule,
         adc_state: McmcStrategyState,

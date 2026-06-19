@@ -29,6 +29,9 @@ class DecoderOutput:
     accumulated_alpha: Float[Tensor, "batch view height width"] | None = None
     radii: Int32[Tensor, "batch view n 2"] | None = None
     means2d: Float[Tensor, "batch view n 2"] | None = None
+    # FastGS Abs-GS split signal: gradient of the *absolute* screen-space mean (cols [2:] of the
+    # FastGS [N,4] screen tensor). Only the FastGS decoder populates it; reachable via autograd.
+    means2d_abs: Float[Tensor, "batch view n 2"] | None = None
     visibility_filter: Bool[Tensor, "batch view n"] | None = None
 
 
@@ -43,6 +46,23 @@ class Decoder(nn.Module, ABC, Generic[T]):
         super().__init__()
         self.cfg = cfg
         self.dataset_cfg = dataset_cfg
+
+    def means2d_grad_to_ndc(
+        self,
+        grad: Float[Tensor, "*batch n 2"],
+        image_shape: tuple[int, int],
+    ) -> Float[Tensor, "*batch n 2"]:
+        """Normalize an autograd.grad(loss, decoder_output.means2d) result to the resolution-
+        independent NDC ([-1, 1]) screen convention.
+
+        This makes the ADC / densification strategy renderer-agnostic: every backend hands it a
+        uniform NDC gradient, so a single threshold (the 3DGS / FastGS
+        ``densify_grad_threshold = 0.0002``) is correct for all of them, and the strategy itself no
+        longer needs to know each renderer's pixel scale.
+
+        The 3DGS-family backends (inria/fastgs) already emit NDC gradients, so the default is
+        identity. Only the gsplat backend (pixel-space, gradient ∝ image size) overrides this."""
+        return grad
 
     @abstractmethod
     def forward(

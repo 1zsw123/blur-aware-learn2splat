@@ -243,7 +243,7 @@ def build_decoder(
     from omegaconf import OmegaConf
 
     from optgs.config import load_typed_config
-    from optgs.model.decoder import DecoderCfg, get_decoder
+    from optgs.model.decoder import DECODER_CFGS, get_decoder
 
     cfg = _load_ckpt_cfg_cached(str(cfg_path))
     node = OmegaConf.select(cfg, "scene_trainer.decoder")
@@ -252,10 +252,21 @@ def build_decoder(
             f"checkpoint config at {cfg_path} has no scene_trainer.decoder; "
             f"cannot rebuild the renderer the optimizer trained with."
         )
+    # Resolve the discriminated union by `name` (dacite can't parse the union
+    # itself). A missing name means its optional backend isn't installed.
+    name = OmegaConf.select(node, "name")
+    cfg_cls = DECODER_CFGS.get(name)
+    if cfg_cls is None:
+        raise OptGSError(
+            f"decoder backend {name!r} (from {cfg_path}) is not available in "
+            f"this environment. Install its backend (e.g. "
+            f"diff_gaussian_rasterization for 'inria') or use a checkpoint "
+            f"trained with the 'gsplat' decoder."
+        )
     # gsplat decoder rasterize_mode / eps2d, by precedence:
     #   caller override  >  checkpoint config  >  gsplat rasterization() default
     # (so an older checkpoint that omits a field behaves as plain gsplat would).
-    if OmegaConf.select(node, "name") == "gsplat":
+    if name == "gsplat":
         import inspect
 
         from gsplat.rendering import rasterization
@@ -269,21 +280,13 @@ def build_decoder(
             OmegaConf.create(dict(decoder_overrides or {})),
         )
     try:
-        decoder_cfg = load_typed_config(node, DecoderCfg)
+        decoder_cfg = load_typed_config(node, cfg_cls)
     except Exception as e:
         raise OptGSError(
             f"failed to parse scene_trainer.decoder from {cfg_path} "
             f"({type(e).__name__}: {e})."
         ) from e
-    try:
-        return get_decoder(decoder_cfg, dataset_cfg)
-    except (KeyError, ImportError) as e:
-        raise OptGSError(
-            f"decoder backend {decoder_cfg.name!r} is not available in this "
-            f"environment ({type(e).__name__}: {e}). Install its backend "
-            f"(e.g. diff_gaussian_rasterization for 'inria') or use a "
-            f"checkpoint trained with the 'gsplat' decoder."
-        ) from e
+    return get_decoder(decoder_cfg, dataset_cfg)
 
 
 def build_optimizer(opt_cfg: "KnnBasedOptimizerCfg") -> "nn.Module":
@@ -308,15 +311,71 @@ def build_optimizer(opt_cfg: "KnnBasedOptimizerCfg") -> "nn.Module":
     return optimizer
 
 
-def build_adam_baseline(num_refine: int) -> "nn.Module":
+def build_refiner_cfg(strategy: str, num_refine: int) -> "BaseStrategyCfg":
+    """Load the bundled ``refiner/{strategy}.yaml`` and, when it densifies, rescale
+    its schedule so ADC actually fires within ``num_refine`` steps.
+
+    ``strategy`` is a raw refiner name ("none"/"default"/"edgs"/"mcmc"/… — a sibling
+    .yaml under ``config/scene_trainer/scene_optimizer/refiner/``). The bundled
+    configs use the stock 3DGS schedule (densify from iter 500), which never
+    triggers in the demo's ~100-step runs, so for any densifying strategy we set
+    start ≈ 10%·N, interval ≈ 20%·N, stop = N, and bound ``cap_max`` for VRAM safety.
+    ``reset_every`` is left at its (large) bundled value so opacity reset does not
+    thrash a short run. Returns a ``BaseStrategyCfg``.
+    """
+    from dataclasses import replace
+
+    import optgs
+    from omegaconf import OmegaConf
+
+    from optgs.config import load_typed_config
+    from optgs.scene_trainer.adc.fastgs import FastGSStrategyCfg
+    from optgs.scene_trainer.adc.mcmc import McmcStrategyCfg
+    from optgs.scene_trainer.adc.vanilla import VanillaStrategyCfg
+
+    cfg_dir = Path(optgs.__file__).resolve().parent / "config"
+    yaml_path = (
+        cfg_dir / "scene_trainer" / "scene_optimizer" / "refiner" / f"{strategy}.yaml"
+    )
+    if not yaml_path.exists():
+        avail = sorted(p.stem for p in yaml_path.parent.glob("*.yaml"))
+        raise OptGSError(
+            f"unknown ADC strategy {strategy!r}: no refiner config at {yaml_path} "
+            f"(available: {', '.join(avail)})."
+        )
+    # Build the matching StrategyCfg arm (by name) so the strategy-specific fields are present;
+    # a bare BaseStrategyCfg would lack noise_lr (mcmc) / grad_abs_thresh (fastgs).
+    arm = {"mcmc": McmcStrategyCfg, "fastgs": FastGSStrategyCfg}.get(strategy, VanillaStrategyCfg)
+    cfg = load_typed_config(OmegaConf.load(yaml_path), arm)
+
+    # Non-densifying strategies (e.g. "none") leave the Gaussian set fixed — no rescale.
+    if not (cfg.do_densify or cfg.do_prune or cfg.do_opacity_reset):
+        return cfg
+
+    n = max(1, int(num_refine))
+    cap = cfg.cap_max if (cfg.cap_max and cfg.cap_max > 0) else 1_500_000
+    return replace(
+        cfg,
+        refine_start_iter=max(1, round(0.1 * n)),
+        refine_every=max(1, round(0.2 * n)),
+        refine_stop_iter=n,
+        cap_max=cap,
+    )
+
+
+def build_adam_baseline(num_refine: int, adc: str = "none") -> "nn.Module":
     """Build the codebase's 3DGS Adam optimizer for a fair baseline comparison.
 
     Uses the bundled ``scene_optimizer=3dgs`` config — gsplat's example
-    hyperparameters (LRs, betas). Densification is disabled so the baseline
-    refines the same fixed Gaussian set as the learned optimizer (a
-    like-for-like update-rule comparison), and the means-LR decay horizon is set
-    to ``num_refine``. Returns a ready-to-run ``AdamOptimizer``.
+    hyperparameters (LRs, betas) — with the means-LR decay horizon set to
+    ``num_refine``. ``adc`` selects the densification strategy: the default
+    ``"none"`` disables ADC so the baseline refines the same fixed Gaussian set as
+    the learned optimizer (a like-for-like update-rule comparison); any other raw
+    refiner name swaps in that strategy's schedule (scaled to ``num_refine`` via
+    ``build_refiner_cfg``). Returns a ready-to-run ``AdamOptimizer``.
     """
+    from dataclasses import asdict
+
     from omegaconf import OmegaConf
 
     from optgs.config import load_typed_config
@@ -335,11 +394,15 @@ def build_adam_baseline(num_refine: int) -> "nn.Module":
     OmegaConf.set_struct(composed, False)
     # gsplat decays the means LR over the full step budget.
     composed.lr_scheduler.max_steps = int(num_refine)
-    # Disable densification — the baseline refines the same fixed Gaussian set
-    # as the learned optimizer (a like-for-like comparison of the update rule).
-    for flag in ("do_densify", "do_prune", "do_opacity_reset"):
-        if flag in composed.refiner:
-            composed.refiner[flag] = False
+    if adc == "none":
+        # Disable densification — the baseline refines the same fixed Gaussian set
+        # as the learned optimizer (a like-for-like comparison of the update rule).
+        for flag in ("do_densify", "do_prune", "do_opacity_reset"):
+            if flag in composed.refiner:
+                composed.refiner[flag] = False
+    else:
+        # Swap in the chosen ADC strategy (schedule scaled to num_refine).
+        composed.refiner = asdict(build_refiner_cfg(adc, num_refine))
     try:
         adam_cfg = load_typed_config(composed, AdamOptimizerCfg)
     except Exception as e:

@@ -139,12 +139,26 @@ class Config:
     # (farthest-point sampling over camera positions).
     opt_batch_strategy: Literal["random", "sequential", "fps"] = "fps"
 
-    # --- gsplat renderer ---
-    # rasterize_mode / eps2d: when set, applied to every run (dense, sparse,
-    # Adam), overriding each checkpoint's decoder config so the comparison uses
-    # one renderer. Left unset, each run uses its own checkpoint's value.
+    # --- Renderer ---
+    # Rasterizer backend for rendering and (with the learned / Adam optimizers)
+    # the optimization itself: "gsplat" (default, the trained renderer), "inria",
+    # or "fastgs". inria / fastgs need their CUDA backend installed. Applies to the
+    # headless comparison and seeds the GUI's Renderer dropdown.
+    renderer: Literal["gsplat", "inria", "fastgs"] = "gsplat"
+    # rasterize_mode / eps2d apply to the gsplat renderer ONLY — inria / fastgs
+    # ignore them. When set (with --renderer gsplat), applied to every run (dense,
+    # sparse, Adam), overriding each checkpoint's decoder config. Left unset, each
+    # run uses its own checkpoint's value.
     rasterize_mode: Optional[Literal["classic", "antialiased"]] = None
     eps2d: Optional[float] = None
+
+    # --- ADC (densification) ---
+    # Adaptive Density Control strategy applied during optimization: "off" (default
+    # — fixed Gaussian set, the like-for-like comparison), "vanilla" (3DGS clone/
+    # split/prune), "edgs", "mcmc". The densification schedule is auto-scaled to
+    # max_steps, so a short demo run densifies (the stock 500-step warm-up never
+    # would). Auto-extends to "fastgs" once it's registered in the ADC dispatcher.
+    adc: str = "off"
 
     # --- Initialization ---
     # Initialization strategy: "sfm" or "random".
@@ -603,6 +617,40 @@ def run_gui(
         console.print("\n[yellow]GUI stopped.[/]")
 
 
+def adc_strategies() -> tuple[list[str], dict[str, str]]:
+    """(labels, label -> raw refiner name) for the ADC dropdown / CLI.
+
+    Derived from the refiner registry (``BaseStrategyCfg.name``) so a newly
+    registered strategy (e.g. ``fastgs``) appears automatically. ``off`` is first;
+    friendly labels rename ``none``->``off`` and ``default``->``vanilla``.
+    """
+    from typing import get_args
+
+    from optgs.scene_trainer.adc.base import BaseStrategyCfg
+
+    friendly = {"none": "off", "default": "vanilla"}
+    raw = list(get_args(BaseStrategyCfg.__annotations__["name"]))
+    labels = ["off"] + [friendly.get(n, n) for n in raw if n != "none"]
+    to_name = {"off": "none", **{friendly.get(n, n): n for n in raw if n != "none"}}
+    return labels, to_name
+
+
+def build_renderer_decoder(renderer: str, device) -> object:
+    """Build a fresh decoder for an inria / fastgs ``renderer``, independent of any
+    checkpoint, to override an OptGS instance's decoder. gsplat is handled by the
+    caller (it keeps the checkpoint's own decoder, which carries its rasterize_mode
+    / eps2d). Assumes ``renderer`` is installed — main() validates that up front."""
+    from types import SimpleNamespace
+
+    from optgs.model.decoder import DECODER_CFGS, get_decoder
+
+    Cfg = DECODER_CFGS[renderer]
+    return get_decoder(
+        Cfg(name=renderer, scale_invariant=False),
+        SimpleNamespace(background_color=[0.0, 0.0, 0.0]),
+    ).to(device)
+
+
 def run_gradio_gui(
     instances: dict,
     gaussians: Gaussians,
@@ -642,17 +690,38 @@ def run_gradio_gui(
     h_full, w_full = train_bv["image"].shape[3], train_bv["image"].shape[4]
     init_gaussians = gaussians.clone()  # pristine copy; each Start re-inits from it
 
-    # Shared state (single-GPU, single-session demo, like run_gui's globals): the
-    # Gaussians currently shown, the OptGS rendering them, and a counter for
-    # unique PLY filenames (so Model3D reloads instead of serving a stale cache).
-    holder = {"current": init_gaussians, "active": instances["dense"], "ply": 0}
+    # A counter for unique PLY filenames (so the Model3D reloads each result
+    # rather than serving a stale cache). Single-GPU, single-session demo.
+    holder = {"ply": 0}
 
     ply_dir = os.path.join(cfg.result_dir, "gradio")
     os.makedirs(ply_dir, exist_ok=True)
 
+    # Decoder renderers the user can pick. gsplat is the checkpoint-trained
+    # default; inria / fastgs are optional backends, offered only when their CUDA
+    # extension is installed (DECODER_CFGS holds exactly the importable ones). The
+    # chosen renderer drives both the in-loop optimization and the displayed renders.
+    from optgs.model.decoder import DECODER_CFGS
+    RENDERERS = list(DECODER_CFGS)  # gsplat first, then any installed inria / fastgs
+    orig_decoder = {k: v.decoder for k, v in instances.items()}  # checkpoint-matched gsplat
+    alt_decoder: Dict[str, object] = {}  # name -> built inria/fastgs decoder (lazy)
+
+    # ADC (densification) strategies for the dropdown; "off" first, auto-extends to
+    # "fastgs" once registered. adc_to_name maps the label back to a raw refiner name.
+    ADC_STRATEGIES, adc_to_name = adc_strategies()
+
+    def decoder_for(renderer: str):
+        """Decoder for a renderer name. gsplat reuses the checkpoint's decoder;
+        inria / fastgs are built once on first use."""
+        if renderer == "gsplat":
+            return orig_decoder["dense"]
+        if renderer not in alt_decoder:
+            alt_decoder[renderer] = build_renderer_decoder(renderer, device)
+        return alt_decoder[renderer]
+
     @torch.no_grad()
-    def render_decoder(inst, g: Gaussians, view_idx: float, height: float) -> np.ndarray:
-        """Decoder-render Gaussians ``g`` from training view ``view_idx``.
+    def render(g: Gaussians, view_idx: float, height: float, renderer: str) -> np.ndarray:
+        """Render Gaussians ``g`` from training view ``view_idx`` with ``renderer``.
 
         Normalized intrinsics make the render resolution-independent; the width
         is derived from ``height`` at the training views' aspect ratio.
@@ -660,7 +729,7 @@ def run_gradio_gui(
         h = int(height)
         w = max(1, round(h * w_full / h_full))
         sl = slice(int(view_idx), int(view_idx) + 1)
-        out = inst.decoder.forward(
+        out = decoder_for(renderer).forward(
             g,
             train_bv["extrinsics"][:, sl],
             train_bv["intrinsics"][:, sl],
@@ -700,46 +769,116 @@ def run_gradio_gui(
         save_gaussian_ply(reorient_for_viewer(g), save_path=Path(path))
         return path
 
-    def start(optimizer_label, max_steps, batch_size, strategy, view_idx, height):
-        """Generator: run the picked optimizer, streaming a decoder render each
-        step, then load the finished splats into the Model3D viewer."""
+    g0 = int(init_gaussians.means.shape[1])  # initial Gaussian count, for the stats delta
+
+    def msg(text: str, err: bool = False) -> str:
+        """One-line status message for the panel (idle / starting / error)."""
+        return f"<div class='l2s-msg{' err' if err else ''}'>{text}</div>"
+
+    def fmt_status(phase: str, step: int, n_steps: int, g_now: int, t0: float) -> str:
+        """Live optimization stats as an HTML metric-card panel. ``phase``: 'run' | 'done'.
+
+        Cards: elapsed time, per-step time (+ step/s when done), Gaussian count (with
+        the delta from initialization — densification grows it), and peak VRAM.
+        """
+        el = time.perf_counter() - t0
+        done = max(1, step)
+        msps = el / done * 1000.0
+        peak = torch.cuda.max_memory_allocated() / 1e9 if torch.cuda.is_available() else 0.0
+        dg = g_now - g0
+        if phase == "done":
+            head = f"done · {n_steps} steps"
+            t_lbl = "total"
+            spd_lbl = f"ms/step · {done / el:.1f}/s" if el > 0 else "ms / step"
+        else:
+            head = f"optimizing · step {step} / {n_steps}"
+            t_lbl = "elapsed"
+            spd_lbl = "ms / step"
+        g_lbl = f"gaussians · +{dg:,}" if dg > 0 else "gaussians"
+
+        def card(value: str, label: str) -> str:
+            return f"<div class='l2s-stat'><b>{value}</b><span>{label}</span></div>"
+
+        cards = (
+            card(f"{el:.1f}s", t_lbl)
+            + card(f"{msps:.0f}", spd_lbl)
+            + card(f"{g_now:,}", g_lbl)
+            + card(f"{peak:.1f} GB", "peak vram")
+        )
+        return f"<div class='l2s-head'>{head}</div><div class='l2s-stats'>{cards}</div>"
+
+    def start(optimizer_label, max_steps, batch_size, strategy, view_idx, height, renderer, adc):
+        """Generator: run the picked optimizer with the chosen renderer, streaming
+        a render each step, then load the finished splats into the Model3D viewer.
+
+        Outputs (per yield): image, status, Model3D, Start button, Reset button,
+        placeholder. Start and Reset are mutually exclusive — Start shows while
+        idle/running, then hides and hands off to Reset when the run finishes.
+        """
         name, use_adam = OPTIONS[optimizer_label]
         inst = instances[name]
-        holder["active"] = inst
-        # Re-init from the pristine copy so repeated Starts share one start point.
-        inst.initialize_from_tensors(init_gaussians.clone(), train_bv)
-        inst.num_refine = int(max_steps)
-        inst.opt_batch_size = min(int(batch_size), n_train_views)
-        inst.opt_batch_strategy = strategy
-        opt = build_adam_baseline(inst.num_refine).to(device) if use_adam else None
-
+        opt = None
         try:
-            # Disable Start, hide the viewer, keep the placeholder while running.
-            yield (
-                render_decoder(inst, init_gaussians, view_idx, height),
-                f"**optimizing** — step 0/{inst.num_refine} — "
-                f"{init_gaussians.means.shape[1]} Gaussians",
-                gr.update(visible=False, value=None),  # hide the viewer
-                gr.update(interactive=False),          # disable Start
-                gr.update(visible=True),               # keep the placeholder
+            # gsplat: the instance's own checkpoint-matched decoder; else swap in
+            # the chosen backend (may raise if its CUDA extension is missing).
+            inst.decoder = (
+                orig_decoder[name] if renderer == "gsplat" else decoder_for(renderer)
+            )
+            # Re-init from the pristine copy so repeated Starts share one start point.
+            inst.initialize_from_tensors(init_gaussians.clone(), train_bv)
+            inst.num_refine = int(max_steps)
+            inst.opt_batch_size = min(int(batch_size), n_train_views)
+            inst.opt_batch_strategy = strategy
+            adc_name = adc_to_name[adc]  # label -> raw refiner name
+            # Densification strategy. Learned path: set it on the instance's
+            # optimizer. Adam path: the AdamOptimizer below carries it (and overrides
+            # the instance for the run). "off" -> fixed Gaussian set.
+            inst.configure_adc(adc_name)
+            opt = (
+                build_adam_baseline(inst.num_refine, adc=adc_name).to(device)
+                if use_adam else None
             )
 
+            # Running: Start disabled, viewer + Reset hidden, placeholder shown.
+            yield (
+                render(init_gaussians, view_idx, height, renderer),
+                f"<div class='l2s-head'>optimizing · step 0 / {inst.num_refine}</div>"
+                + msg(f"{g0:,} Gaussians · starting…"),
+                gr.update(visible=False, value=None),  # Model3D hidden
+                gr.update(interactive=False),          # Start disabled
+                gr.update(visible=False),              # Reset hidden
+                gr.update(visible=True),               # placeholder shown
+            )
+
+            # Time the optimization loop (excludes setup); isolate this run's peak VRAM.
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
+            t0 = time.perf_counter()
             g = init_gaussians
             for step, g in inst.optimize_iter(optimizer=opt):
-                holder["current"] = g
                 yield (
-                    render_decoder(inst, g, view_idx, height),
-                    f"**optimizing** — step {step + 1}/{inst.num_refine} — "
-                    f"{g.means.shape[1]} Gaussians",
-                    gr.update(), gr.update(), gr.update(),  # no change mid-run
+                    render(g, view_idx, height, renderer),
+                    fmt_status("run", step + 1, inst.num_refine, g.means.shape[1], t0),
+                    gr.update(), gr.update(), gr.update(), gr.update(),  # no change
                 )
 
+            # Done: reveal the viewer + Reset, hide Start + placeholder.
             yield (
-                render_decoder(inst, g, view_idx, height),
-                f"**done** — {inst.num_refine} steps — {g.means.shape[1]} Gaussians",
-                gr.update(visible=True, value=export_ply(g)),  # reveal the viewer
-                gr.update(interactive=True),                   # re-enable Start
-                gr.update(visible=False),                      # hide the placeholder
+                render(g, view_idx, height, renderer),
+                fmt_status("done", inst.num_refine, inst.num_refine, g.means.shape[1], t0),
+                gr.update(visible=True, value=export_ply(g)),  # Model3D shown
+                gr.update(visible=False),                       # Start hidden
+                gr.update(visible=True, interactive=True),      # Reset shown
+                gr.update(visible=False),                       # placeholder hidden
+            )
+        except Exception as e:  # e.g. the inria/fastgs backend isn't installed
+            yield (
+                gr.update(),  # leave the last image
+                msg(f"error — {type(e).__name__}: {str(e)[:200]}", err=True),
+                gr.update(visible=False, value=None),
+                gr.update(visible=True, interactive=True),  # Start back
+                gr.update(visible=False),                   # Reset hidden
+                gr.update(visible=True),                    # placeholder shown
             )
         finally:
             # Free the run's CUDA work (also runs if the user hits Stop mid-run),
@@ -748,27 +887,25 @@ def run_gradio_gui(
             gc.collect()
             torch.cuda.empty_cache()
 
-    def reset(view_idx, height):
-        """Restore the initialization: re-render it, hide the viewer.
+    def reset(view_idx, height, renderer):
+        """Restore the initialization: re-render it, hide the viewer, show Start.
 
-        No CUDA cleanup here — ``start``'s ``finally`` already frees each run's
-        work; reset only re-renders the init.
+        No CUDA cleanup here — ``start``'s ``finally`` already frees each run's work.
         """
-        holder["current"] = init_gaussians
-        holder["active"] = instances["dense"]
         return (
-            render_decoder(instances["dense"], init_gaussians, view_idx, height),
-            "**Initialized.** Pick a method, then Start.",
-            gr.update(visible=False, value=None),  # hide the viewer
-            gr.update(interactive=True),           # enable Start
-            gr.update(visible=True),               # show the placeholder
+            render(init_gaussians, view_idx, height, renderer),
+            msg("Initialized — pick a method, then <b>Start</b>."),
+            gr.update(visible=False, value=None),       # Model3D hidden
+            gr.update(visible=True, interactive=True),  # Start shown
+            gr.update(visible=False),                   # Reset hidden
+            gr.update(visible=True),                    # placeholder shown
         )
 
-    def rerender(view_idx, height):
-        """Re-render the current Gaussians (preview view / height changed)."""
-        return render_decoder(holder["active"], holder["current"], view_idx, height)
+    def rerender(view_idx, height, renderer):
+        """Preview always shows the initialization, from the chosen view + renderer."""
+        return render(init_gaussians, view_idx, height, renderer)
 
-    initial_img = render_decoder(instances["dense"], init_gaussians, 0, 540)
+    initial_img = render(init_gaussians, 0, 540, "gsplat")
 
     # Open the interactive viewer on the same vantage as the live render's
     # default preview (view 0). The viewer shows splats in the reoriented frame
@@ -854,9 +991,18 @@ def run_gradio_gui(
     #l2s-start button, #l2s-reset button { font-family:'JetBrains Mono',monospace;
         letter-spacing:.03em; font-weight:500; }
     #l2s-status { background:#f7f8fc; border:1px solid #e2e5ef; border-left:3px solid #b04080;
-        border-radius:9px; padding:4px 14px; }
-    #l2s-status p { color:#5a6080; font-size:14px; margin:8px 0; }
-    #l2s-status strong { color:#1a1d2e; }
+        border-radius:9px; padding:11px 14px; }
+    #l2s-status .l2s-head { font-family:'JetBrains Mono',monospace; font-size:11px;
+        letter-spacing:.12em; text-transform:uppercase; color:#b04080; font-weight:500; margin:2px 1px 11px; }
+    #l2s-status .l2s-stats { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+    #l2s-status .l2s-stat { background:#fff; border:1px solid #e6e8f1; border-radius:8px; padding:8px 11px; }
+    #l2s-status .l2s-stat b { display:block; font-family:'Source Serif 4',Georgia,serif;
+        font-size:19px; font-weight:600; color:#1a1d2e; line-height:1.15; }
+    #l2s-status .l2s-stat span { display:block; font-family:'JetBrains Mono',monospace; font-size:9.5px;
+        letter-spacing:.04em; text-transform:uppercase; color:#8890b0; margin-top:3px; }
+    #l2s-status .l2s-msg { color:#5a6080; font-size:14px; margin:6px 1px; }
+    #l2s-status .l2s-msg.err { color:#c0392b; word-break:break-word; }
+    #l2s-status .l2s-msg b { color:#1a1d2e; }
     .l2s-ph { display:flex; align-items:center; justify-content:center; text-align:center;
         height:420px; border:1px dashed #c8cde0; border-radius:12px; background:#fbfcff;
         color:#8890b0; font-family:'JetBrains Mono',monospace; font-size:12.5px;
@@ -900,6 +1046,12 @@ def run_gradio_gui(
                         ["random", "sequential", "fps"],
                         value=cfg.opt_batch_strategy, label="Batch strategy",
                     )
+                    renderer_dd = gr.Dropdown(
+                        RENDERERS, value=cfg.renderer, label="Renderer",
+                    )
+                    adc_dd = gr.Dropdown(
+                        ADC_STRATEGIES, value=cfg.adc, label="Densification (ADC)",
+                    )
                 with gr.Group():
                     gr.HTML("<div class='l2s-eyebrow'><span>Preview</span></div>")
                     view_slider = gr.Slider(
@@ -914,10 +1066,12 @@ def run_gradio_gui(
                         elem_id="l2s-start", scale=2,
                     )
                     reset_btn = gr.Button(
-                        "Reset", variant="secondary", elem_id="l2s-reset", scale=1
+                        "Reset", variant="secondary", elem_id="l2s-reset",
+                        scale=1, visible=False,  # appears only when a run finishes
                     )
-                status_md = gr.Markdown(
-                    "**Initialized.** Pick a method, then Start.", elem_id="l2s-status"
+                status_md = gr.HTML(
+                    msg("Initialized — pick a method, then <b>Start</b>."),
+                    elem_id="l2s-status",
                 )
             # Column 2 — live decoder render (streamed during optimization).
             with gr.Column(scale=5, min_width=380):
@@ -939,9 +1093,12 @@ def run_gradio_gui(
 
         start_inputs = [
             optimizer_dd, max_steps_input, batch_size_input, strategy_dd,
-            view_slider, height_slider,
+            view_slider, height_slider, renderer_dd, adc_dd,
         ]
-        gui_outputs = [image_out, status_md, model3d_out, start_btn, placeholder]
+        preview_inputs = [view_slider, height_slider, renderer_dd]
+        gui_outputs = [
+            image_out, status_md, model3d_out, start_btn, reset_btn, placeholder
+        ]
         # One shared GPU lane (concurrency_id) so Start / Reset / preview re-renders
         # never run on the GPU at the same time — overlapping runs were the path to
         # runaway VRAM growth.
@@ -949,16 +1106,13 @@ def run_gradio_gui(
             start, inputs=start_inputs, outputs=gui_outputs, concurrency_id="gpu"
         )
         reset_btn.click(
-            reset, inputs=[view_slider, height_slider], outputs=gui_outputs,
-            concurrency_id="gpu",
+            reset, inputs=preview_inputs, outputs=gui_outputs, concurrency_id="gpu"
         )
-        # Slider release (not change) — re-render once when the user lets go.
-        view_slider.release(
-            rerender, [view_slider, height_slider], image_out, concurrency_id="gpu"
-        )
-        height_slider.release(
-            rerender, [view_slider, height_slider], image_out, concurrency_id="gpu"
-        )
+        # Preview re-renders the initialization on slider release (not change, to
+        # render once when the user lets go) or when the renderer changes.
+        view_slider.release(rerender, preview_inputs, image_out, concurrency_id="gpu")
+        height_slider.release(rerender, preview_inputs, image_out, concurrency_id="gpu")
+        renderer_dd.change(rerender, preview_inputs, image_out, concurrency_id="gpu")
 
     console.print(
         f"[green]✓[/] gradio GUI on port [cyan]{cfg.gui_port}[/]"
@@ -976,6 +1130,27 @@ def main(cfg: Config) -> None:
 
     from optgs.experimental.api import OptGS, OptGSError
     from optgs.experimental.api.integration.config_bridge import build_adam_baseline
+    from optgs.model.decoder import DECODER_CFGS
+
+    if cfg.renderer not in DECODER_CFGS:
+        console.print(
+            f"[bold red]renderer {cfg.renderer!r} is not available[/] — its CUDA "
+            f"backend isn't installed. Installed: {', '.join(DECODER_CFGS)}."
+        )
+        raise SystemExit(1)
+    if cfg.renderer != "gsplat" and (cfg.rasterize_mode is not None or cfg.eps2d is not None):
+        console.print(
+            f"[yellow]Note:[/] --rasterize-mode / --eps2d apply to the gsplat "
+            f"renderer only; ignored for {cfg.renderer!r}."
+        )
+    adc_labels, adc_to_name = adc_strategies()
+    if cfg.adc not in adc_labels:
+        console.print(
+            f"[bold red]ADC strategy {cfg.adc!r} is not available[/] — "
+            f"choose one of: {', '.join(adc_labels)}."
+        )
+        raise SystemExit(1)
+    adc_name = adc_to_name[cfg.adc]  # raw refiner name for the API
 
     os.makedirs(cfg.result_dir, exist_ok=True)
     device = torch.device(cfg.device)
@@ -1077,6 +1252,11 @@ def main(cfg: Config) -> None:
         except OptGSError as e:
             console.print(f"[bold red]OptGS error ({name}):[/] {e}")
             raise SystemExit(1)
+        # Swap in the chosen renderer (gsplat keeps the checkpoint's own decoder,
+        # which already carries its rasterize_mode / eps2d).
+        if cfg.renderer != "gsplat":
+            optgs.decoder = build_renderer_decoder(cfg.renderer, device)
+        optgs.configure_adc(adc_name)  # densification strategy (off = fixed set)
         # Seed *after* construction so dense and sparse get an identical SfM init.
         torch.manual_seed(cfg.seed)
         np.random.seed(cfg.seed)
@@ -1089,10 +1269,10 @@ def main(cfg: Config) -> None:
         torch.cuda.synchronize()
         finish(optgs, refined, name, time.time() - tic)
 
-    # --- Fair Adam baseline: same SfM init / views / step budget / gsplat
-    # renderer, run through the same optimize() path on the last OptGS
-    # instance — only the update rule differs. ---
-    adam = build_adam_baseline(optgs.num_refine).to(device)
+    # --- Fair Adam baseline: same SfM init / views / step budget / renderer,
+    # run through the same optimize() path on the last OptGS instance — only the
+    # update rule differs. ---
+    adam = build_adam_baseline(optgs.num_refine, adc=adc_name).to(device)
     torch.cuda.synchronize()  # drain setup GPU work so it isn't timed
     tic = time.time()
     refined_adam = optgs.optimize(optimizer=adam)
@@ -1108,7 +1288,7 @@ def main(cfg: Config) -> None:
         ),
         title_style="bold",
         caption=(
-            f"gsplat renderer  ·  "
+            f"{cfg.renderer} renderer  ·  adc={cfg.adc}  ·  "
             f"rasterize_mode={cfg.rasterize_mode or 'per-checkpoint'}  ·  "
             f"eps2d={cfg.eps2d if cfg.eps2d is not None else 'per-checkpoint'}"
         ),
