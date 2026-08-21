@@ -5,7 +5,10 @@ fork ``diff_gaussian_rasterization_fastgs``. The fork's API differs from stock
 Inria: the SH DC term is passed separately from the rest (``dc`` vs ``shs``),
 the rasterization settings carry ``mult`` / ``get_flag`` / ``metric_map``, the
 screen-space means tensor is ``[N, 4]``, and ``forward`` returns a third value
-(``accum_metric_counts``) that we drop.
+(``accum_metric_counts``) that we drop. When the official LeGS extension is
+installed, the same call additionally returns per-Gaussian leave-one-out image
+error and alpha-compositing weight. The wrapper consumes that exact interface
+for LeGS state/reward construction.
 
 Kept as a separate module (with its own guarded import + a local copy of
 ``get_projection_matrix``) so importing the FastGS backend does NOT require the
@@ -115,16 +118,40 @@ def _fastgs_view_setup(
     )
 
 
-def _fastgs_settings(views: _FastGSViews, i, background_color, mult, image_shape, get_flag, metric_map):
-    """Per-view GaussianRasterizationSettings; only get_flag/metric_map differ across the two paths."""
+def _fastgs_settings(
+    views: _FastGSViews,
+    i,
+    background_color,
+    mult,
+    image_shape,
+    get_flag,
+    metric_map,
+    gt_image=None,
+):
+    """Build one official FastGS/LeGS rasterization setting.
+
+    ``gt_image`` is consumed only when ``get_flag`` is true. Supplying a zero
+    tensor on normal renders keeps the exact LeGS extension a strict superset
+    of the original FastGS forward path.
+    """
     h, w = image_shape
+    if gt_image is None:
+        gt_image = torch.zeros(
+            (3, h, w),
+            dtype=background_color.dtype,
+            device=background_color.device,
+        )
     return GaussianRasterizationSettings(
         image_height=h, image_width=w,
         tanfovx=views.tan_fov_x[i].item(), tanfovy=views.tan_fov_y[i].item(),
         bg=background_color[i], scale_modifier=1.0,
         viewmatrix=views.view_matrix[i], projmatrix=views.full_projection[i],
         sh_degree=views.degree, campos=views.extrinsics[i, :3, 3], mult=mult,
-        prefiltered=False, debug=False, get_flag=get_flag, metric_map=metric_map,
+        prefiltered=False,
+        debug=False,
+        get_flag=get_flag,
+        metric_map=metric_map,
+        gt_image=gt_image,
     )
 
 
@@ -196,15 +223,21 @@ def render_cuda_fastgs(
         abs_half = means2d_abs_out[i] if means2d_abs_out is not None \
             else torch.zeros((n_gauss, 2), dtype=gaussian_means.dtype, device=gaussian_means.device)
         means2D = torch.cat([means2d_out[i], abs_half], dim=1)  # [N, 4]
-        metric_map = torch.zeros(h * w, dtype=torch.int, device=gaussian_means.device)  # required, unused here
+        metric_map = torch.zeros(
+            h * w,
+            dtype=gaussian_means.dtype,
+            device=gaussian_means.device,
+        )  # required by the LeGS ABI, unused on normal renders
 
         rasterizer = GaussianRasterizer(
             _fastgs_settings(views, i, background_color, mult, image_shape, False, metric_map))
         kw = dict(means3D=views.means[i], means2D=means2D, opacities=gaussian_opacities[i, ..., None])
         kw.update(_fastgs_appearance_kwargs(views, i, use_sh, gaussian_rotations))
 
-        # FastGS returns (image, radii, accum_metric_counts); the normal forward drops the counts.
-        image, radii, _ = rasterizer(**kw)
+        # The official LeGS fork returns image, radii, leave-one-out metric,
+        # legacy count, and alpha-compositing weight. Normal rendering drops
+        # all three diagnostic tensors.
+        image, radii, _, _, _ = rasterizer(**kw)
         all_images.append(image)
         all_radii.append(radii)
     return torch.stack(all_images), torch.stack(all_radii)
@@ -221,7 +254,7 @@ def render_metric_counts_fastgs(
     gaussian_covariances: Float[Tensor, "batch gaussian 3 3"] | None,
     gaussian_sh_coefficients: Float[Tensor, "batch gaussian 3 d_sh"],
     gaussian_opacities: Float[Tensor, "batch gaussian"],
-    metric_maps: Int[Tensor, "batch height_width"],
+    metric_maps: Float[Tensor, "batch height_width"],
     scale_invariant: bool = True,
     gaussian_scales: Float[Tensor, "batch gaussian 3"] | None = None,
     gaussian_rotations: Float[Tensor, "batch gaussian 4"] | None = None,
@@ -243,15 +276,114 @@ def render_metric_counts_fastgs(
     all_counts = []
     for i in range(b):
         rasterizer = GaussianRasterizer(_fastgs_settings(
-            views, i, background_color, mult, image_shape, True, metric_maps[i].int().contiguous()))
+            views,
+            i,
+            background_color,
+            mult,
+            image_shape,
+            True,
+            metric_maps[i].float().contiguous(),
+        ))
         # Screen tensor is unused here (no grad), but the rasterizer still expects an [N, 4] means2D.
         means2D = torch.zeros((n_gauss, 4), dtype=gaussian_means.dtype, device=gaussian_means.device)
         kw = dict(means3D=views.means[i], means2D=means2D, opacities=gaussian_opacities[i, ..., None])
         kw.update(_fastgs_appearance_kwargs(views, i, True, gaussian_rotations))
 
-        _, _, accum_metric_counts = rasterizer(**kw)
+        _, _, _, accum_metric_counts, _ = rasterizer(**kw)
         all_counts.append(accum_metric_counts)
     return torch.stack(all_counts)
+
+
+def render_legs_sensitivity_fastgs(
+    extrinsics: Float[Tensor, "batch 4 4"],
+    intrinsics: Float[Tensor, "batch 3 3"],
+    near: Float[Tensor, " batch"],
+    far: Float[Tensor, " batch"],
+    image_shape: tuple[int, int],
+    background_color: Float[Tensor, "batch 3"],
+    gaussian_means: Float[Tensor, "batch gaussian 3"],
+    gaussian_covariances: Float[Tensor, "batch gaussian 3 3"] | None,
+    gaussian_sh_coefficients: Float[Tensor, "batch gaussian 3 d_sh"],
+    gaussian_opacities: Float[Tensor, "batch gaussian"],
+    ground_truth_images: Float[Tensor, "batch 3 height width"],
+    scale_invariant: bool = True,
+    gaussian_scales: Float[Tensor, "batch gaussian 3"] | None = None,
+    gaussian_rotations: Float[Tensor, "batch gaussian 4"] | None = None,
+    mult: float = 0.5,
+) -> tuple[
+    Float[Tensor, "batch gaussian"],
+    Float[Tensor, "batch gaussian"],
+]:
+    """Return the exact per-Gaussian LeGS leave-one-out sensitivity.
+
+    This calls the metric branch added by the official LeGS FastGS fork. For
+    every contributing Gaussian and pixel, CUDA measures the L1 error change
+    caused by removing that Gaussian and separately accumulates its alpha-
+    compositing weight. No proxy metric or screen-gradient substitution is
+    used here.
+    """
+    using_cov = gaussian_covariances is not None
+    using_sr = gaussian_scales is not None and gaussian_rotations is not None
+    assert using_cov ^ using_sr, (
+        "Provide either gaussian_covariances or "
+        "(gaussian_scales+gaussian_rotations)."
+    )
+
+    views = _fastgs_view_setup(
+        extrinsics,
+        intrinsics,
+        near,
+        far,
+        gaussian_means,
+        gaussian_covariances,
+        gaussian_scales,
+        gaussian_sh_coefficients,
+        scale_invariant,
+    )
+    b, _, _ = extrinsics.shape
+    n_gauss = gaussian_means.shape[1]
+    h, w = image_shape
+    if ground_truth_images.shape != (b, 3, h, w):
+        raise ValueError(
+            "ground_truth_images must match flattened cameras and image_shape; "
+            f"got {tuple(ground_truth_images.shape)}, expected {(b, 3, h, w)}"
+        )
+
+    metric_per_view = []
+    weight_per_view = []
+    for i in range(b):
+        metric_map = torch.zeros(
+            h * w,
+            dtype=gaussian_means.dtype,
+            device=gaussian_means.device,
+        )
+        rasterizer = GaussianRasterizer(
+            _fastgs_settings(
+                views,
+                i,
+                background_color,
+                mult,
+                image_shape,
+                True,
+                metric_map,
+                ground_truth_images[i].contiguous(),
+            )
+        )
+        means2d = torch.zeros(
+            (n_gauss, 4),
+            dtype=gaussian_means.dtype,
+            device=gaussian_means.device,
+        )
+        kw = dict(
+            means3D=views.means[i],
+            means2D=means2d,
+            opacities=gaussian_opacities[i, ..., None],
+        )
+        kw.update(_fastgs_appearance_kwargs(views, i, True, gaussian_rotations))
+        _, _, metric_per_gs, _, gs_weight = rasterizer(**kw)
+        metric_per_view.append(metric_per_gs)
+        weight_per_view.append(gs_weight)
+    return torch.stack(metric_per_view), torch.stack(weight_per_view)
 
 
 DepthRenderingMode = Literal["depth", "disparity", "relative_disparity", "log"]

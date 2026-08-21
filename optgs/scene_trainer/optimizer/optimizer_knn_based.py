@@ -933,6 +933,11 @@ class KnnBasedOptimizer(LearnedOptimizer[KnnBasedOptimizerCfg]):
         if self.cfg.any_adc:
 
             n_before_adc = updated_gaussians.means.shape[1]
+            if self.cfg.refiner.name == "legs":
+                meta_for_adc["legs_renderer"] = renderer
+                # Match the official ten-camera LeGS state/reward sample, not
+                # Learn2Splat's current eight-view optimization minibatch.
+                meta_for_adc["legs_context"] = full_context
 
             # Prepare objects to adjust during ADC.
             # Write the current state back so ADC mutation methods see it.
@@ -2279,4 +2284,3 @@ class KnnBasedOptimizer(LearnedOptimizer[KnnBasedOptimizerCfg]):
         # Returning also the render output, but it can only be used for visualization,
         # as we already backpropagate gradients through it
         return gaussian_grads_raw, gaussian_grads, grads_sign, context_render_output, means2d_grads
-

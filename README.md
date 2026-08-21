@@ -25,13 +25,29 @@ offline deblurring. The current tested pipeline combines:
   fixed training probes, target PSNR improvement, Laplacian surplus
   improvement, and a primitive-growth cost.
 
-The controller operates on Gaussian clone/split/prune decisions. It is a custom
-adaptive ADC, not a LeGS/PPO implementation. The implementation, equations,
-benchmark protocols, rollback flags, smoke-test table, and reproduction
-commands are documented in
+The default controller operates on Gaussian clone/split/prune decisions and is
+the custom adaptive ADC described below. An independent `--adc legs`
+ablation now transplants the released LeGS mechanism into the Learn2Splat
+runtime: the pinned official FastGS CUDA leave-one-out sensitivity, 11-D
+per-Gaussian state, keep/clone/split actor, prune estimator, 50-step
+parent-child reward, and PPO update. It deliberately does not reuse the older
+global/proxy `adapt` controller. The implementation, equations, benchmark
+protocols, rollback flags, smoke-test table, and reproduction commands are documented in
 [`experiments/blur_aware_cross_dataset/README.md`](experiments/blur_aware_cross_dataset/README.md).
 Dataset paths are intentionally external; pass a local JSON file with
 `--scene-config` and a released Learn2Splat checkpoint with `--checkpoint`.
+
+Initialize and build the exact LeGS dependency with:
+
+```bash
+git submodule update --init --recursive third_party/LeGS
+PYTHON_BIN=/path/to/python optgs/scripts/install_legs_fastgs.sh
+```
+
+The submodule is pinned to LeGS commit
+`8eb120b1f0c0fe0727e0440f4e372b412f275572`. The build script applies one
+out-of-tree CUDA 12.x header compatibility patch to a temporary copy; the
+official source tree remains unchanged.
 
 The original interactive demo is retained below.
 

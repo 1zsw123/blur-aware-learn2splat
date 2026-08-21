@@ -218,7 +218,12 @@ def transfer_adaptive_reward_state(
     Gradient/radius accumulators intentionally remain fresh. Only scalar probe
     history and the immediately preceding action cost cross the boundary.
     """
-    if source is None or target is None:
+    # Other ADC strategies own independent runtime state. In particular,
+    # LeGSStrategyState must be handed to transfer_legs_runtime_state instead
+    # of being interpreted as this controller's global reward state.
+    if not isinstance(source, VanillaStrategyState) or not isinstance(
+        target, VanillaStrategyState
+    ):
         return
     fields = (
         "feedback_revision",

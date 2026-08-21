@@ -1,0 +1,56 @@
+name: legs
+
+do_densify: true
+do_prune: true
+do_opacity_reset: true
+
+# Official LeGS has no global primitive cap. A capped run is a separate
+# ablation and must set this explicitly rather than silently changing actions.
+cap_max: -1
+
+# Exact schedule from the official LeGS release (30K training recipe).
+pause_refine_after_reset: 0
+refine_every: 100
+reset_every: 3000
+refine_start_iter: 500
+refine_stop_iter: 15000
+refine_scale2d_stop_iter: 0
+
+# Official LeGS candidate thresholds. clone/split themselves are selected by
+# PPO, so the vanilla scale thresholds below are not used.
+grow_grad2d: 0.0001
+grow_scale3d: 0.001
+prune_scale3d: 0.1
+prune_scale2d: 0.15
+grow_scale2d: 0.05
+min_opacity: 0.005
+prune_zero_radii: false
+
+reduce_opacity: false
+reduce_factor: 0.0
+reduce_every: 0
+fallback_means_lr: 0.0
+
+grad_thresh: 0.0001
+grad_abs_thresh: 0.0002
+state_dim: 11
+hidden_dim: 64
+reward_delay: 50
+rollout_batch_size: 2
+ppo_epochs: 2
+ppo_chunk_size: 500000
+state_view_count: 10
+use_mixed_precision: true
+gamma: 0.99
+gae_lambda: 0.95
+policy_clip: 0.2
+actor_lr_init: 0.001
+actor_lr_final: 0.00001
+state_encoder_lr_init: 0.001
+state_encoder_lr_final: 0.00001
+prune_lr_init: 0.001
+prune_lr_final: 0.00001
+min_opacity_init: 0.005
+min_opacity_final: 0.1
+reward_normalize: true
+use_prune_estimator: true

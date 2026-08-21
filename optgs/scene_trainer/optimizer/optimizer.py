@@ -28,9 +28,16 @@ from optgs.model.types import Gaussians
 from optgs.scene_trainer.adc.vanilla import AdaptiveStrategyCfg, VanillaStrategyCfg
 from optgs.scene_trainer.adc.mcmc import McmcStrategyCfg
 from optgs.scene_trainer.adc.fastgs import FastGSStrategyCfg
+from optgs.scene_trainer.adc.legs_config import LeGSStrategyCfg
 
 # Discriminated by `name`; mirrors adc.StrategyCfg (kept inline here to dodge the package import).
-StrategyCfg = VanillaStrategyCfg | AdaptiveStrategyCfg | McmcStrategyCfg | FastGSStrategyCfg
+StrategyCfg = (
+    VanillaStrategyCfg
+    | AdaptiveStrategyCfg
+    | McmcStrategyCfg
+    | FastGSStrategyCfg
+    | LeGSStrategyCfg
+)
 from optgs.scene_trainer.initializer.initializer import InitializerOutput
 from optgs.scene_trainer.initializer import InitializerCfg
 from optgs.misc.detaching_cpu_list import DetachingCPUList
@@ -413,6 +420,7 @@ class Optimizer(nn.Module, ABC, Generic[T]):
         visibility_mask = meta["visibility_filter"]  # [B, V, N]
         radii_2d = meta["radii"].float()  # [B, V, N, 2]
         means2d_grads = meta["means_2d_grads"]  # [B, V, N, 2] or None
+        means2d_abs_grads = meta.get("means_2d_abs_grads")
 
         if isinstance(self.cfg.refiner, AdaptiveStrategyCfg):
             objective = getattr(self, "input_objective", None)
@@ -446,11 +454,14 @@ class Optimizer(nn.Module, ABC, Generic[T]):
             smoothers=object_dict_to_adjust,
             radii_2d=radii_2d,  # [V, N]
             means2d_grads=means2d_grads,  # [V, N, 2]
+            means2d_abs_grads=means2d_abs_grads,
             visibility_mask=visibility_mask,  # [V, N]
             iter_batch_size=v,
             w=w,
             h=h,
-            lr=lr
+            lr=lr,
+            renderer=meta.get("legs_renderer"),
+            context=meta.get("legs_context"),
         )
 
         if (
@@ -495,6 +506,35 @@ class Optimizer(nn.Module, ABC, Generic[T]):
                     "cloned": int(nr_cloned),
                     "split": int(nr_splitted),
                     "pruned": int(nr_pruned),
+                    "num_gaussians": int(gaussians.means.shape[1]),
+                }
+            )
+        elif (
+            self.cfg.refiner.name == "legs"
+            and getattr(adc_state, "last_event_step", -1) == i
+        ):
+            controller = adc_state.controller
+            self.capacity_events.append(
+                {
+                    "step": int(i),
+                    "controller": "official_legs_ppo",
+                    "event_kind": str(adc_state.last_event_kind),
+                    "valid": int(adc_state.last_valid_count),
+                    "cloned": int(nr_cloned),
+                    "split": int(nr_splitted),
+                    "pruned": int(nr_pruned),
+                    "cap_truncated": int(adc_state.last_cap_truncation),
+                    "reward_step": int(adc_state.last_reward_step),
+                    "reward_mean": float(adc_state.last_reward_mean),
+                    "reward_std": float(adc_state.last_reward_std),
+                    "ppo_updates": int(controller.update_count),
+                    "policy_loss": float(controller.last_policy_loss),
+                    "policy_entropy": float(controller.last_entropy),
+                    "sampled_view_indices": list(
+                        adc_state.last_sampled_view_indices
+                    ),
+                    "opacity_reset_count": int(adc_state.opacity_reset_count),
+                    "final_prune_count": int(adc_state.final_prune_count),
                     "num_gaussians": int(gaussians.means.shape[1]),
                 }
             )

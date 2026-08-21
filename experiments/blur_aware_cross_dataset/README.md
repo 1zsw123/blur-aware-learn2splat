@@ -197,6 +197,65 @@ geometry artifacts despite their metric gain.
 The hash-bound CSV/JSON, capacity-event audit, and plot are under
 `outputs/learn2splat_surplus_action_reward_cross_dataset_s2_final`.
 
+## Exact LeGS transplantation
+
+`--adc legs --decoder-backend fastgs` is a separate reference ablation. It
+keeps Learn2Splat as the Gaussian parameter optimizer but transplants the
+released LeGS structural controller rather than approximating it with the
+global adaptive policy:
+
+- official LeGS commit `8eb120b1f0c0fe0727e0440f4e372b412f275572`;
+- official FastGS CUDA leave-one-out L1 sensitivity and alpha visibility;
+- ten randomly sampled training cameras per decision;
+- normalized 11-D state: XYZ gradients (3), scale gradients (3), opacity
+  gradient (1), DC-color gradients (3), and sensitivity (1);
+- per-Gaussian keep/clone/split actor and separate low-opacity prune estimator;
+- parent-child aggregation after the released 50-step reward delay;
+- two-transition GAE/PPO update, two epochs, 500K chunks, and the released
+  learning-rate schedule;
+- released 500/100/15000 structural schedule, 3K opacity reset, no global
+  primitive cap, and 15K-post final opacity pruning.
+
+The representation update, BPN/Laplacian objective, data protocol, and final
+hold metrics remain this repository's Learn2Splat pipeline. Consequently this
+is an exact transplantation of the LeGS *capacity mechanism*, not a claim that
+the whole LeGS training stack is reproduced. A fair comparison must run both
+controllers with `--decoder-backend fastgs`; comparing LeGS/FastGS against the
+default gsplat renderer would mix controller and renderer effects. The former
+short-horizon rescaled/global policy is an adapted ablation and is not exposed
+as `--adc legs`.
+
+```bash
+git submodule update --init --recursive third_party/LeGS
+PYTHON_BIN="$ENV" optgs/scripts/install_legs_fastgs.sh
+
+CUDA_VISIBLE_DEVICES=2 "$ENV" experiments/blur_aware_cross_dataset/run_cross_dataset.py \
+  --scene motion_blurcoffee --output-root "$OUT/exact_legs" \
+  --steps 10000 --eval-steps 1000,2000,3000,4000,5000,6000,7000,8000,9000,10000 \
+  --objective blur-aware --optimizer learned_projected --adc legs \
+  --decoder-backend fastgs --densification-reward off \
+  --laplacian-loss-mode surplus --laplacian-loss-weight 0.1
+```
+
+### Verified blurcoffee smoke
+
+The exact command above was compared with the current adaptive-surplus
+controller using the same Learn2Splat optimizer, FastGS decoder, seed, data,
+objective, hold frames, and 1K--10K metric schedule. Only the capacity
+controller and its native reward path differ.
+
+| Controller | Best hold PSNR / SSIM | 10K hold PSNR / SSIM | 10K Gaussians |
+| --- | --- | --- | ---: |
+| Adaptive + surplus | 39.754 / 0.9827 @8K | 39.034 / 0.9804 | 45,440 |
+| Exact LeGS | **46.003 / 0.9934 @9K** | **45.391 / 0.9930** | 289,251 |
+
+The 9K and 10K exact-LeGS hold grids were visually checked and contain no
+large black regions, wrong-view substitutions, or the long red-line artifact
+visible in the adaptive control. This is a one-scene engineering smoke result,
+not a multi-scene aggregate or an independent claim about held-out
+generalization. Exact LeGS improves this scene substantially but uses about
+6.4x as many Gaussians at 10K.
+
 ## Reproduction
 
 ```bash

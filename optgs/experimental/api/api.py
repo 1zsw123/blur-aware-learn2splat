@@ -54,6 +54,7 @@ class OptGS:
         opt_batch_strategy: str | None = None,
         rollout_horizon: int | None = None,
         background_color: Sequence[float] | None = None,
+        decoder_backend: str | None = None,
         rasterize_mode: str | None = None,
         eps2d: float | None = None,
         strict_load: bool = True,
@@ -161,7 +162,11 @@ class OptGS:
         # when given, override the checkpoint's decoder config.
         decoder_overrides = {
             k: v
-            for k, v in (("rasterize_mode", rasterize_mode), ("eps2d", eps2d))
+            for k, v in (
+                ("name", decoder_backend),
+                ("rasterize_mode", rasterize_mode),
+                ("eps2d", eps2d),
+            )
             if v is not None
         }
         self.decoder = build_decoder(
@@ -584,6 +589,7 @@ class OptGS:
         from optgs.scene_trainer.adc.vanilla import (
             transfer_adaptive_reward_state,
         )
+        from optgs.scene_trainer.adc.legs import transfer_legs_runtime_state
 
         capacity_events = list(getattr(opt, "capacity_events", []))
         current = inp.prev_output.gaussians
@@ -596,6 +602,10 @@ class OptGS:
         )
         opt.on_scene_start(inp)
         transfer_adaptive_reward_state(
+            previous_adc_state,
+            getattr(inp.prev_output.state, "adc_state", None),
+        )
+        transfer_legs_runtime_state(
             previous_adc_state,
             getattr(inp.prev_output.state, "adc_state", None),
         )
@@ -759,6 +769,9 @@ class OptGS:
                         from optgs.scene_trainer.adc.vanilla import (
                             transfer_adaptive_reward_state,
                         )
+                        from optgs.scene_trainer.adc.legs import (
+                            transfer_legs_runtime_state,
+                        )
 
                         self.capacity_events.extend(
                             list(getattr(opt, "capacity_events", []))
@@ -781,6 +794,10 @@ class OptGS:
                         opt.validate_input(inp)
                         opt.on_scene_start(inp)
                         transfer_adaptive_reward_state(
+                            previous_adc_state,
+                            getattr(inp.prev_output.state, "adc_state", None),
+                        )
+                        transfer_legs_runtime_state(
                             previous_adc_state,
                             getattr(inp.prev_output.state, "adc_state", None),
                         )

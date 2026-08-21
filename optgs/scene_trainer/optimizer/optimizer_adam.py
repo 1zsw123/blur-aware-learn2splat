@@ -140,6 +140,13 @@ class AdamOptimizer(NonlearnedOptimizer[AdamOptimizerCfg]):
 
             # Densification and Pruning
             if self.cfg.any_adc:
+                if self.cfg.refiner.name == "legs":
+                    meta_for_adc["legs_renderer"] = renderer
+                    # Official LeGS samples ten cameras for policy state and
+                    # delayed sensitivity reward at each structural event.
+                    # Pass the complete training pool; the LeGS strategy owns
+                    # the event-time random sampling.
+                    meta_for_adc["legs_context"] = full_context
                 # Apply ADC
                 self.apply_adc(
                     i=i, v=v, h=h, w=w,

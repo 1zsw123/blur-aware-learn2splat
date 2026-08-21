@@ -11,6 +11,7 @@ from ..types import Gaussians
 from .cuda_splatting_fastgs import (
     render_cuda_fastgs,
     render_depth_cuda_fastgs,
+    render_legs_sensitivity_fastgs,
     render_metric_counts_fastgs,
 )
 from .splatting_cuda_decoder import SplattingCUDADecoder
@@ -85,3 +86,48 @@ class FastGSDecoderSplattingCUDA(SplattingCUDADecoder[FastGSDecoderSplattingCUDA
             gaussian_rotations=rotations_wxyz,
             mult=self.cfg.mult,
         )
+
+    @torch.no_grad()
+    def render_legs_sensitivity(
+        self,
+        gaussians: Gaussians | GaussiansModule,
+        extrinsics: Float[Tensor, "batch view 4 4"],
+        intrinsics: Float[Tensor, "batch view 3 3"],
+        near: Float[Tensor, "batch view"],
+        far: Float[Tensor, "batch view"],
+        image_shape: tuple[int, int],
+        ground_truth_images: Float[Tensor, "batch view 3 height width"],
+    ) -> tuple[
+        Float[Tensor, "view gaussian"],
+        Float[Tensor, "view gaussian"],
+    ]:
+        """Expose the exact metric branch from the official LeGS rasterizer."""
+        b, v, _, _ = extrinsics.shape
+        assert b == 1, "render_legs_sensitivity assumes scene batch size 1"
+        if ground_truth_images.shape[:2] != (b, v):
+            raise ValueError(
+                "ground_truth_images must align with the supplied cameras; "
+                f"got {tuple(ground_truth_images.shape[:2])}, expected {(b, v)}"
+            )
+        means, shs, opacities, scales, rotations_wxyz, covars = (
+            self._prepare_flat_gaussians(gaussians, b, v)
+        )
+        bg = repeat(self.background_color, "c -> (b v) c", b=b, v=v)
+        metric, weight = render_legs_sensitivity_fastgs(
+            rearrange(extrinsics, "b v i j -> (b v) i j"),
+            rearrange(intrinsics, "b v i j -> (b v) i j"),
+            rearrange(near, "b v -> (b v)"),
+            rearrange(far, "b v -> (b v)"),
+            image_shape,
+            bg,
+            means,
+            covars,
+            shs,
+            opacities,
+            rearrange(ground_truth_images, "b v c h w -> (b v) c h w"),
+            scale_invariant=self.cfg.scale_invariant,
+            gaussian_scales=scales,
+            gaussian_rotations=rotations_wxyz,
+            mult=self.cfg.mult,
+        )
+        return metric, weight

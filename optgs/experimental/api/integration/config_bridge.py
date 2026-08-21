@@ -257,6 +257,16 @@ def build_decoder(
             f"checkpoint config at {cfg_path} has no scene_trainer.decoder; "
             f"cannot rebuild the renderer the optimizer trained with."
         )
+    overrides = dict(decoder_overrides or {})
+    requested_backend = overrides.pop("name", None)
+    if requested_backend is not None:
+        default_node = _compose_default_group("decoder", str(requested_backend))
+        if default_node is None:
+            raise OptGSError(
+                f"could not compose decoder backend override {requested_backend!r}"
+            )
+        node = default_node
+
     # Resolve the discriminated union by `name` (dacite can't parse the union
     # itself). A missing name means its optional backend isn't installed.
     name = OmegaConf.select(node, "name")
@@ -282,8 +292,10 @@ def build_decoder(
                 {f: sig[f].default for f in ("rasterize_mode", "eps2d") if f in sig}
             ),
             node,
-            OmegaConf.create(dict(decoder_overrides or {})),
+            OmegaConf.create(overrides),
         )
+    elif overrides:
+        node = OmegaConf.merge(node, OmegaConf.create(overrides))
     try:
         decoder_cfg = load_typed_config(node, cfg_cls)
     except Exception as e:
@@ -335,6 +347,7 @@ def build_refiner_cfg(strategy: str, num_refine: int) -> "BaseStrategyCfg":
 
     from optgs.config import load_typed_config
     from optgs.scene_trainer.adc.fastgs import FastGSStrategyCfg
+    from optgs.scene_trainer.adc.legs_config import LeGSStrategyCfg
     from optgs.scene_trainer.adc.mcmc import McmcStrategyCfg
     from optgs.scene_trainer.adc.vanilla import AdaptiveStrategyCfg, VanillaStrategyCfg
 
@@ -355,6 +368,7 @@ def build_refiner_cfg(strategy: str, num_refine: int) -> "BaseStrategyCfg":
         "fastgs": FastGSStrategyCfg,
         "adaptive": AdaptiveStrategyCfg,
         "adaptive_legacy": AdaptiveStrategyCfg,
+        "legs": LeGSStrategyCfg,
     }.get(strategy, VanillaStrategyCfg)
     cfg = load_typed_config(OmegaConf.load(yaml_path), arm)
 
@@ -364,6 +378,12 @@ def build_refiner_cfg(strategy: str, num_refine: int) -> "BaseStrategyCfg":
 
     n = max(1, int(num_refine))
     cap = cfg.cap_max if (cfg.cap_max and cfg.cap_max > 0) else 1_500_000
+    if cfg.name == "legs":
+        # Exact LeGS transplantation keeps the released 500/100/15000
+        # densification schedule and the absence of a global primitive cap.
+        # Scaling these values to a smoke-test horizon is the older adapted
+        # ablation, not the reference mechanism requested by --adc legs.
+        return cfg
     if cfg.name == "adaptive":
         return replace(
             cfg,

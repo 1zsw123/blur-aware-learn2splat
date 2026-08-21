@@ -56,6 +56,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
+        "--decoder-backend",
+        choices=("checkpoint", "fastgs"),
+        default="checkpoint",
+        help=(
+            "Renderer used by both optimization and evaluation. LeGS requires "
+            "fastgs because its exact per-Gaussian sensitivity is implemented "
+            "inside the official LeGS FastGS rasterizer."
+        ),
+    )
+    parser.add_argument(
         "--steps",
         type=int,
         default=0,
@@ -1319,6 +1329,16 @@ def save_kernel_visualization(
 
 def main() -> None:
     args = parse_args()
+    if args.adc == "legs" and args.decoder_backend != "fastgs":
+        raise ValueError(
+            "exact --adc legs requires --decoder-backend fastgs; the official "
+            "per-Gaussian leave-one-out sensitivity is a FastGS CUDA kernel"
+        )
+    if args.adc == "legs" and args.densification_reward != "off":
+        raise ValueError(
+            "exact LeGS uses its own delayed per-Gaussian sensitivity reward; "
+            "do not combine it with the adapted global probe reward"
+        )
     reward_enabled = args.densification_reward == "surplus_probe"
     probe_enabled = args.densification_reward != "off"
     if probe_enabled and (
@@ -1368,6 +1388,9 @@ def main() -> None:
     optgs = OptGS(
         checkpoint=args.checkpoint,
         device=device,
+        decoder_backend=(
+            None if args.decoder_backend == "checkpoint" else args.decoder_backend
+        ),
         num_refine=(None if args.steps == 0 else args.steps),
         opt_batch_size=args.opt_batch_size,
         opt_batch_strategy=(
@@ -1582,12 +1605,22 @@ def main() -> None:
         "scene": args.scene,
         "dataset": cfg["dataset"],
         "method": (
-            "official Learn2Splat Dense + factorized BPN + calibrated EVSSM "
-            "+ normalized NIMA-sharp w10"
+            (
+                "official Learn2Splat Dense + exact LeGS per-Gaussian PPO "
+                "+ factorized BPN + calibrated EVSSM + normalized NIMA-sharp w10"
+                if args.adc == "legs"
+                else "official Learn2Splat Dense + factorized BPN + calibrated EVSSM "
+                "+ normalized NIMA-sharp w10"
+            )
             if args.optimizer == "learned"
             else (
-                "official Learn2Splat Dense proposal + objective-consistent "
-                "Adam residual projection + blur-aware capacity controller"
+                (
+                    "official Learn2Splat Dense proposal + objective-consistent "
+                    "Adam residual projection + exact LeGS per-Gaussian PPO"
+                    if args.adc == "legs"
+                    else "official Learn2Splat Dense proposal + objective-consistent "
+                    "Adam residual projection + blur-aware capacity controller"
+                )
                 if args.optimizer == "learned_projected"
                 else "official OptGS Adam diagnostic"
             )
@@ -1614,8 +1647,30 @@ def main() -> None:
             "opt_batch_strategy_requested": requested_batch_strategy,
             "opt_batch_strategy_effective": optgs.opt_batch_strategy,
             "adc": args.adc,
+            "decoder_backend_requested": args.decoder_backend,
+            "decoder_backend_effective": optgs.decoder.cfg.name,
             "densification_reward": args.densification_reward,
             "capacity_controller": (
+                {
+                    "version": "official_legs_8eb120b_exact_mechanism",
+                    "host_representation": "learn2splat_gaussians",
+                    "sensitivity": "official_fastgs_leave_one_out_l1",
+                    "state_dim": 11,
+                    "state_views": 10,
+                    "actions": ["keep", "clone", "split"],
+                    "pruning": "separate_low_opacity_estimator",
+                    "reward_delay": 50,
+                    "parent_child_credit": True,
+                    "schedule": {
+                        "start": 500,
+                        "interval": 100,
+                        "stop": 15000,
+                        "opacity_reset": 3000,
+                    },
+                    "global_primitive_cap": None,
+                }
+                if args.adc == "legs"
+                else
                 {
                     "version": (
                         "residual_headroom_v2"

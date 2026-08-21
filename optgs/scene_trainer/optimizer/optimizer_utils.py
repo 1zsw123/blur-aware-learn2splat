@@ -58,13 +58,18 @@ def inner_loss_for_input_gradients(
     output_renderer: DecoderOutput,
     reduction: str = "mean",
     with_ssim: bool = True,
+    clamp_images: bool = False,
 ) -> Tensor:
     # compute scalar loss
     # assume batch size 1
     assert gt_images.shape[0] == 1
     assert gt_images.shape == output_renderer.color.shape
 
-    l1_loss = (output_renderer.color - gt_images).abs()
+    prediction = output_renderer.color
+    if clamp_images:
+        prediction = prediction.clamp(0.0, 1.0)
+        gt_images = gt_images.clamp(0.0, 1.0)
+    l1_loss = (prediction - gt_images).abs()
     if reduction == "mean":
         l1_loss = l1_loss.mean()
     elif reduction == "sum":
@@ -79,7 +84,7 @@ def inner_loss_for_input_gradients(
 
     gt_images_for_ssim = gt_images.clone() if gt_images.is_inference() else gt_images
     ssim_loss = fused_ssim_with_reduction(
-        rearrange(output_renderer.color, "b v c h w -> (b v) c h w"),
+        rearrange(prediction, "b v c h w -> (b v) c h w"),
         rearrange(gt_images_for_ssim, "b v c h w -> (b v) c h w"),
         padding="valid",
         reduction=reduction,
@@ -173,6 +178,7 @@ def calc_input_gradients(
     opacity_reg_lambda: float = 0.0,  # L1 opacity regularization weight (3DGS-MCMC)
     input_objective=None,
     step: int | None = None,
+    clamp_images: bool = False,
 ) -> tuple[Tensor, dict[str, Tensor], dict[str, Tensor | None] | None]:
 
     b, v, _, h, w = iter_context["image"].shape
@@ -183,6 +189,10 @@ def calc_input_gradients(
     nr_chunks = math.ceil(v / chunk_size)
     N = prev_means.shape[1]
     device = prev_means.device
+    need_abs_2d_grads = bool(
+        need_2d_grads
+        and getattr(renderer, "_produces_abs_grad", lambda: False)()
+    )
 
     # --- Grad setup ---
     # Gradients are obtained functionally via torch.autograd.grad below, so .grad buffers
@@ -208,6 +218,12 @@ def calc_input_gradients(
         if need_2d_grads and means2d_grads_all is None:
             means2d_grads_all = torch.empty((b, v, N, 2), dtype=torch.float32, device=device)
             meta_bufs["means2d_grads"] = means2d_grads_all
+        means2d_abs_grads_all = meta_bufs.get("means2d_abs_grads")
+        if need_abs_2d_grads and means2d_abs_grads_all is None:
+            means2d_abs_grads_all = torch.empty(
+                (b, v, N, 2), dtype=torch.float32, device=device
+            )
+            meta_bufs["means2d_abs_grads"] = means2d_abs_grads_all
     elif any_adc:
         radii_all       = torch.empty((b, v, N, 2), dtype=torch.float32, device=device)
         visibility_all  = torch.empty((b, v, N),    dtype=torch.bool,    device=device)
@@ -215,11 +231,17 @@ def calc_input_gradients(
             torch.empty((b, v, N, 2), dtype=torch.float32, device=device)
             if need_2d_grads else None
         )
+        means2d_abs_grads_all = (
+            torch.empty((b, v, N, 2), dtype=torch.float32, device=device)
+            if need_abs_2d_grads else None
+        )
         if meta_bufs is not None:
             meta_bufs.update({"N": N, "v": v, "radii": radii_all,
-                              "visibility": visibility_all, "means2d_grads": means2d_grads_all})
+                              "visibility": visibility_all,
+                              "means2d_grads": means2d_grads_all,
+                              "means2d_abs_grads": means2d_abs_grads_all})
     else:
-        radii_all = visibility_all = means2d_grads_all = None
+        radii_all = visibility_all = means2d_grads_all = means2d_abs_grads_all = None
 
     # --- Forward + autograd.grad loop ---
     # Per-chunk gradients for the leaf params are summed here, then averaged below.
@@ -274,6 +296,7 @@ def calc_input_gradients(
                     output_renderer,
                     reduction=loss_reduction,
                     with_ssim=loss_with_ssim,
+                    clamp_images=clamp_images,
                 )
             else:
                 loss = input_objective.compute_loss(
@@ -292,9 +315,16 @@ def calc_input_gradients(
                 grad_loss = loss + opacity_reg_lambda * torch.sigmoid(prev_opacities_raw).mean()
 
             grad_inputs = list(_leaf_params)
+            means2d_grad_index = None
+            means2d_abs_grad_index = None
             if need_2d_grads:
                 assert output_renderer.means2d is not None
+                means2d_grad_index = len(grad_inputs)
                 grad_inputs.append(output_renderer.means2d)
+                if need_abs_2d_grads:
+                    assert output_renderer.means2d_abs is not None
+                    means2d_abs_grad_index = len(grad_inputs)
+                    grad_inputs.append(output_renderer.means2d_abs)
             geometry_input_count = len(grad_inputs)
             objective_parameters = []
             if input_objective is not None:
@@ -319,7 +349,14 @@ def calc_input_gradients(
                     # Normalize to NDC per the renderer's convention so the ADC stays
                     # renderer-agnostic (gsplat=pixel→×w/2,h/2; inria/fastgs already NDC).
                     means2d_grads_all[:, start:stop] = renderer.means2d_grad_to_ndc(
-                        chunk_grads[5].detach(), (h, w))
+                        chunk_grads[means2d_grad_index].detach(), (h, w))
+                if means2d_abs_grad_index is not None:
+                    means2d_abs_grads_all[:, start:stop] = (
+                        renderer.means2d_grad_to_ndc(
+                            chunk_grads[means2d_abs_grad_index].detach(),
+                            (h, w),
+                        )
+                    )
             if input_objective is not None:
                 input_objective.accumulate_parameter_grads(
                     chunk_grads[geometry_input_count:]
@@ -351,6 +388,7 @@ def calc_input_gradients(
         "visibility_filter": visibility_all,
         "radii":             radii_all,
         "means_2d_grads":    means2d_grads_all if need_2d_grads else None,
+        "means_2d_abs_grads": means2d_abs_grads_all if need_abs_2d_grads else None,
     } if any_adc else None
 
     return loss, grads, meta_for_adc

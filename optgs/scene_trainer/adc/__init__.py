@@ -13,19 +13,33 @@ from optgs.scene_trainer.adc.vanilla import (
     update_vanilla_strategy_state,
 )
 from optgs.scene_trainer.adc.fastgs import FastGSStrategyState, FastGSStrategyCfg, update_fastgs_strategy_state
+from optgs.scene_trainer.adc.legs import LeGSStrategyState
+from optgs.scene_trainer.adc.legs_config import LeGSStrategyCfg
 
 # Discriminated union of the per-strategy configs, resolved by the `name` Literal (mirrors the
 # DecoderCfg / SceneOptimizerCfg unions). OptimizerCfg.refiner and the postprocessing adc config
 # are typed with this so dacite builds the right arm — vanilla/edgs/none -> VanillaStrategyCfg,
 # mcmc -> McmcStrategyCfg, fastgs -> FastGSStrategyCfg.
-StrategyCfg = VanillaStrategyCfg | AdaptiveStrategyCfg | McmcStrategyCfg | FastGSStrategyCfg
+StrategyCfg = (
+    VanillaStrategyCfg
+    | AdaptiveStrategyCfg
+    | McmcStrategyCfg
+    | FastGSStrategyCfg
+    | LeGSStrategyCfg
+)
 
 def init_strategy_state(
     cfg: BaseStrategyCfg,
     **kwargs
-) -> VanillaStrategyState | McmcStrategyState | FastGSStrategyState:
+) -> VanillaStrategyState | McmcStrategyState | FastGSStrategyState | LeGSStrategyState:
 
-    if cfg.name == "mcmc":
+    if cfg.name == "legs":
+        return LeGSStrategyState.initialize(
+            nr_points=kwargs["nr_points"],
+            device=kwargs["device"],
+            scene_extent=kwargs["scene_extent"],
+        )
+    elif cfg.name == "mcmc":
         return McmcStrategyState.initialize(
             device=kwargs["device"]
         )
@@ -45,7 +59,7 @@ def init_strategy_state(
         raise NotImplementedError(f"ADC strategy state initialization not implemented for {cfg.name}")
 
 def update_strategy_state(
-    adc_state: VanillaStrategyState | McmcStrategyState | FastGSStrategyState,
+    adc_state: VanillaStrategyState | McmcStrategyState | FastGSStrategyState | LeGSStrategyState,
     **kwargs
 ) -> None:
     """Updates adc_state in place."""
@@ -90,7 +104,20 @@ def apply_adc_strategy(
 ) -> tuple[int, int, int, float | None, float | None]:
     """Applies ADC strategy and returns number of cloned, split, pruned GSs."""
     
-    if cfg.name == "fastgs":
+    if cfg.name == "legs":
+        from optgs.scene_trainer.adc.legs import apply_legs_strategy
+        assert isinstance(adc_state, LeGSStrategyState), "adc_state type mismatch."
+        return apply_legs_strategy(
+            cfg,
+            step=step,
+            gaussians=gaussians,
+            adc_state=adc_state,
+            smoothers=smoothers,
+            renderer=kwargs["renderer"],
+            context=kwargs["context"],
+            zero_t=zero_t,
+        )
+    elif cfg.name == "fastgs":
         from optgs.scene_trainer.adc.fastgs import apply_fastgs_strategy
         assert isinstance(adc_state, FastGSStrategyState), "adc_state type mismatch."
         return apply_fastgs_strategy(
@@ -135,7 +162,7 @@ def post_backward(
     cfg: BaseStrategyCfg,
     step: int,
     gaussians: Gaussians | GaussiansModule,
-    adc_state: VanillaStrategyState | McmcStrategyState | FastGSStrategyState,
+    adc_state: VanillaStrategyState | McmcStrategyState | FastGSStrategyState | LeGSStrategyState,
     smoothers: dict[str, Any],
     radii_2d: Tensor,  # [B, V, G, 2]
     means2d_grads: Tensor | None,  # [B, V, G, 2]
@@ -147,16 +174,20 @@ def post_backward(
     **kwargs
 ) -> tuple[int, int, int, float | None, float | None]:
 
-    # update adc state
-    update_strategy_state(
-        adc_state,
-        radii_2d=radii_2d,
-        means2d_grads=means2d_grads,
-        visibility_mask=visibility_mask,
-        v=iter_batch_size,
-        w=w,
-        h=h,
-    )
+    # Official LeGS stops collecting densification statistics at its released
+    # densify_until_iter boundary. Other strategies keep their existing update
+    # behavior.
+    if cfg.name != "legs" or step < cfg.refine_stop_iter:
+        update_strategy_state(
+            adc_state,
+            radii_2d=radii_2d,
+            means2d_grads=means2d_grads,
+            means2d_abs_grads=kwargs.get("means2d_abs_grads"),
+            visibility_mask=visibility_mask,
+            v=iter_batch_size,
+            w=w,
+            h=h,
+        )
 
     return apply_adc_strategy(
         cfg,
