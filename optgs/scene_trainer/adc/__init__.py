@@ -6,14 +6,19 @@ from jaxtyping import Bool
 from optgs.scene_trainer.gaussian_module import GaussiansModule
 from optgs.scene_trainer.adc.base import BaseStrategyCfg
 from optgs.scene_trainer.adc.mcmc import McmcStrategyState, McmcStrategyCfg, update_mcmc_strategy_state
-from optgs.scene_trainer.adc.vanilla import VanillaStrategyState, VanillaStrategyCfg, update_vanilla_strategy_state
+from optgs.scene_trainer.adc.vanilla import (
+    AdaptiveStrategyCfg,
+    VanillaStrategyState,
+    VanillaStrategyCfg,
+    update_vanilla_strategy_state,
+)
 from optgs.scene_trainer.adc.fastgs import FastGSStrategyState, FastGSStrategyCfg, update_fastgs_strategy_state
 
 # Discriminated union of the per-strategy configs, resolved by the `name` Literal (mirrors the
 # DecoderCfg / SceneOptimizerCfg unions). OptimizerCfg.refiner and the postprocessing adc config
 # are typed with this so dacite builds the right arm — vanilla/edgs/none -> VanillaStrategyCfg,
 # mcmc -> McmcStrategyCfg, fastgs -> FastGSStrategyCfg.
-StrategyCfg = VanillaStrategyCfg | McmcStrategyCfg | FastGSStrategyCfg
+StrategyCfg = VanillaStrategyCfg | AdaptiveStrategyCfg | McmcStrategyCfg | FastGSStrategyCfg
 
 def init_strategy_state(
     cfg: BaseStrategyCfg,
@@ -30,7 +35,7 @@ def init_strategy_state(
             device=kwargs["device"],
             scene_extent=kwargs["scene_extent"],
         )
-    elif cfg.name in ["default", "edgs", "none"]:
+    elif cfg.name in ["default", "edgs", "none", "adaptive"]:
         return VanillaStrategyState.initialize(
             nr_points=kwargs["nr_points"],
             device=kwargs["device"],
@@ -98,7 +103,7 @@ def apply_adc_strategy(
             pruning_score=kwargs.get("pruning_score"),
             zero_t=zero_t,
         )
-    elif cfg.name in ["default", "edgs", "none"]:
+    elif cfg.name in ["default", "edgs", "none", "adaptive"]:
         from optgs.scene_trainer.adc.vanilla import apply_vanilla_strategy
         assert isinstance(adc_state, VanillaStrategyState), "adc_state type mismatch."
         return apply_vanilla_strategy(

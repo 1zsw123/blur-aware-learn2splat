@@ -15,7 +15,7 @@ class BaseStrategyCfg:
     the optimizer). Strategy-specific knobs live in the ``name``-narrowed subclasses —
     ``VanillaStrategyCfg`` (vanilla.py), ``McmcStrategyCfg`` (mcmc.py), ``FastGSStrategyCfg``
     (fastgs.py) — which the ``StrategyCfg`` union in ``__init__.py`` discriminates by ``name``."""
-    name: Literal["default", "edgs", "mcmc", "none", "fastgs"]
+    name: Literal["default", "edgs", "mcmc", "none", "fastgs", "adaptive"]
 
     do_densify: bool
     do_prune: bool

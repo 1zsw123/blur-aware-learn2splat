@@ -1,0 +1,31 @@
+name: adaptive
+
+do_densify: true
+do_prune: false
+do_opacity_reset: false
+
+cap_max: 1500000
+active_budget: 100000
+support_conditioned_cap: false
+min_growth_fraction: 0.0
+max_growth_fraction: 0.5
+
+pause_refine_after_reset: 0
+refine_every: 100
+reset_every: 999999999
+refine_start_iter: 500
+refine_stop_iter: 15000
+refine_scale2d_stop_iter: 0
+
+grow_grad2d: 0.0
+grow_scale3d: 0.0
+prune_scale3d: 0.1
+prune_scale2d: 0.15
+grow_scale2d: 0.05
+min_opacity: 0.005
+prune_zero_radii: false
+
+reduce_opacity: false
+reduce_factor: 0.0
+reduce_every: 0
+fallback_means_lr: 0.0

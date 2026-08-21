@@ -1044,7 +1044,7 @@ class KnnBasedOptimizer(LearnedOptimizer[KnnBasedOptimizerCfg]):
         # Get input signal for the optimizer model (errors/gradients)
         with self.benchmarker.time("decoder"):
             input_signal, gaussian_grads_raw, gaussian_grads, grad_sign, context_render_output, means2d_grads = (
-                self.prepare_input_signal(context, gaussians, optimizer_input.renderer)
+                self.prepare_input_signal(context, gaussians, optimizer_input.renderer, step=i)
             )
 
         # Preparing meta for ADC
@@ -1900,7 +1900,7 @@ class KnnBasedOptimizer(LearnedOptimizer[KnnBasedOptimizerCfg]):
 
         return input_signal
 
-    def prepare_input_signal(self, context, gaussians, renderer):
+    def prepare_input_signal(self, context, gaussians, renderer, step=None):
         """Build the per-Gaussian signal that drives the update: render gradients and/or feature error.
 
         Renders the context views once and turns the errors with the inputs into the network's input
@@ -1918,7 +1918,7 @@ class KnnBasedOptimizer(LearnedOptimizer[KnnBasedOptimizerCfg]):
         # calculate input gradients
         if self.cfg.input_gradient:
             gaussian_grads_raw, gaussian_grads, grad_sign, context_render_output, means2d_grads = (
-                self._calc_input_gradients(context, gaussians, renderer)
+                self._calc_input_gradients(context, gaussians, renderer, step=step)
             )
 
             input_signal = gaussian_grads_raw
@@ -2123,7 +2123,7 @@ class KnnBasedOptimizer(LearnedOptimizer[KnnBasedOptimizerCfg]):
 
         return delta_gaussians
 
-    def _calc_input_gradients(self, context, gaussians, renderer):
+    def _calc_input_gradients(self, context, gaussians, renderer, step=None):
         """Render the context views and backprop the reconstruction loss to per-Gaussian parameter gradients.
 
         These gradients are a feature fed to the network (the "what is wrong" signal), not used to update
@@ -2132,6 +2132,10 @@ class KnnBasedOptimizer(LearnedOptimizer[KnnBasedOptimizerCfg]):
         """
         assert not self.cfg.input_gradient_same_loss, "input_gradient_same_loss is not implemented"
         _, v, _, h, w = context["image"].shape
+
+        input_objective = getattr(self, "input_objective", None)
+        if input_objective is not None:
+            input_objective.begin_step(step=step, context=context)
 
         with torch.enable_grad():
 
@@ -2202,24 +2206,49 @@ class KnnBasedOptimizer(LearnedOptimizer[KnnBasedOptimizerCfg]):
                     # means2d.retain_grad()  # retain grad for means2d grads computation
                     inputs.append(means2d)
 
-                inner_loss = inner_loss_for_input_gradients(
-                    context["image"][:, start:stop],
-                    context_render_output,
-                    reduction=self.cfg.input_gradient_loss_reduction,
-                    with_ssim=self.cfg.input_gradient_with_ssim_loss,
-                )
+                geometry_input_count = len(inputs)
+                objective_parameters = []
+                if input_objective is not None:
+                    objective_parameters = input_objective.trainable_parameters()
+                    inputs.extend(objective_parameters)
+
+                if input_objective is None:
+                    inner_loss = inner_loss_for_input_gradients(
+                        context["image"][:, start:stop],
+                        context_render_output,
+                        reduction=self.cfg.input_gradient_loss_reduction,
+                        with_ssim=self.cfg.input_gradient_with_ssim_loss,
+                    )
+                else:
+                    inner_loss = input_objective.compute_loss(
+                        context=context,
+                        output_renderer=context_render_output,
+                        start=start,
+                        stop=stop,
+                        reduction=self.cfg.input_gradient_loss_reduction,
+                        with_ssim=self.cfg.input_gradient_with_ssim_loss,
+                        fallback_loss=inner_loss_for_input_gradients,
+                    )
                 if self.cfg.opacity_reg_lambda > 0.0:
                     inner_loss = inner_loss + self.cfg.opacity_reg_lambda * torch.sigmoid(opacities_raw).mean()
                 grads = torch.autograd.grad(outputs=inner_loss,
                                             inputs=inputs,
                                             create_graph=False,
                                             retain_graph=False,
+                                            allow_unused=bool(objective_parameters),
                                             )
 
                 gaussian_grads = gaussian_grads + torch.cat(grads[:5], dim=-1)  # [B, G, D]
                 assert not torch.isnan(gaussian_grads).any(), "NaN detected in gaussian_grads"
                 if self.cfg.need_2d_grads:
                     means2d_grads_chunks.append(grads[5])  # [B, V_chunk, N, 2]
+                if input_objective is not None:
+                    input_objective.accumulate_parameter_grads(
+                        grads[geometry_input_count:]
+                    )
+
+            if input_objective is not None:
+                input_objective.end_step()
 
             gaussian_grads = gaussian_grads / nr_chunks
 
@@ -2250,5 +2279,4 @@ class KnnBasedOptimizer(LearnedOptimizer[KnnBasedOptimizerCfg]):
         # Returning also the render output, but it can only be used for visualization,
         # as we already backpropagate gradients through it
         return gaussian_grads_raw, gaussian_grads, grads_sign, context_render_output, means2d_grads
-
 

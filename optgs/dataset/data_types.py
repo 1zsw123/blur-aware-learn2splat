@@ -22,6 +22,13 @@ class BatchedViewsDict(TypedDict, total=False):
     far: Float[Tensor, "batch view"]  # batch view
     index: Int64[Tensor, "batch view"]  # batch view
     scene_scale: Float[Tensor, "batch"]  # batch
+    raw_image: Float[Tensor, "batch view channel height width"]
+    target_confidence: Float[Tensor, "batch view"]
+    known_sharp: Bool[Tensor, "batch view"]
+    direct_supervision: Bool[Tensor, "batch view"]
+    supervision_confidence: Float[Tensor, "batch view"]
+    sampling_mass: Float[Tensor, "batch view"]
+    valid_mask: Bool[Tensor, "batch view 1 height width"]
 
 
 @dataclass
@@ -42,6 +49,17 @@ class BatchedViews:
     scene_scale: Float[Tensor, "batch "] | None
 
     x_flipped: Bool[Tensor, "batch"]
+
+    # Optional blur-aware supervision. These fields are deliberately part of
+    # the view container rather than dataset-specific globals so minibatching
+    # cannot silently desynchronise images, confidences, and camera indices.
+    raw_image: Float[Tensor, "batch _ _ _ _"] | None = None
+    target_confidence: Float[Tensor, "batch _"] | None = None
+    known_sharp: Bool[Tensor, "batch _"] | None = None
+    direct_supervision: Bool[Tensor, "batch _"] | None = None
+    supervision_confidence: Float[Tensor, "batch _"] | None = None
+    sampling_mass: Float[Tensor, "batch _"] | None = None
+    valid_mask: Bool[Tensor, "batch _ 1 _ _"] | None = None
 
     viewpoint_stack: Int64[Tensor, "batch _"] | None = None  # batch subset
     used_indices_list: list[Int64[Tensor, "_"]] | None = None  # list of tensors of shape (subset,)
@@ -64,6 +82,9 @@ class BatchedViews:
         scene_batch = indices.size(0)
         scene_batch_idx = torch.arange(scene_batch, device=indices.device)[:, None]
 
+        def select_optional(value):
+            return None if value is None else value[scene_batch_idx, indices]
+
         return BatchedViews(
             extrinsics=self.extrinsics[scene_batch_idx, indices],
             intrinsics=self.intrinsics[scene_batch_idx, indices],
@@ -72,7 +93,14 @@ class BatchedViews:
             far=self.far[scene_batch_idx, indices],
             index=self.index[scene_batch_idx, indices],
             x_flipped=self.x_flipped,
-            scene_scale=self.scene_scale
+            scene_scale=self.scene_scale,
+            raw_image=select_optional(self.raw_image),
+            target_confidence=select_optional(self.target_confidence),
+            known_sharp=select_optional(self.known_sharp),
+            direct_supervision=select_optional(self.direct_supervision),
+            supervision_confidence=select_optional(self.supervision_confidence),
+            sampling_mass=select_optional(self.sampling_mass),
+            valid_mask=select_optional(self.valid_mask),
         )
 
     @classmethod
@@ -89,7 +117,14 @@ class BatchedViews:
             x_flipped=data.get("x_flipped", torch.zeros(b, dtype=torch.bool, device=device)),
             viewpoint_stack=data.get("viewpoint_stack", None),
             used_indices_list=data.get("used_indices_list", None),
-            scene_scale=data.get("scene_scale", None)
+            scene_scale=data.get("scene_scale", None),
+            raw_image=data.get("raw_image", None),
+            target_confidence=data.get("target_confidence", None),
+            known_sharp=data.get("known_sharp", None),
+            direct_supervision=data.get("direct_supervision", None),
+            supervision_confidence=data.get("supervision_confidence", None),
+            sampling_mass=data.get("sampling_mass", None),
+            valid_mask=data.get("valid_mask", None),
         )
 
     def reset_viewpoint_stack_if_needed(self, strategy, batch_size) -> None:

@@ -88,6 +88,48 @@ def new_load_images_txt(self, input_file):
 SceneManager._load_images_txt = new_load_images_txt
 
 
+def new_load_points3d_txt(self, input_file):
+    """Python-3-safe replacement for pycolmap's legacy text point loader.
+
+    Some pycolmap releases pass ``map`` objects directly to ``np.array``.
+    Modern NumPy treats each map as one object, which corrupts both the XYZ
+    array and the observation tracks. Binary COLMAP models are unaffected.
+    """
+    self.points3D = []
+    self.point3D_ids = []
+    self.point3D_colors = []
+    self.point3D_id_to_point3D_idx = {}
+    self.point3D_id_to_images = {}
+    self.point3D_errors = []
+
+    with open(input_file, "r") as stream:
+        for line in stream:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            data = line.split()
+            point_id = np.uint64(data[0])
+            self.point3D_id_to_point3D_idx[point_id] = len(self.points3D)
+            self.point3D_ids.append(point_id)
+            self.points3D.append([float(value) for value in data[1:4]])
+            self.point3D_colors.append([int(value) for value in data[4:7]])
+            self.point3D_errors.append(float(data[7]))
+            track = np.asarray([int(value) for value in data[8:]], dtype=np.uint32)
+            if track.size % 2:
+                raise ValueError(
+                    f"Malformed COLMAP track for point {int(point_id)} in {input_file}"
+                )
+            self.point3D_id_to_images[point_id] = track.reshape(-1, 2)
+
+    self.points3D = np.asarray(self.points3D, dtype=np.float64)
+    self.point3D_ids = np.asarray(self.point3D_ids, dtype=np.uint64)
+    self.point3D_colors = np.asarray(self.point3D_colors, dtype=np.uint8)
+    self.point3D_errors = np.asarray(self.point3D_errors, dtype=np.float64)
+
+
+SceneManager._load_points3D_txt = new_load_points3d_txt
+
+
 def _get_rel_paths(path_dir: str) -> List[str]:
     """Recursively get relative paths of files in a directory."""
     paths = []

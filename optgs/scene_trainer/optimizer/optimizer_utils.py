@@ -171,6 +171,8 @@ def calc_input_gradients(
     loss_reduction: str = "mean",
     loss_with_ssim: bool = True,
     opacity_reg_lambda: float = 0.0,  # L1 opacity regularization weight (3DGS-MCMC)
+    input_objective=None,
+    step: int | None = None,
 ) -> tuple[Tensor, dict[str, Tensor], dict[str, Tensor | None] | None]:
 
     b, v, _, h, w = iter_context["image"].shape
@@ -222,6 +224,8 @@ def calc_input_gradients(
     # --- Forward + autograd.grad loop ---
     # Per-chunk gradients for the leaf params are summed here, then averaged below.
     accumulated_grads: list[Tensor] | None = None
+    if input_objective is not None:
+        input_objective.begin_step(step=step, context=iter_context)
     with torch.enable_grad():
         assert not torch.is_inference_mode_enabled()
 
@@ -264,8 +268,23 @@ def calc_input_gradients(
                     extrinsics=extrinsics_chunk, intrinsics=intrinsics_chunk,
                     near=near_chunk, far=far_chunk, image_shape=(h, w))
 
-            loss = inner_loss_for_input_gradients(image_chunk, output_renderer,
-                                                  reduction=loss_reduction, with_ssim=loss_with_ssim)
+            if input_objective is None:
+                loss = inner_loss_for_input_gradients(
+                    image_chunk,
+                    output_renderer,
+                    reduction=loss_reduction,
+                    with_ssim=loss_with_ssim,
+                )
+            else:
+                loss = input_objective.compute_loss(
+                    context=iter_context,
+                    output_renderer=output_renderer,
+                    start=start,
+                    stop=stop,
+                    reduction=loss_reduction,
+                    with_ssim=loss_with_ssim,
+                    fallback_loss=inner_loss_for_input_gradients,
+                )
 
             # L1 opacity regularization (3DGS-MCMC) folded into the differentiated loss.
             grad_loss = loss
@@ -276,9 +295,15 @@ def calc_input_gradients(
             if need_2d_grads:
                 assert output_renderer.means2d is not None
                 grad_inputs.append(output_renderer.means2d)
+            geometry_input_count = len(grad_inputs)
+            objective_parameters = []
+            if input_objective is not None:
+                objective_parameters = input_objective.trainable_parameters()
+                grad_inputs.extend(objective_parameters)
 
             chunk_grads = torch.autograd.grad(grad_loss, grad_inputs,
-                                              create_graph=False, retain_graph=False)
+                                              create_graph=False, retain_graph=False,
+                                              allow_unused=bool(objective_parameters))
 
             param_grads = [g.detach() for g in chunk_grads[:5]]
             if accumulated_grads is None:
@@ -295,6 +320,13 @@ def calc_input_gradients(
                     # renderer-agnostic (gsplat=pixel→×w/2,h/2; inria/fastgs already NDC).
                     means2d_grads_all[:, start:stop] = renderer.means2d_grad_to_ndc(
                         chunk_grads[5].detach(), (h, w))
+            if input_objective is not None:
+                input_objective.accumulate_parameter_grads(
+                    chunk_grads[geometry_input_count:]
+                )
+
+    if input_objective is not None:
+        input_objective.end_step()
 
     # --- Average grads for multi-chunk ---
     if nr_chunks > 1:

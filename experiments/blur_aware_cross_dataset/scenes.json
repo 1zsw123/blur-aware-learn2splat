@@ -1,0 +1,116 @@
+{
+  "motion_blurcoffee": {
+    "dataset": "Deblur-NeRF motion",
+    "data_dir": "/srv2/szha0669/blur_slam_exp/data/deblurnerf_extra/real_camera_motion_blur/blurcoffee",
+    "factor": 4,
+    "raw_dir": "/srv2/szha0669/blur_slam_exp/data/deblurnerf_extra/real_camera_motion_blur/blurcoffee/images_4",
+    "raw_mode": "stem",
+    "evssm_dir": "/srv2/szha0669/blur_slam_exp/data/evssm_deblurred_deblurnerf/blurcoffee",
+    "depth_dir": "/srv2/szha0669/blur_slam_exp/data/deblurnerf_extra/real_camera_motion_blur/blurcoffee/depth",
+    "sharp_json": "/srv2/szha0669/blur_slam_exp/outputs/logs/blurcoffee_nima06_sharp_frames.json",
+    "evaluation_manifest": {
+      "path": "/srv2/szha0669/blur_slam_exp/outputs/logs/blurcoffee_nima06_sharp_frames.json",
+      "label": "nima06_sharp_frames"
+    }
+  },
+  "defocus_cisco": {
+    "dataset": "Deblur-NeRF defocus",
+    "data_dir": "/srv2/szha0669/blur_slam_exp/data/i2slam_trigsplat_defocus_images4_r1/defocuscisco_abl1",
+    "factor": 4,
+    "raw_dir": "/srv2/szha0669/blur_slam_exp/data/deblurnerf_extra/real_defocus_blur/defocuscisco/images_4",
+    "raw_mode": "stem",
+    "evssm_dir": "/srv2/szha0669/blur_slam_exp/data/evssm_deblurred_deblurnerf/defocuscisco_unblurslam",
+    "depth_dir": "/srv2/szha0669/blur_slam_exp/data/deblurnerf_extra/real_defocus_blur/defocuscisco/depth",
+    "sharp_json": "/srv2/szha0669/blur_slam_exp/outputs/logs/defocuscisco_nima06_sharp_frames.json",
+    "evaluation_manifest": {
+      "path": "/srv2/szha0669/blur_slam_exp/outputs/logs/defocuscisco_nima06_sharp_frames.json",
+      "label": "nima06_sharp_frames"
+    }
+  },
+  "tum_fr2_xyz": {
+    "dataset": "TUM fr2_xyz (Unblur-SLAM/I2-SLAM mapping protocol)",
+    "benchmark_role": "official_benchmark",
+    "protocol_description": "full 32 Hz stream is consumed by the SLAM tracker; reconstruction optimizes the exact 42 released I2-SLAM mapping keyframes and evaluates their authoritative sharp observations",
+    "data_dir": "/srv2/szha0669/blur_slam_exp/data/i2slam_trigsplat/tum_fr2_xyz_officialkf_abl1",
+    "factor": 1,
+    "raw_dir": "/srv2/szha0669/blur_slam_exp/data/TUM_RGBD/rgbd_dataset_freiburg2_xyz/rgb",
+    "raw_mode": "sorted_index",
+    "evssm_dir": "/srv2/szha0669/datasets/tum_rgbd/evssm_all/rgbd_dataset_freiburg2_xyz/evssm_all",
+    "depth_dir": "/srv2/szha0669/blur_slam_exp/data/i2slam_trigsplat/tum_fr2_xyz_officialkf_abl1/depth",
+    "sharp_json": "/srv2/szha0669/blur_slam_exp/outputs/logs/tum_fr2xyz_officialkf_nima06_sharp_frames.json",
+    "sharp_supervision_policy": "sharp_json_only",
+    "camera_preprocess": {
+      "distortion": [0.2312, -0.7849, -0.0033, -0.0001, 0.9172],
+      "resize": [528, 400],
+      "crop": [8, 8, 8, 8],
+      "undistort_depth": true
+    }
+  },
+  "tum_fr2_xyz_full": {
+    "dataset": "TUM fr2_xyz full-stream optimization diagnostic",
+    "benchmark_role": "nonbenchmark_diagnostic",
+    "protocol_description": "diagnostic only: optimizes the complete associated 32 Hz stream and evaluates the released 42 indices; this is not the Unblur-SLAM/I2-SLAM mapping protocol",
+    "data_dir": "/srv2/szha0669/blur_slam_exp/data/i2slam_trigsplat/tum_fr2_xyz_unblurslam_stream_abl1",
+    "factor": 1,
+    "raw_dir": "/srv2/szha0669/blur_slam_exp/data/TUM_RGBD/rgbd_dataset_freiburg2_xyz/rgb",
+    "raw_mode": "sorted_index",
+    "evssm_dir": "/srv2/szha0669/blur_slam_exp/data/i2slam_trigsplat/tum_fr2_xyz_unblurslam_stream_abl1/images",
+    "depth_dir": "/srv2/szha0669/blur_slam_exp/data/i2slam_trigsplat/tum_fr2_xyz_unblurslam_stream_abl1/depth",
+    "depth_convention": "z",
+    "sharp_json": "/srv2/szha0669/blur_slam_exp/outputs/logs/tum_fr2xyz_full_nima06_sharp_frames.json",
+    "frame_protocol": {
+      "type": "tum_i2slam_32hz",
+      "tum_dir": "/srv2/szha0669/blur_slam_exp/data/TUM_RGBD/rgbd_dataset_freiburg2_xyz",
+      "frame_rate": 32.0,
+      "association_max_dt": 0.08,
+      "evaluation_stream_indices": [
+        0, 9, 15, 49, 58, 72, 89, 109, 125, 166, 220, 319, 374,
+        407, 435, 470, 483, 523, 568, 704, 750, 789, 827, 926, 1004,
+        1160, 1251, 1342, 1409, 1460, 1553, 1692, 1795, 1889, 1978,
+        2055, 2206, 2282, 2358, 2425, 2590, 2764
+      ]
+    },
+    "camera_preprocess": {
+      "distortion": [0.2312, -0.7849, -0.0033, -0.0001, 0.9172],
+      "resize": [528, 400],
+      "crop": [8, 8, 8, 8],
+      "undistort_depth": true
+    }
+  },
+  "tum_fr2_xyz_framecrafter": {
+    "dataset": "I2-SLAM TUM + confidence-weighted FrameCrafter train-only views",
+    "benchmark_role": "official_benchmark_with_train_only_augmentation",
+    "protocol_description": "optimize the 42 released mapping keyframes plus five confidence-weighted FrameCrafter train-only views; only the observed NIMA-sharp frame receives w10; evaluate the same 42 authoritative RAW observations as the unaugmented protocol",
+    "data_dir": "/srv2/szha0669/blur_slam_exp/data/i2slam_trigsplat_framecrafter_i2slamsparsectxv5_full_s1/tum_fr2_xyz_officialkf_abl1",
+    "factor": 1,
+    "raw_dir": "/srv2/szha0669/blur_slam_exp/data/TUM_RGBD/rgbd_dataset_freiburg2_xyz/rgb",
+    "raw_mode": "sorted_index",
+    "raw_fallback_dir": "/srv2/szha0669/blur_slam_exp/data/i2slam_trigsplat_framecrafter_i2slamsparsectxv5_full_s1/tum_fr2_xyz_officialkf_abl1/images",
+    "evssm_dir": "/srv2/szha0669/blur_slam_exp/data/i2slam_trigsplat_framecrafter_i2slamsparsectxv5_full_s1/tum_fr2_xyz_officialkf_abl1/images",
+    "depth_dir": "/srv2/szha0669/blur_slam_exp/data/i2slam_trigsplat_framecrafter_i2slamsparsectxv5_full_s1/tum_fr2_xyz_officialkf_abl1/depth",
+    "sharp_json": "/srv2/szha0669/blur_slam_exp/outputs/logs/tum_fr2xyz_officialkf_nima06_sharp_frames.json",
+    "sharp_supervision_policy": "sharp_json_only",
+    "auxiliary_supervision_manifest": "/srv2/szha0669/blur_slam_exp/repos/learn2splat-official-space/experiments/blur_aware_cross_dataset/tum_fr2_xyz_framecrafter_auxiliary_confidence.json",
+    "evaluation_manifest": {
+      "path": "/srv2/szha0669/blur_slam_exp/repos/learn2splat-official-space/experiments/blur_aware_cross_dataset/tum_fr2_xyz_official_mapping_keyframes.json",
+      "label": "official_mapping_keyframes_42"
+    },
+    "train_only_manifest": "/srv2/szha0669/blur_slam_exp/data/i2slam_trigsplat_framecrafter_i2slamsparsectxv5_full_s1/tum_fr2_xyz_officialkf_abl1/train_only_images.json",
+    "camera_preprocess_by_camera_id": {
+      "1": {
+        "pre_crop": [0, 0, 0, 0],
+        "resize": [528, 400],
+        "crop": [8, 8, 8, 8],
+        "distortion": [0.2312, -0.7849, -0.0033, -0.0001, 0.9172],
+        "undistort_depth": true
+      },
+      "2": {
+        "pre_crop": [96, 0, 96, 0],
+        "resize": [528, 400],
+        "crop": [8, 8, 8, 8],
+        "distortion": [],
+        "undistort_depth": false
+      }
+    }
+  }
+}

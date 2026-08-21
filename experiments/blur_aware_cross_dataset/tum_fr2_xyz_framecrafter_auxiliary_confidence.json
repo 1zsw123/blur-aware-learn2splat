@@ -1,0 +1,28 @@
+{
+  "schema": "framecrafter-auxiliary-supervision-v1",
+  "confidence_formula": "0.25 * bidirectional_depth_overlap * depth_confidence * sqrt(dino_generated_left * dino_generated_right) * exp(-abs(log(sharpness_ratio)))",
+  "confidence_cap": 0.25,
+  "uses_hidden_target": false,
+  "views": [
+    {
+      "image_name": "fc_000906_001006_a050",
+      "confidence": 0.189860294
+    },
+    {
+      "image_name": "fc_001084_001247_a050",
+      "confidence": 0.162390574
+    },
+    {
+      "image_name": "fc_001341_001436_a050",
+      "confidence": 0.175547854
+    },
+    {
+      "image_name": "fc_001697_001836_a050",
+      "confidence": 0.193822174
+    },
+    {
+      "image_name": "fc_002033_002123_a050",
+      "confidence": 0.190400331
+    }
+  ]
+}

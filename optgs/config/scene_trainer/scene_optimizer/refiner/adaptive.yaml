@@ -1,0 +1,42 @@
+name: adaptive
+
+do_densify: true
+# Adaptive capacity must not inherit 3DGS's absolute opacity/scale pruning
+# thresholds. Near the checkpoint capacity, the correct scale-free action is
+# to hold the structure fixed; rank-based replacement can be added separately.
+do_prune: false
+do_opacity_reset: false
+
+# Absolute safety boundary only. active_budget is the Learn2Splat checkpoint's
+# reference active set, not a scene cap. The controller corrects it for current
+# visibility and unresolved residual support at every structural event.
+cap_max: 1500000
+active_budget: 100000
+support_conditioned_cap: true
+
+# Dimensionless bounds on one structural update. The actual fraction balances
+# inverse-participation residual support against current capacity pressure.
+min_growth_fraction: 0.0
+max_growth_fraction: 0.5
+
+# These values are replaced by normalized run-length scheduling in the API.
+pause_refine_after_reset: 0
+refine_every: 100
+reset_every: 999999999
+refine_start_iter: 500
+refine_stop_iter: 15000
+refine_scale2d_stop_iter: 0
+
+# Raw gradient/scale thresholds are unused by adaptive growth.
+grow_grad2d: 0.0
+grow_scale3d: 0.0
+prune_scale3d: 0.1
+prune_scale2d: 0.15
+grow_scale2d: 0.05
+min_opacity: 0.005
+prune_zero_radii: false
+
+reduce_opacity: false
+reduce_factor: 0.0
+reduce_every: 0
+fallback_means_lr: 0.0

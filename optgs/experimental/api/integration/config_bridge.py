@@ -29,6 +29,14 @@ def _load_ckpt_cfg_cached(cfg_path_str: str):
     return _load_checkpoint_cfg(Path(cfg_path_str))
 
 
+def get_checkpoint_scalar(cfg_path: Path, key: str, default):
+    """Read one scalar from the safely loaded checkpoint configuration."""
+    from omegaconf import OmegaConf
+
+    cfg = _load_ckpt_cfg_cached(str(cfg_path))
+    return OmegaConf.select(cfg, key, default=default)
+
+
 def get_scene_trainer_scalar(cfg_path: Path, key: str, default):
     """Read ``scene_trainer.<key>`` from a checkpoint config (or ``default``).
 
@@ -36,10 +44,7 @@ def get_scene_trainer_scalar(cfg_path: Path, key: str, default):
     config rather than the optimizer cfg: ``num_update_steps``,
     ``iter_batch_size``, ``sh_degree_interval``.
     """
-    from omegaconf import OmegaConf
-
-    cfg = _load_ckpt_cfg_cached(str(cfg_path))
-    return OmegaConf.select(cfg, f"scene_trainer.{key}", default=default)
+    return get_checkpoint_scalar(cfg_path, f"scene_trainer.{key}", default)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from torch import nn
@@ -331,7 +336,7 @@ def build_refiner_cfg(strategy: str, num_refine: int) -> "BaseStrategyCfg":
     from optgs.config import load_typed_config
     from optgs.scene_trainer.adc.fastgs import FastGSStrategyCfg
     from optgs.scene_trainer.adc.mcmc import McmcStrategyCfg
-    from optgs.scene_trainer.adc.vanilla import VanillaStrategyCfg
+    from optgs.scene_trainer.adc.vanilla import AdaptiveStrategyCfg, VanillaStrategyCfg
 
     cfg_dir = Path(optgs.__file__).resolve().parent / "config"
     yaml_path = (
@@ -345,7 +350,12 @@ def build_refiner_cfg(strategy: str, num_refine: int) -> "BaseStrategyCfg":
         )
     # Build the matching StrategyCfg arm (by name) so the strategy-specific fields are present;
     # a bare BaseStrategyCfg would lack noise_lr (mcmc) / grad_abs_thresh (fastgs).
-    arm = {"mcmc": McmcStrategyCfg, "fastgs": FastGSStrategyCfg}.get(strategy, VanillaStrategyCfg)
+    arm = {
+        "mcmc": McmcStrategyCfg,
+        "fastgs": FastGSStrategyCfg,
+        "adaptive": AdaptiveStrategyCfg,
+        "adaptive_legacy": AdaptiveStrategyCfg,
+    }.get(strategy, VanillaStrategyCfg)
     cfg = load_typed_config(OmegaConf.load(yaml_path), arm)
 
     # Non-densifying strategies (e.g. "none") leave the Gaussian set fixed — no rescale.
@@ -354,6 +364,14 @@ def build_refiner_cfg(strategy: str, num_refine: int) -> "BaseStrategyCfg":
 
     n = max(1, int(num_refine))
     cap = cfg.cap_max if (cfg.cap_max and cfg.cap_max > 0) else 1_500_000
+    if cfg.name == "adaptive":
+        return replace(
+            cfg,
+            refine_start_iter=max(1, round(0.05 * n)),
+            refine_every=max(1, round(0.10 * n)),
+            refine_stop_iter=max(1, round(0.80 * n)),
+            cap_max=cap,
+        )
     return replace(
         cfg,
         refine_start_iter=max(1, round(0.1 * n)),
@@ -363,7 +381,12 @@ def build_refiner_cfg(strategy: str, num_refine: int) -> "BaseStrategyCfg":
     )
 
 
-def build_adam_baseline(num_refine: int, adc: str = "none") -> "nn.Module":
+def build_adam_baseline(
+    num_refine: int,
+    adc: str = "none",
+    *,
+    reward_conditioned: bool = False,
+) -> "nn.Module":
     """Build the codebase's 3DGS Adam optimizer for a fair baseline comparison.
 
     Uses the bundled ``scene_optimizer=3dgs`` config — gsplat's example
@@ -402,7 +425,18 @@ def build_adam_baseline(num_refine: int, adc: str = "none") -> "nn.Module":
                 composed.refiner[flag] = False
     else:
         # Swap in the chosen ADC strategy (schedule scaled to num_refine).
-        composed.refiner = asdict(build_refiner_cfg(adc, num_refine))
+        refiner = build_refiner_cfg(adc, num_refine)
+        if reward_conditioned:
+            from dataclasses import replace
+
+            from optgs.scene_trainer.adc.vanilla import AdaptiveStrategyCfg
+
+            if not isinstance(refiner, AdaptiveStrategyCfg):
+                raise OptGSError(
+                    "reward-conditioned densification requires adc='adaptive'"
+                )
+            refiner = replace(refiner, reward_conditioned=True)
+        composed.refiner = asdict(refiner)
     try:
         adam_cfg = load_typed_config(composed, AdamOptimizerCfg)
     except Exception as e:

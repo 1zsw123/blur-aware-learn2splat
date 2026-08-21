@@ -25,12 +25,12 @@ from optgs.model.decoder.decoder import DecoderOutput
 from optgs.model.types import Gaussians
 # Per-strategy configs imported from their leaf submodules (not the adc package) to avoid the
 # adc/__init__ <-> optimizer import cycle that the lazy imports below guard against.
-from optgs.scene_trainer.adc.vanilla import VanillaStrategyCfg
+from optgs.scene_trainer.adc.vanilla import AdaptiveStrategyCfg, VanillaStrategyCfg
 from optgs.scene_trainer.adc.mcmc import McmcStrategyCfg
 from optgs.scene_trainer.adc.fastgs import FastGSStrategyCfg
 
 # Discriminated by `name`; mirrors adc.StrategyCfg (kept inline here to dodge the package import).
-StrategyCfg = VanillaStrategyCfg | McmcStrategyCfg | FastGSStrategyCfg
+StrategyCfg = VanillaStrategyCfg | AdaptiveStrategyCfg | McmcStrategyCfg | FastGSStrategyCfg
 from optgs.scene_trainer.initializer.initializer import InitializerOutput
 from optgs.scene_trainer.initializer import InitializerCfg
 from optgs.misc.detaching_cpu_list import DetachingCPUList
@@ -285,6 +285,7 @@ class Optimizer(nn.Module, ABC, Generic[T]):
 
     def on_scene_start(self, optimizer_input: OptimizerInput) -> None:
         self.benchmarker.clear_history()  # isolate this scene's per-iteration timing
+        self.capacity_events = []
         self._on_scene_start_impl(optimizer_input)
 
     def _on_scene_start_impl(self, optimizer_input: OptimizerInput) -> None:
@@ -404,10 +405,27 @@ class Optimizer(nn.Module, ABC, Generic[T]):
         """
         # Lazy import to avoid circular dependency
         from optgs.scene_trainer.adc import post_backward
+        from optgs.scene_trainer.adc.vanilla import (
+            AdaptiveStrategyCfg,
+            set_adaptive_densification_feedback,
+        )
 
         visibility_mask = meta["visibility_filter"]  # [B, V, N]
         radii_2d = meta["radii"].float()  # [B, V, N, 2]
         means2d_grads = meta["means_2d_grads"]  # [B, V, N, 2] or None
+
+        if isinstance(self.cfg.refiner, AdaptiveStrategyCfg):
+            objective = getattr(self, "input_objective", None)
+            feedback_getter = getattr(
+                objective, "densification_feedback", None
+            )
+            feedback = (
+                None
+                if feedback_getter is None
+                else feedback_getter()
+            )
+            if feedback is not None:
+                set_adaptive_densification_feedback(adc_state, feedback)
         
         # means lr for MCMC noise injection
         # check if optimizer has means_lr_scheduler
@@ -434,6 +452,52 @@ class Optimizer(nn.Module, ABC, Generic[T]):
             h=h,
             lr=lr
         )
+
+        if (
+            self.cfg.refiner.name == "adaptive"
+            and getattr(adc_state, "last_event_step", -1) == i
+        ):
+            self.capacity_events.append(
+                {
+                    "step": int(i),
+                    "support_fraction": float(adc_state.last_support_fraction),
+                    "rewarded_support_fraction": float(
+                        adc_state.last_rewarded_support_fraction
+                    ),
+                    "capacity_pressure": float(adc_state.last_capacity_pressure),
+                    "growth_fraction": float(adc_state.last_growth_fraction),
+                    "visible_fraction": float(adc_state.last_visible_fraction),
+                    "growth_budget": int(adc_state.last_growth_budget),
+                    "base_cap": int(adc_state.last_base_cap),
+                    "demand_multiplier": float(
+                        adc_state.last_demand_multiplier
+                    ),
+                    "effective_cap": int(adc_state.last_effective_cap),
+                    "reward_feedback_revision": int(
+                        adc_state.consumed_feedback_revision
+                    ),
+                    "reward_used": bool(adc_state.last_reward_used),
+                    "probe_psnr_delta": float(
+                        adc_state.last_probe_psnr_delta
+                    ),
+                    "probe_surplus_delta": float(
+                        adc_state.last_probe_surplus_delta
+                    ),
+                    "quality_reward": float(adc_state.last_quality_reward),
+                    "complexity_cost": float(adc_state.last_complexity_cost),
+                    "densification_reward": float(
+                        adc_state.last_densification_reward
+                    ),
+                    "densification_reward_ema": float(
+                        adc_state.last_densification_reward_ema
+                    ),
+                    "action_factor": float(adc_state.last_action_factor),
+                    "cloned": int(nr_cloned),
+                    "split": int(nr_splitted),
+                    "pruned": int(nr_pruned),
+                    "num_gaussians": int(gaussians.means.shape[1]),
+                }
+            )
         
         self.benchmarker.record("cloned", nr_cloned)
         self.benchmarker.record("splitted", nr_splitted)

@@ -52,6 +52,7 @@ class OptGS:
         iter_batch_size: int | None = None,
         opt_batch_size: int | None = None,
         opt_batch_strategy: str | None = None,
+        rollout_horizon: int | None = None,
         background_color: Sequence[float] | None = None,
         rasterize_mode: str | None = None,
         eps2d: float | None = None,
@@ -74,12 +75,14 @@ class OptGS:
         self.iter_batch_size = iter_batch_size
         self.opt_batch_size = opt_batch_size
         self.opt_batch_strategy = opt_batch_strategy
+        self.rollout_horizon = rollout_horizon
 
         from optgs.config import _find_config_for_checkpoint
         from optgs.experimental.api.integration.config_bridge import (
             build_decoder,
             build_optimizer,
             build_optimizer_cfg,
+            get_checkpoint_scalar,
             get_scene_trainer_scalar,
             load_optimizer_state,
         )
@@ -95,9 +98,40 @@ class OptGS:
                 f"(looked for <ckpt>/../../config.yaml and the wandb "
                 f"latest-run fallback). OptGS needs the training config to "
                 f"rebuild the optimizer architecture."
-            )
+        )
 
         opt_cfg, num_update_steps = build_optimizer_cfg(cfg_path)
+        self.checkpoint_num_refine = (
+            None if num_update_steps is None else int(num_update_steps)
+        )
+        if self.rollout_horizon is None:
+            self.rollout_horizon = self.checkpoint_num_refine or 0
+        self.rollout_horizon = int(self.rollout_horizon)
+        if self.rollout_horizon < 0:
+            raise OptGSError("rollout_horizon must be zero or positive")
+        self.reference_context_views = int(
+            get_checkpoint_scalar(
+                cfg_path,
+                "dataset.view_sampler.num_context_views",
+                1,
+            )
+        )
+        reference_init = get_checkpoint_scalar(
+            cfg_path,
+            "scene_trainer.scene_initializer.eval_fixed_gaussians_num",
+            None,
+        )
+        if reference_init is None:
+            reference_init = get_checkpoint_scalar(
+                cfg_path,
+                "scene_trainer.scene_initializer.train_fixed_gaussians_num",
+                getattr(opt_cfg, "max_active_gaussians", 0),
+            )
+        self.reference_initial_gaussians = int(reference_init)
+        if self.reference_context_views <= 0:
+            raise OptGSError("checkpoint reference context-view count must be positive")
+        if self.reference_initial_gaussians <= 0:
+            raise OptGSError("checkpoint reference Gaussian count must be positive")
 
         if not getattr(opt_cfg, "init_state_wo_features", False):
             warnings.warn(
@@ -161,10 +195,16 @@ class OptGS:
             self.opt_batch_strategy = str(
                 get_scene_trainer_scalar(cfg_path, "opt_batch_strategy", "random")
             )
-        if self.opt_batch_strategy not in ("random", "sequential", "fps"):
+        if self.opt_batch_strategy not in (
+            "random",
+            "sequential",
+            "fps",
+            "supervision_fps",
+        ):
             raise OptGSError(
                 f"opt_batch_strategy={self.opt_batch_strategy!r} is not supported "
-                f"by the API (supported: 'random', 'sequential', 'fps'). Pass "
+                "by the API (supported: 'random', 'sequential', 'fps', "
+                "'supervision_fps'). Pass "
                 f"OptGS(opt_batch_strategy='random')."
             )
 
@@ -179,6 +219,15 @@ class OptGS:
         self._context = None
         self._init_output = None
         self._refined: "Gaussians | None" = None
+        self._input_objective = None
+        self.capacity_events: list[dict] = []
+        self.optimizer_transitions: list[dict] = []
+        self._reset_supervision_sampler()
+
+    def _reset_supervision_sampler(self) -> None:
+        self._supervision_draws = 0
+        self._supervision_sharp_draws = 0
+        self._supervision_pool_stacks: dict[str, torch.Tensor] = {}
 
     # ------------------------------------------------------------------
     # Ingest
@@ -210,6 +259,7 @@ class OptGS:
             device=self.device,
             dtype=self.dtype,
         )
+        self._reset_supervision_sampler()
         self._scene_ref = scene
         self._initialized = True
         return self
@@ -241,6 +291,7 @@ class OptGS:
         self._context = batched_views_from_cameras(
             list(cameras), scene_scale=scene_scale, device=self.device, dtype=self.dtype
         )
+        self._reset_supervision_sampler()
         self._scene_ref = None
         self._initialized = True
         return self
@@ -272,6 +323,7 @@ class OptGS:
             depths=None,
         )
         self._context = bv
+        self._reset_supervision_sampler()
         self._scene_ref = None
         self._initialized = True
         return self
@@ -296,6 +348,9 @@ class OptGS:
         if bs <= 0 or bs >= v:
             return views
 
+        if self.opt_batch_strategy == "supervision_fps":
+            return self._supervision_fps_minibatch(views, bs)
+
         views.reset_viewpoint_stack_if_needed(self.opt_batch_strategy, bs)
         stack = views.viewpoint_stack  # [B, V_stack]
 
@@ -317,7 +372,155 @@ class OptGS:
             views.viewpoint_stack = stack[:, bs:]
         return views.batchify_views(idx)
 
-    def configure_adc(self, strategy: str) -> "OptGS":
+    def _draw_fps_pool(
+        self,
+        views,
+        pool: torch.Tensor,
+        count: int,
+        key: str,
+        selected: list[int],
+    ) -> list[int]:
+        """Draw unique views while cycling every member of one quality pool."""
+        if count <= 0 or pool.numel() == 0:
+            return []
+        stack = self._supervision_pool_stacks.get(key)
+        if stack is None:
+            stack = pool.clone()
+        result: list[int] = []
+        selected_set = set(selected)
+        positions = views.extrinsics[0, :, :3, 3]
+        while len(result) < count:
+            if stack.numel() == 0:
+                stack = pool.clone()
+            keep = torch.tensor(
+                [int(index) not in selected_set for index in stack],
+                device=stack.device,
+                dtype=torch.bool,
+            )
+            candidates = stack[keep]
+            if candidates.numel() == 0:
+                break
+            if selected:
+                selected_positions = positions[
+                    torch.tensor(selected, device=positions.device)
+                ]
+                distances = torch.cdist(
+                    positions[candidates], selected_positions
+                ).amin(dim=1)
+                chosen = int(candidates[torch.argmax(distances)])
+            else:
+                chosen = int(
+                    candidates[
+                        torch.randint(
+                            candidates.numel(), (1,), device=candidates.device
+                        )
+                    ]
+                )
+            selected.append(chosen)
+            selected_set.add(chosen)
+            result.append(chosen)
+            stack = stack[stack != chosen]
+        self._supervision_pool_stacks[key] = stack
+        return result
+
+    def _draw_supervision_pool(
+        self,
+        views,
+        pool: torch.Tensor,
+        count: int,
+        key: str,
+        selected: list[int],
+    ) -> list[int]:
+        """Draw a quality-pool quota, repeating only when quota exceeds size.
+
+        FPS supplies every distinct camera first. A repeated observation then
+        represents additional supervision mass, which is required when a rare
+        sharp pool contains fewer views than its w10 batch quota.
+        """
+        if count <= 0 or pool.numel() == 0:
+            return []
+        distinct = self._draw_fps_pool(
+            views,
+            pool,
+            min(count, int(pool.numel())),
+            key,
+            selected,
+        )
+        if len(distinct) != min(count, int(pool.numel())):
+            raise OptGSError(f"failed to draw distinct views from {key} pool")
+        result = list(distinct)
+        while len(result) < count:
+            chosen = distinct[(len(result) - len(distinct)) % len(distinct)]
+            selected.append(chosen)
+            result.append(chosen)
+        return result
+
+    def _supervision_fps_minibatch(self, views, batch_size: int):
+        """Realize the scene-level supervision risk through view sampling.
+
+        ``sampling_mass`` defines the desired expected exposure. Known-sharp
+        and other views are scheduled by cumulative weighted fair queuing;
+        FPS inside each pool preserves camera-space coverage. This makes a
+        rare sharp frame's w10 contract real even in thousand-frame streams,
+        without a dataset label or a frame-count threshold.
+        """
+        if views.extrinsics.shape[0] != 1:
+            raise OptGSError("supervision_fps currently requires scene batch size 1")
+        if views.known_sharp is None or views.sampling_mass is None:
+            raise OptGSError(
+                "supervision_fps requires known_sharp and sampling_mass"
+            )
+        sharp_mask = views.known_sharp[0].bool()
+        mass = views.sampling_mass[0].float().clamp_min(0.0)
+        if mass.shape != sharp_mask.shape or not bool(torch.isfinite(mass).all()):
+            raise OptGSError("invalid supervision sampling mass")
+        sharp_pool = torch.nonzero(sharp_mask, as_tuple=False).flatten()
+        other_pool = torch.nonzero(~sharp_mask, as_tuple=False).flatten()
+        total_mass = float(mass.sum())
+        if total_mass <= 0.0:
+            raise OptGSError("supervision sampling mass must have positive sum")
+        sharp_fraction = float(mass[sharp_mask].sum()) / total_mass
+
+        draws_after = self._supervision_draws + batch_size
+        target_sharp_after = round(draws_after * sharp_fraction)
+        sharp_slots = max(
+            0,
+            min(batch_size, target_sharp_after - self._supervision_sharp_draws),
+        )
+        if sharp_pool.numel() == 0:
+            sharp_slots = 0
+        if other_pool.numel() == 0:
+            sharp_slots = batch_size
+
+        selected: list[int] = []
+        sharp_selected = self._draw_supervision_pool(
+            views,
+            sharp_pool,
+            sharp_slots,
+            "sharp",
+            selected,
+        )
+        other_slots = batch_size - sharp_slots
+        other_selected = self._draw_supervision_pool(
+            views,
+            other_pool,
+            other_slots,
+            "other",
+            selected,
+        )
+        if len(selected) != batch_size:
+            raise OptGSError(
+                f"supervision_fps selected {len(selected)} of {batch_size} views"
+            )
+
+        self._supervision_draws += batch_size
+        self._supervision_sharp_draws += len(sharp_selected)
+        idx = torch.tensor(selected, device=sharp_mask.device).unsqueeze(0)
+        return views.batchify_views(idx)
+
+    def configure_adc(
+        self, strategy: str, *, reward_conditioned: bool = False
+    ) -> "OptGS":
         """Set the ADC (densification) strategy for subsequent ``optimize`` runs.
 
         ``strategy`` is a raw refiner name: ``"none"`` (the default the checkpoints
@@ -326,10 +529,81 @@ class OptGS:
         (see ``build_refiner_cfg``). Call before ``optimize``/``optimize_iter`` — the
         ADC state is created in ``on_scene_start`` and gated on the refiner's flags.
         """
-        from optgs.experimental.api.integration.config_bridge import build_refiner_cfg
+        from dataclasses import replace
 
-        self.optimizer.cfg.refiner = build_refiner_cfg(strategy, self.num_refine)
+        from optgs.experimental.api.integration.config_bridge import build_refiner_cfg
+        from optgs.scene_trainer.adc.vanilla import AdaptiveStrategyCfg
+
+        refiner = build_refiner_cfg(strategy, self.num_refine)
+        if isinstance(refiner, AdaptiveStrategyCfg):
+            # This is an architectural limit of the released learned optimizer,
+            # not a dataset-tuned point budget. The controller converts it to a
+            # scene-wide capacity using online visibility statistics.
+            active_budget = int(
+                getattr(self.optimizer.cfg, "max_active_gaussians", refiner.active_budget)
+            )
+            refiner = replace(
+                refiner,
+                active_budget=active_budget,
+                reward_conditioned=bool(reward_conditioned),
+            )
+        elif reward_conditioned:
+            raise OptGSError(
+                "reward-conditioned densification requires adc='adaptive'"
+            )
+        self.optimizer.cfg.refiner = refiner
         return self
+
+    def configure_input_objective(self, objective) -> "OptGS":
+        """Attach an optional per-scene objective used to form optimizer gradients.
+
+        The learned optimizer remains unchanged: it still consumes per-Gaussian
+        gradients and predicts the Gaussian updates. The objective only defines
+        which differentiable image-formation loss produces those gradients. A
+        value of ``None`` restores the checkpoint's original photometric loss.
+        """
+        self._input_objective = objective
+        if objective is not None:
+            objective.to(device=self.device, dtype=self.dtype)
+            objective.configure_run(num_steps=self.num_refine)
+        return self
+
+    def _restart_learned_rollout(self, opt, inp):
+        """Restart checkpoint-horizon state while preserving the current scene.
+
+        The released optimizer's recurrent state was trained on finite
+        rollouts. Long scenes use several architecture-matched rollouts rather
+        than extrapolating that state indefinitely. Scene Gaussians, the BPN,
+        supervision scheduler, and accumulated capacity receipts are retained;
+        only the learned latent, gradient normalizer, and ADC observation state
+        are refreshed. If a checkpoint enables time encoding, its local time is
+        reset by the fresh ``OptimizerOutput`` as well.
+        """
+        from optgs.scene_trainer.initializer.initializer import InitializerOutput
+        from optgs.scene_trainer.optimizer.optimizer import OptimizerOutput
+        from optgs.scene_trainer.adc.vanilla import (
+            transfer_adaptive_reward_state,
+        )
+
+        capacity_events = list(getattr(opt, "capacity_events", []))
+        current = inp.prev_output.gaussians
+        previous_adc_state = getattr(inp.prev_output.state, "adc_state", None)
+        opt.on_scene_end()
+        inp.prev_output = InitializerOutput(
+            gaussians=current,
+            features=None,
+            depths=None,
+        )
+        opt.on_scene_start(inp)
+        transfer_adaptive_reward_state(
+            previous_adc_state,
+            getattr(inp.prev_output.state, "adc_state", None),
+        )
+        if hasattr(opt, "capacity_events"):
+            opt.capacity_events = capacity_events
+        restarted = OptimizerOutput.empty(t=0)
+        restarted.T = self.rollout_horizon
+        return restarted
 
     @torch.no_grad()
     def optimize(self, scene: object | None = None, *, optimizer=None):
@@ -351,6 +625,7 @@ class OptGS:
             raise OptGSError("call initialize(scene) before optimize().")
 
         opt = optimizer if optimizer is not None else self.optimizer
+        opt.input_objective = self._input_objective
 
         from optgs.scene_trainer.optimizer.optimizer import (
             OptimizerInput,
@@ -383,6 +658,12 @@ class OptGS:
         except Exception:
             pass
         for step in steps:
+            if (
+                step > 0
+                and self.rollout_horizon > 0
+                and step % self.rollout_horizon == 0
+            ):
+                out = self._restart_learned_rollout(opt, inp)
             # Feed the optimizer a fresh view minibatch each step (the regime it
             # was trained with); full_context/full_target stay the whole scene.
             batch = self._view_minibatch(self._context)
@@ -409,7 +690,13 @@ class OptGS:
             return self._scene_ref.gaussians
         return final
 
-    def optimize_iter(self, *, optimizer=None):
+    def optimize_iter(
+        self,
+        *,
+        optimizer=None,
+        fallback_optimizer=None,
+        switch_step: int | None = None,
+    ):
         """Generator form of :meth:`optimize`: yields ``(step, gaussians)`` after
         each optimization step.
 
@@ -422,6 +709,15 @@ class OptGS:
             raise OptGSError("call initialize(...) before optimize_iter().")
 
         opt = optimizer if optimizer is not None else self.optimizer
+        opt.input_objective = self._input_objective
+        if fallback_optimizer is not None:
+            if switch_step is None or not 0 < switch_step < self.num_refine:
+                raise OptGSError(
+                    "fallback_optimizer requires 0 < switch_step < num_refine"
+                )
+            fallback_optimizer.input_objective = self._input_objective
+        self.capacity_events = []
+        self.optimizer_transitions = []
 
         from optgs.scene_trainer.optimizer.optimizer import (
             OptimizerInput,
@@ -459,6 +755,52 @@ class OptGS:
         try:
             for step in range(self.num_refine):
                 with torch.no_grad():
+                    if fallback_optimizer is not None and step == switch_step:
+                        from optgs.scene_trainer.adc.vanilla import (
+                            transfer_adaptive_reward_state,
+                        )
+
+                        self.capacity_events.extend(
+                            list(getattr(opt, "capacity_events", []))
+                        )
+                        current = inp.prev_output.gaussians
+                        previous_adc_state = getattr(
+                            inp.prev_output.state, "adc_state", None
+                        )
+                        opt.on_scene_end()
+                        from optgs.scene_trainer.initializer.initializer import (
+                            InitializerOutput,
+                        )
+
+                        inp.prev_output = InitializerOutput(
+                            gaussians=current,
+                            features=None,
+                            depths=None,
+                        )
+                        opt = fallback_optimizer
+                        opt.validate_input(inp)
+                        opt.on_scene_start(inp)
+                        transfer_adaptive_reward_state(
+                            previous_adc_state,
+                            getattr(inp.prev_output.state, "adc_state", None),
+                        )
+                        out = OptimizerOutput.empty(t=0)
+                        out.T = self.num_refine - step
+                        self.optimizer_transitions.append(
+                            {
+                                "step": step,
+                                "from": type(self.optimizer).__name__,
+                                "to": type(opt).__name__,
+                                "reason": "released_checkpoint_rollout_horizon",
+                            }
+                        )
+                    if (
+                        step > 0
+                        and self.rollout_horizon > 0
+                        and step % self.rollout_horizon == 0
+                        and opt is self.optimizer
+                    ):
+                        out = self._restart_learned_rollout(opt, inp)
                     # Fresh view minibatch each step (the regime the optimizer
                     # was trained with); full_context/target stay the whole scene.
                     batch = self._view_minibatch(self._context)
@@ -476,6 +818,7 @@ class OptGS:
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
                 opt.on_scene_end()
+            self.capacity_events.extend(list(getattr(opt, "capacity_events", [])))
             self._refined = inp.prev_output.gaussians
 
     def export_ply(self, path: str) -> None:

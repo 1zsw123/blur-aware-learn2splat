@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -26,12 +27,62 @@ class VanillaStrategyCfg(BaseStrategyCfg):
 
 
 @dataclass
+class AdaptiveStrategyCfg(BaseStrategyCfg):
+    """Scale-free ADC driven by the support of blur-aware screen gradients.
+
+    The policy has no raw gradient threshold. It balances normalized residual
+    demand against occupied capacity and derives its scene cap from the
+    fraction that is active in the current view batch.
+    """
+
+    name: Literal["adaptive"]
+    active_budget: int
+    support_conditioned_cap: bool
+    min_growth_fraction: float
+    max_growth_fraction: float
+    reward_conditioned: bool = False
+    reward_ema_decay: float = 0.5
+
+
+@dataclass
 class VanillaStrategyState(GenericStrategyState):
     # for densification and pruning
     grad2d_norm_accum: Float[Tensor, "gaussian"]  # running accum of the norm of the image plane gradients for each GS
     denom: Float[Tensor, "gaussian"]
     radii2d: Float[Tensor, "gaussian"]  # max radius in 2D screen space observed for each GS
     scene_extent: Float[float, ""]
+    initial_points: int
+    last_visible_fraction: float
+    last_event_step: int
+    last_support_fraction: float
+    last_capacity_pressure: float
+    last_growth_fraction: float
+    last_growth_budget: int
+    last_base_cap: int
+    last_demand_multiplier: float
+    last_effective_cap: int
+    feedback_revision: int
+    feedback_probe_psnr: float
+    feedback_probe_surplus: float
+    feedback_has_surplus: bool
+    consumed_feedback_revision: int
+    previous_probe_psnr: float
+    previous_probe_surplus: float
+    previous_probe_has_surplus: bool
+    reward_delta_count: int
+    reward_psnr_delta_ema: float
+    reward_psnr_abs_ema: float
+    reward_surplus_delta_ema: float
+    reward_surplus_abs_ema: float
+    last_probe_psnr_delta: float
+    last_probe_surplus_delta: float
+    last_quality_reward: float
+    last_complexity_cost: float
+    last_densification_reward: float
+    last_densification_reward_ema: float
+    last_action_factor: float
+    last_rewarded_support_fraction: float
+    last_reward_used: bool
 
     def external_pruning(self, valid_points_mask: Tensor) -> None:
         if self.grad2d_norm_accum is not None:
@@ -48,6 +99,38 @@ class VanillaStrategyState(GenericStrategyState):
             denom=torch.zeros(nr_points, device=device),
             radii2d=torch.zeros(nr_points, device=device),
             scene_extent=scene_extent,
+            initial_points=nr_points,
+            last_visible_fraction=0.0,
+            last_event_step=-1,
+            last_support_fraction=0.0,
+            last_capacity_pressure=0.0,
+            last_growth_fraction=0.0,
+            last_growth_budget=0,
+            last_base_cap=nr_points,
+            last_demand_multiplier=1.0,
+            last_effective_cap=nr_points,
+            feedback_revision=-1,
+            feedback_probe_psnr=0.0,
+            feedback_probe_surplus=0.0,
+            feedback_has_surplus=False,
+            consumed_feedback_revision=-1,
+            previous_probe_psnr=0.0,
+            previous_probe_surplus=0.0,
+            previous_probe_has_surplus=False,
+            reward_delta_count=0,
+            reward_psnr_delta_ema=0.0,
+            reward_psnr_abs_ema=0.0,
+            reward_surplus_delta_ema=0.0,
+            reward_surplus_abs_ema=0.0,
+            last_probe_psnr_delta=0.0,
+            last_probe_surplus_delta=0.0,
+            last_quality_reward=0.0,
+            last_complexity_cost=0.0,
+            last_densification_reward=0.0,
+            last_densification_reward_ema=0.0,
+            last_action_factor=1.0,
+            last_rewarded_support_fraction=0.0,
+            last_reward_used=False,
         )
 
 
@@ -64,6 +147,7 @@ def update_vanilla_strategy_state(
     # get gs ids from visibility mask
 
     visibility_mask = visibility_mask.squeeze(0)  # [V, G], assume batch size 1
+    adc_state.last_visible_fraction = float(visibility_mask.any(dim=0).float().mean())
     gs_ids = torch.where(visibility_mask)[1]  # [G_valid]
     assert visibility_mask.ndim == 2, "visibility_mask should be of shape [V, G]"
 
@@ -105,6 +189,276 @@ def reset_adc_state(
     adc_state.denom.zero_()
     adc_state.radii2d.zero_()
     torch.cuda.empty_cache()
+
+
+def set_adaptive_densification_feedback(
+    adc_state: VanillaStrategyState,
+    feedback: dict[str, float | int | bool],
+) -> None:
+    """Stage the newest fixed-probe observation for the next ADC event."""
+    revision = int(feedback["revision"])
+    if revision <= adc_state.feedback_revision:
+        return
+    probe_psnr = float(feedback["probe_psnr"])
+    probe_surplus = float(feedback["probe_surplus"])
+    if not math.isfinite(probe_psnr) or not math.isfinite(probe_surplus):
+        raise ValueError("adaptive densification feedback must be finite")
+    adc_state.feedback_revision = revision
+    adc_state.feedback_probe_psnr = probe_psnr
+    adc_state.feedback_probe_surplus = probe_surplus
+    adc_state.feedback_has_surplus = bool(feedback["has_surplus"])
+
+
+def transfer_adaptive_reward_state(
+    source: VanillaStrategyState | None,
+    target: VanillaStrategyState | None,
+) -> None:
+    """Carry delayed-reward history across optimizer phase restarts.
+
+    Gradient/radius accumulators intentionally remain fresh. Only scalar probe
+    history and the immediately preceding action cost cross the boundary.
+    """
+    if source is None or target is None:
+        return
+    fields = (
+        "feedback_revision",
+        "feedback_probe_psnr",
+        "feedback_probe_surplus",
+        "feedback_has_surplus",
+        "consumed_feedback_revision",
+        "previous_probe_psnr",
+        "previous_probe_surplus",
+        "previous_probe_has_surplus",
+        "reward_delta_count",
+        "reward_psnr_delta_ema",
+        "reward_psnr_abs_ema",
+        "reward_surplus_delta_ema",
+        "reward_surplus_abs_ema",
+        "last_probe_psnr_delta",
+        "last_probe_surplus_delta",
+        "last_quality_reward",
+        "last_complexity_cost",
+        "last_densification_reward",
+        "last_densification_reward_ema",
+        "last_action_factor",
+        "last_rewarded_support_fraction",
+        "last_reward_used",
+        "last_growth_budget",
+        "last_effective_cap",
+    )
+    for field in fields:
+        setattr(target, field, getattr(source, field))
+
+
+def _normalized_delayed_reward(
+    cfg: AdaptiveStrategyCfg,
+    adc_state: VanillaStrategyState,
+) -> float:
+    """Consume one probe transition and return its bounded action multiplier.
+
+    The previous structural action is rewarded by fixed-probe improvement over
+    its complete control interval. PSNR and supported render-over-EVSSM surplus
+    deltas are normalized by their within-scene absolute-delta EMAs. This keeps
+    the utility scale free without a dataset-specific threshold. The fraction
+    of capacity added by the action is charged as its complexity cost.
+    """
+    adc_state.last_reward_used = False
+    adc_state.last_probe_psnr_delta = 0.0
+    adc_state.last_probe_surplus_delta = 0.0
+    adc_state.last_quality_reward = 0.0
+    adc_state.last_complexity_cost = 0.0
+    adc_state.last_densification_reward = 0.0
+    adc_state.last_action_factor = 1.0
+    if not cfg.reward_conditioned:
+        return 1.0
+    if not 0.0 <= cfg.reward_ema_decay < 1.0:
+        raise ValueError("reward_ema_decay must satisfy 0 <= decay < 1")
+    if adc_state.feedback_revision <= adc_state.consumed_feedback_revision:
+        return 1.0
+
+    adc_state.consumed_feedback_revision = adc_state.feedback_revision
+    current_psnr = adc_state.feedback_probe_psnr
+    current_surplus = adc_state.feedback_probe_surplus
+    current_has_surplus = adc_state.feedback_has_surplus
+    if adc_state.reward_delta_count == 0:
+        adc_state.previous_probe_psnr = current_psnr
+        adc_state.previous_probe_surplus = current_surplus
+        adc_state.previous_probe_has_surplus = current_has_surplus
+        adc_state.reward_delta_count = 1
+        return 1.0
+
+    delta_psnr = current_psnr - adc_state.previous_probe_psnr
+    delta_surplus = current_surplus - adc_state.previous_probe_surplus
+    use_surplus = current_has_surplus and adc_state.previous_probe_has_surplus
+    adc_state.previous_probe_psnr = current_psnr
+    adc_state.previous_probe_surplus = current_surplus
+    adc_state.previous_probe_has_surplus = current_has_surplus
+
+    decay = cfg.reward_ema_decay
+    epsilon = 1e-8
+    if adc_state.reward_delta_count == 1:
+        psnr_scale = max(abs(delta_psnr), epsilon)
+        surplus_scale = max(abs(delta_surplus), epsilon)
+        adc_state.reward_psnr_delta_ema = delta_psnr
+        adc_state.reward_psnr_abs_ema = abs(delta_psnr)
+        adc_state.reward_surplus_delta_ema = delta_surplus
+        adc_state.reward_surplus_abs_ema = abs(delta_surplus)
+    else:
+        psnr_scale = max(adc_state.reward_psnr_abs_ema, epsilon)
+        surplus_scale = max(adc_state.reward_surplus_abs_ema, epsilon)
+        adc_state.reward_psnr_delta_ema = (
+            decay * adc_state.reward_psnr_delta_ema
+            + (1.0 - decay) * delta_psnr
+        )
+        adc_state.reward_psnr_abs_ema = (
+            decay * adc_state.reward_psnr_abs_ema
+            + (1.0 - decay) * abs(delta_psnr)
+        )
+        adc_state.reward_surplus_delta_ema = (
+            decay * adc_state.reward_surplus_delta_ema
+            + (1.0 - decay) * delta_surplus
+        )
+        adc_state.reward_surplus_abs_ema = (
+            decay * adc_state.reward_surplus_abs_ema
+            + (1.0 - decay) * abs(delta_surplus)
+        )
+
+    psnr_reward = math.tanh(delta_psnr / psnr_scale)
+    components = [psnr_reward]
+    if use_surplus:
+        components.append(math.tanh(delta_surplus / surplus_scale))
+    quality_reward = sum(components) / len(components)
+    complexity_cost = adc_state.last_growth_budget / max(
+        1, adc_state.last_effective_cap
+    )
+    reward = quality_reward - complexity_cost
+    if adc_state.reward_delta_count > 1:
+        reward_ema = (
+            decay * adc_state.last_densification_reward_ema
+            + (1.0 - decay) * reward
+        )
+    else:
+        reward_ema = reward
+    # A zero reward is exactly neutral. The smooth map is bounded in (0, 2),
+    # so poor actions suppress but never permanently disable future growth.
+    action_factor = 2.0 / (1.0 + math.exp(-reward_ema))
+
+    adc_state.reward_delta_count += 1
+    adc_state.last_probe_psnr_delta = delta_psnr
+    adc_state.last_probe_surplus_delta = delta_surplus if use_surplus else 0.0
+    adc_state.last_quality_reward = quality_reward
+    adc_state.last_complexity_cost = complexity_cost
+    adc_state.last_densification_reward = reward
+    adc_state.last_densification_reward_ema = reward_ema
+    adc_state.last_action_factor = action_factor
+    adc_state.last_reward_used = True
+    return action_factor
+
+
+def adaptive_growth_masks(
+    cfg: AdaptiveStrategyCfg,
+    grads: Tensor,
+    scales: Tensor,
+    adc_state: VanillaStrategyState,
+) -> tuple[Tensor, Tensor]:
+    """Select a bounded, scale-free clone/split set.
+
+    Gradient magnitudes are converted to a probability distribution. Its
+    inverse participation ratio estimates how many primitives materially
+    support the current residual, so multiplying by the population produces a
+    growth budget without a dataset-dependent magnitude threshold.
+    """
+
+    n = grads.numel()
+    visible = (adc_state.denom > 0) & torch.isfinite(grads) & (grads > 0)
+    clone_mask = torch.zeros(n, dtype=torch.bool, device=grads.device)
+    split_mask = torch.zeros_like(clone_mask)
+
+    visible_indices = torch.nonzero(visible, as_tuple=False).flatten()
+    if visible_indices.numel() == 0:
+        return clone_mask, split_mask
+
+    values = grads[visible_indices].clamp_min(torch.finfo(grads.dtype).eps)
+    probabilities = values / values.sum()
+    support_fraction = float(
+        (1.0 / (values.numel() * probabilities.square().sum())).clamp(0.0, 1.0)
+    )
+    action_factor = _normalized_delayed_reward(cfg, adc_state)
+    if cfg.reward_conditioned:
+        rewarded_support = min(1.0, support_fraction * action_factor)
+    else:
+        # Preserve the pre-reward arithmetic path exactly when disabled.
+        rewarded_support = support_fraction
+
+    # The learned point transformer supplies a reference active-set budget,
+    # not a universal scene cap. First undo minibatch visibility. Then solve
+    # for the capacity whose fractional headroom equals the unresolved
+    # residual support: (C - C_base) / C = S, hence C = C_base / (1 - S).
+    # This lets a broad unresolved residual request more capacity without a
+    # dataset label, while concentrated residuals stay near the learned prior.
+    visible_fraction = max(adc_state.last_visible_fraction, 1.0 / max(1, n))
+    base_cap = max(1, math.ceil(cfg.active_budget / visible_fraction))
+    if cfg.support_conditioned_cap:
+        support_headroom = max(
+            1.0 - support_fraction,
+            torch.finfo(grads.dtype).eps,
+        )
+        demand_multiplier = 1.0 / support_headroom
+        if cfg.reward_conditioned:
+            demand_multiplier = 1.0 + action_factor * (
+                demand_multiplier - 1.0
+            )
+        if cfg.cap_max > 0:
+            demand_multiplier = min(
+                demand_multiplier,
+                max(1.0, cfg.cap_max / base_cap),
+            )
+    else:
+        demand_multiplier = 1.0
+    demand_cap = math.ceil(base_cap * demand_multiplier)
+    effective_cap = max(n, demand_cap)
+    if cfg.cap_max > 0:
+        effective_cap = min(cfg.cap_max, effective_cap)
+    capacity_pressure = min(1.0, n / max(1, effective_cap))
+    # Treat residual demand and occupied capacity as two dimensionless,
+    # competing masses. The normalized ratio closes a large capacity deficit
+    # quickly when residual support is broad, while it tends continuously to
+    # zero as the active representation reaches its inferred capacity. Unlike
+    # a raw gradient threshold, this law is invariant to image resolution,
+    # loss scale, world units, and dataset identity.
+    residual_demand = rewarded_support * (1.0 - capacity_pressure)
+    growth_fraction = residual_demand / (
+        residual_demand + capacity_pressure + torch.finfo(grads.dtype).eps
+    )
+    growth_fraction = min(
+        cfg.max_growth_fraction,
+        max(cfg.min_growth_fraction, growth_fraction),
+    )
+    available = max(0, effective_cap - n)
+    desired = math.ceil(n * growth_fraction)
+    budget = min(available, desired, visible_indices.numel())
+
+    adc_state.last_event_step = -2  # caller replaces with the actual step
+    adc_state.last_support_fraction = support_fraction
+    adc_state.last_rewarded_support_fraction = rewarded_support
+    adc_state.last_capacity_pressure = capacity_pressure
+    adc_state.last_growth_fraction = growth_fraction
+    adc_state.last_growth_budget = int(budget)
+    adc_state.last_base_cap = int(base_cap)
+    adc_state.last_demand_multiplier = float(demand_multiplier)
+    adc_state.last_effective_cap = int(effective_cap)
+    if budget <= 0:
+        return clone_mask, split_mask
+
+    selected_local = torch.topk(values, k=budget, sorted=False).indices
+    selected = visible_indices[selected_local]
+    selected_scales = scales[selected].max(dim=-1).values
+    scale_partition = selected_scales.median()
+    clone_selected = selected[selected_scales <= scale_partition]
+    split_selected = selected[selected_scales > scale_partition]
+    clone_mask[clone_selected] = True
+    split_mask[split_selected] = True
+    return clone_mask, split_mask
 
 def prune(
     gaussians: Gaussians | GaussiansModule,
@@ -387,19 +741,25 @@ def apply_vanilla_strategy(
                     scales = torch.exp(scales)  # [G, 3]
             else:
                 raise ValueError(f"Unknown type of gaussians: {type(gaussians)}")
-            # Extract points that satisfy the gradient condition
-            is_grad_high: Tensor = grads > grow_grad2d  # [G]
+            if isinstance(cfg, AdaptiveStrategyCfg):
+                clone_mask, split_mask = adaptive_growth_masks(
+                    cfg, grads, scales, adc_state
+                )
+                adc_state.last_event_step = step
+            else:
+                # Extract points that satisfy the gradient condition
+                is_grad_high: Tensor = grads > grow_grad2d  # [G]
 
-            is_small: Tensor = scales.max(dim=-1).values <= grow_scale3d * adc_state.scene_extent
+                is_small: Tensor = scales.max(dim=-1).values <= grow_scale3d * adc_state.scene_extent
 
-            is_large: Tensor = ~is_small
+                is_large: Tensor = ~is_small
 
-            clone_mask: Tensor = is_grad_high & is_small
+                clone_mask = is_grad_high & is_small
 
-            split_mask: Tensor = is_grad_high & is_large
+                split_mask = is_grad_high & is_large
 
-            if step < cfg.refine_scale2d_stop_iter:
-                split_mask |= adc_state.radii2d > grow_scale2d
+                if step < cfg.refine_scale2d_stop_iter:
+                    split_mask |= adc_state.radii2d > grow_scale2d
 
             # clone ---------------------------------------------------------------------
             
@@ -481,9 +841,26 @@ def apply_vanilla_strategy(
         # reset adc state
         reset_adc_state(adc_state)
 
-        print(
-            f"Densification/Pruning @ iter {step}: cloned {nr_cloned}, splitted {nr_splitted}, pruned {nr_pruned}, total now {gaussians.means.shape[1]}"
-        )
+        if isinstance(cfg, AdaptiveStrategyCfg):
+            print(
+                "Adaptive Densification/Pruning "
+                f"@ iter {step}: support={adc_state.last_support_fraction:.4f}, "
+                f"pressure={adc_state.last_capacity_pressure:.4f}, "
+                f"growth={adc_state.last_growth_fraction:.4f}, "
+                f"visible={adc_state.last_visible_fraction:.4f}, "
+                f"budget={adc_state.last_growth_budget}, "
+                f"base_cap={adc_state.last_base_cap}, "
+                f"demand_x={adc_state.last_demand_multiplier:.3f}, "
+                f"reward={adc_state.last_densification_reward_ema:.3f}, "
+                f"action_x={adc_state.last_action_factor:.3f}, "
+                f"cap={adc_state.last_effective_cap}, cloned={nr_cloned}, "
+                f"splitted={nr_splitted}, pruned={nr_pruned}, "
+                f"total={gaussians.means.shape[1]}"
+            )
+        else:
+            print(
+                f"Densification/Pruning @ iter {step}: cloned {nr_cloned}, splitted {nr_splitted}, pruned {nr_pruned}, total now {gaussians.means.shape[1]}"
+            )
 
     if cfg.do_opacity_reset:
 

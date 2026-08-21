@@ -53,6 +53,10 @@ class AdamOptimizer(NonlearnedOptimizer[AdamOptimizerCfg]):
 
     def _on_scene_start_impl(self, optimizer_input: OptimizerInput) -> None:
         super()._on_scene_start_impl(optimizer_input)
+        # A staged solver may hand Adam an already-refined scene at a non-zero
+        # global step. Parameter-space setup is a phase-local first-step event,
+        # not equivalent to ``i == 0``.
+        self._needs_parameter_space_setup = True
 
         # assert scene batch size 1
         context = optimizer_input.context
@@ -197,8 +201,8 @@ class AdamOptimizer(NonlearnedOptimizer[AdamOptimizerCfg]):
         renderer = optimizer_input.renderer
         gaussians = optimizer_input.prev_output.gaussians
 
-        # if first iteration
-        if i == 0:
+        # First iteration of this optimizer phase (which may start at i > 0).
+        if self._needs_parameter_space_setup:
             # assert gaussians stores activated values
             assert gaussians.stores_activated, "Gaussians must store activated values."
             # deactivate values in-place (avoids allocating new tensors)
@@ -212,6 +216,7 @@ class AdamOptimizer(NonlearnedOptimizer[AdamOptimizerCfg]):
             gaussians.rotations_unnorm.requires_grad_(True)
             gaussians.opacities.requires_grad_(True)
             gaussians.harmonics.requires_grad_(True)
+            self._needs_parameter_space_setup = False
         else:
             # assert gaussians does not store activated values
             assert not gaussians.stores_activated, "Gaussians must not store activated values."
@@ -253,6 +258,8 @@ class AdamOptimizer(NonlearnedOptimizer[AdamOptimizerCfg]):
                 sh_degree=sh_degree,
                 meta_bufs=self._meta_bufs,
                 opacity_reg_lambda=self.cfg.opacity_reg_lambda,
+                input_objective=getattr(self, "input_objective", None),
+                step=i,
             )
 
         # get updates from adam optimizer
