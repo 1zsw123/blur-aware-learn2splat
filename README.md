@@ -21,19 +21,21 @@ offline deblurring. The current tested pipeline combines:
 - BPN image-formation supervision and NIMA-sharp weighted view sampling;
 - a confidence-gated, multiscale Laplacian surplus objective that allows
   supported render sharpness to exceed the EVSSM initialization; and
-- a scale-free adaptive densification controller whose delayed reward uses
-  fixed training probes, target PSNR improvement, Laplacian surplus
-  improvement, and a primitive-growth cost.
+- two capacity paths: a scale-free adaptive rollback whose delayed reward uses
+  fixed training probes, and the exact LeGS per-Gaussian PPO candidate.
 
-The default controller operates on Gaussian clone/split/prune decisions and is
-the custom adaptive ADC described below. An independent `--adc legs`
-ablation now transplants the released LeGS mechanism into the Learn2Splat
-runtime: the pinned official FastGS CUDA leave-one-out sensitivity, 11-D
-per-Gaussian state, keep/clone/split actor, prune estimator, 50-step
-parent-child reward, and PPO update. It deliberately does not reuse the older
-global/proxy `adapt` controller. The implementation, equations, benchmark
-protocols, rollback flags, smoke-test table, and reproduction commands are documented in
+The stable rollback controller is the custom adaptive ADC described below.
+The newest capacity candidate, `--adc legs`, transplants the released LeGS
+mechanism into the Learn2Splat runtime: the pinned official FastGS CUDA
+leave-one-out sensitivity, 11-D per-Gaussian state, keep/clone/split actor,
+prune estimator, 50-step parent-child reward, and PPO update. It deliberately
+does not reuse the older global/proxy `adapt` controller. The implementation,
+equations, benchmark protocols, rollback flags, smoke-test table, and
+reproduction commands are documented in
 [`experiments/blur_aware_cross_dataset/README.md`](experiments/blur_aware_cross_dataset/README.md).
+The exact current stack, module boundaries, rollback matrix, and three-domain
+matched smoke results are also summarized in Chinese in
+[`CURRENT_ARCHITECTURE_ZH.md`](experiments/blur_aware_cross_dataset/CURRENT_ARCHITECTURE_ZH.md).
 Dataset paths are intentionally external; pass a local JSON file with
 `--scene-config` and a released Learn2Splat checkpoint with `--checkpoint`.
 
