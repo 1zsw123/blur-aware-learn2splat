@@ -53,5 +53,7 @@ use_prune_estimator: true
 
 blur_conditioned: true
 blur_feature_dim: 7
-blur_quality_weight: 1.0
-blur_capacity_weight: 1.0
+blur_quality_weight: 0.5
+blur_capacity_weight: 0.25
+blur_condition_start_iter: 2000
+blur_condition_ramp_iters: 3000

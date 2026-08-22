@@ -552,6 +552,18 @@ class Optimizer(nn.Module, ABC, Generic[T]):
                     "blur_feature_normalized": list(
                         adc_state.last_blur_feature_normalized
                     ),
+                    "blur_condition_scale": float(
+                        adc_state.last_blur_condition_scale
+                    ),
+                    "blur_action_support_mean": float(
+                        adc_state.last_blur_action_support_mean
+                    ),
+                    "blur_birth_penalty_gate_mean": float(
+                        adc_state.last_blur_birth_penalty_gate_mean
+                    ),
+                    "blur_net_action_direction": float(
+                        adc_state.last_blur_net_action_direction
+                    ),
                     "ppo_updates": int(controller.update_count),
                     "policy_loss": float(controller.last_policy_loss),
                     "policy_entropy": float(controller.last_entropy),

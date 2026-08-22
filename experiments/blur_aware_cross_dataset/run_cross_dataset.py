@@ -186,7 +186,61 @@ def parse_args() -> argparse.Namespace:
             "probe renders without feeding them to ADC for a fair ablation."
         ),
     )
+    parser.add_argument(
+        "--legs-blur-quality-weight",
+        type=float,
+        default=None,
+        help="Override the legs_blur multi-view quality reward weight.",
+    )
+    parser.add_argument(
+        "--legs-blur-capacity-weight",
+        type=float,
+        default=None,
+        help="Override the legs_blur relative primitive-growth cost.",
+    )
+    parser.add_argument(
+        "--legs-blur-start-iter",
+        type=int,
+        default=None,
+        help="Override the first iteration of blur-policy conditioning.",
+    )
+    parser.add_argument(
+        "--legs-blur-ramp-iters",
+        type=int,
+        default=None,
+        help="Override the blur-policy conditioning ramp duration.",
+    )
     return parser.parse_args()
+
+
+def configure_legs_blur_ablation(refiner_cfg, args: argparse.Namespace) -> None:
+    """Apply explicit ablation overrides without changing exact LeGS."""
+    if args.adc != "legs_blur":
+        overrides = (
+            args.legs_blur_quality_weight,
+            args.legs_blur_capacity_weight,
+            args.legs_blur_start_iter,
+            args.legs_blur_ramp_iters,
+        )
+        if any(value is not None for value in overrides):
+            raise ValueError("--legs-blur-* overrides require --adc legs_blur")
+        return
+    if args.legs_blur_quality_weight is not None:
+        if args.legs_blur_quality_weight < 0:
+            raise ValueError("legs_blur quality weight must be non-negative")
+        refiner_cfg.blur_quality_weight = args.legs_blur_quality_weight
+    if args.legs_blur_capacity_weight is not None:
+        if args.legs_blur_capacity_weight < 0:
+            raise ValueError("legs_blur capacity weight must be non-negative")
+        refiner_cfg.blur_capacity_weight = args.legs_blur_capacity_weight
+    if args.legs_blur_start_iter is not None:
+        if args.legs_blur_start_iter < 0:
+            raise ValueError("legs_blur start iteration must be non-negative")
+        refiner_cfg.blur_condition_start_iter = args.legs_blur_start_iter
+    if args.legs_blur_ramp_iters is not None:
+        if args.legs_blur_ramp_iters <= 0:
+            raise ValueError("legs_blur ramp duration must be positive")
+        refiner_cfg.blur_condition_ramp_iters = args.legs_blur_ramp_iters
 
 
 def read_hold(data_dir: Path) -> int:
@@ -1452,6 +1506,7 @@ def main() -> None:
     )
     optgs.num_refine = num_steps
     optgs.configure_adc(args.adc, reward_conditioned=reward_enabled)
+    configure_legs_blur_ablation(optgs.optimizer.cfg.refiner, args)
     init_budget, init_budget_source = resolve_initialization_budget(
         args.num_init_points, optgs
     )
@@ -1495,6 +1550,7 @@ def main() -> None:
         from optgs.experimental.api.integration.config_bridge import build_adam_baseline
 
         optimizer_override = build_adam_baseline(num_steps, adc=args.adc).to(device)
+        configure_legs_blur_ablation(optimizer_override.cfg.refiner, args)
     elif args.optimizer == "learned_projected" and num_steps > optgs.checkpoint_num_refine:
         from optgs.experimental.api.integration.config_bridge import build_adam_baseline
 
@@ -1504,6 +1560,7 @@ def main() -> None:
             adc=args.adc,
             reward_conditioned=reward_enabled,
         ).to(device)
+        configure_legs_blur_ablation(fallback_optimizer.cfg.refiner, args)
 
     probe_views = build_views(scene, probe_global, scene_scale, device)
     optimization_names = [
@@ -1694,7 +1751,7 @@ def main() -> None:
             "capacity_controller": (
                 {
                     "version": (
-                        "blur_conditioned_legs_v2"
+                        "blur_conditioned_legs_v5_directional_credit"
                         if args.adc == "legs_blur"
                         else "official_legs_8eb120b_exact_mechanism"
                     ),
@@ -1728,12 +1785,38 @@ def main() -> None:
                     "reward_delay": 50,
                     "reward": (
                         "normalized sensitivity + confidence-weighted PSNR delta "
-                        "+ Laplacian-surplus delta - relative net capacity growth"
+                        "+ Laplacian-surplus delta - relative net capacity growth, "
+                        "directionally assigned to birth/prune and soft-assigned "
+                        "by local sensitivity support"
                         if args.adc == "legs_blur"
                         else "normalized delayed per-Gaussian sensitivity"
                     ),
                     "cross_scene_normalization": (
                         "dimensionless bounded state features and causal reward RMS"
+                        if args.adc == "legs_blur"
+                        else None
+                    ),
+                    "blur_conditioning": (
+                        {
+                            "adapter": "zero_initialized_residual",
+                            "start_iter": int(
+                                refiner_cfg.blur_condition_start_iter
+                            ),
+                            "ramp_iters": int(
+                                refiner_cfg.blur_condition_ramp_iters
+                            ),
+                            "quality_weight": float(
+                                refiner_cfg.blur_quality_weight
+                            ),
+                            "capacity_weight": float(
+                                refiner_cfg.blur_capacity_weight
+                            ),
+                            "quality_gates_capacity_cost": True,
+                            "credit_assignment": (
+                                "net_action_direction_times_threshold_free_"
+                                "sigmoid_of_standardized_local_delayed_sensitivity"
+                            ),
+                        }
                         if args.adc == "legs_blur"
                         else None
                     ),

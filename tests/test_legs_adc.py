@@ -8,8 +8,10 @@ from optgs.experimental.api.integration.config_bridge import build_refiner_cfg
 from optgs.experimental.api.integration.config_bridge import build_adam_baseline
 from optgs.model.types import Gaussians
 from optgs.scene_trainer.adc.legs import (
+    LeGSPPOController,
     LeGSStrategyState,
     _apply_legs_final_prune,
+    _blur_condition_scale,
     _compose_blur_conditioned_reward,
     _enforce_safety_cap,
     _fixed_blur_probe_views,
@@ -72,6 +74,37 @@ def test_blur_conditioned_legs_has_separate_eighteen_dimensional_contract() -> N
     assert conditioned.refine_every == exact.refine_every == 100
     assert conditioned.refine_stop_iter == exact.refine_stop_iter == 15_000
     assert conditioned.cap_max == exact.cap_max == -1
+    assert conditioned.blur_condition_start_iter == 2000
+    assert conditioned.blur_condition_ramp_iters == 3000
+
+
+def test_blur_adapter_starts_as_an_exact_legs_residual() -> None:
+    exact_cfg = build_refiner_cfg("legs", 10_000)
+    blur_cfg = build_refiner_cfg("legs_blur", 10_000)
+    torch.manual_seed(17)
+    exact = LeGSPPOController(exact_cfg, torch.device("cpu"))
+    torch.manual_seed(17)
+    conditioned = LeGSPPOController(blur_cfg, torch.device("cpu"))
+    local_state = torch.randn(13, 11)
+    blur_state = torch.randn(13, 7)
+
+    exact_encoded = exact._encode(local_state)
+    conditioned_encoded = conditioned._encode(
+        torch.cat([local_state, blur_state], dim=-1)
+    )
+
+    assert torch.equal(exact_encoded, conditioned_encoded)
+    assert conditioned.blur_adapter is not None
+    assert not conditioned.blur_adapter.weight.any()
+
+
+def test_blur_condition_curriculum_is_scene_independent() -> None:
+    cfg = build_refiner_cfg("legs_blur", 10_000)
+
+    assert _blur_condition_scale(cfg, 2_000) == 0.0
+    assert abs(_blur_condition_scale(cfg, 3_500) - 0.5) < 1e-8
+    assert _blur_condition_scale(cfg, 5_000) == 1.0
+    assert _blur_condition_scale(cfg, 50_000) == 1.0
 
 
 def test_blur_feature_normalization_preserves_bounded_scene_identity() -> None:
@@ -92,16 +125,88 @@ def test_blur_reward_credits_quality_and_charges_birth_capacity() -> None:
     actions = torch.tensor([0, 1, 2, 3, 1])
     valid = torch.tensor([True, True, True, True, False])
 
-    combined, fraction, capacity_cost = _compose_blur_conditioned_reward(
-        reward, actions, valid, quality_reward=1.0, cfg=cfg
+    (
+        combined,
+        fraction,
+        capacity_cost,
+        scale,
+        support_mean,
+        birth_gate_mean,
+        net_direction,
+    ) = _compose_blur_conditioned_reward(
+        reward, actions, valid, quality_reward=1.0, cfg=cfg, step=5_000
     )
 
     assert fraction == 0.75
     assert capacity_cost == 0.2
+    assert scale == 1.0
     assert combined[0] == 0.0
-    assert combined[1] == combined[2] == 0.8
-    assert combined[3] == 1.0
+    assert abs(float(combined[1]) - 1.0 / 6.0) < 1e-6
+    assert abs(float(combined[2]) - 1.0 / 6.0) < 1e-6
+    assert abs(float(combined[3]) + 1.0 / 6.0) < 1e-6
     assert combined[4] == 0.0
+    assert support_mean == 0.5
+    assert birth_gate_mean == 1.0
+    assert abs(net_direction - 1.0 / 3.0) < 1e-8
+
+
+def test_blur_reward_is_inactive_during_representation_warmup() -> None:
+    cfg = build_refiner_cfg("legs_blur", 10_000)
+    reward = torch.tensor([0.3, -0.2, 0.1])
+    actions = torch.tensor([0, 1, 2])
+    valid = torch.ones(3, dtype=torch.bool)
+
+    combined, _, _, scale, _, _, _ = _compose_blur_conditioned_reward(
+        reward, actions, valid, quality_reward=-1.0, cfg=cfg, step=2_000
+    )
+
+    assert scale == 0.0
+    assert torch.equal(combined, reward)
+
+
+def test_blur_reward_protects_locally_supported_births_from_global_regression() -> None:
+    cfg = build_refiner_cfg("legs_blur", 10_000)
+    reward = torch.tensor([-2.0, 2.0])
+    actions = torch.tensor([1, 1])
+    valid = torch.ones(2, dtype=torch.bool)
+
+    combined, _, _, _, support_mean, birth_gate_mean, net_direction = (
+        _compose_blur_conditioned_reward(
+            reward,
+            actions,
+            valid,
+            quality_reward=-1.0,
+            cfg=cfg,
+            step=5_000,
+        )
+    )
+
+    assert combined[1] > combined[0]
+    assert (combined[1] - reward[1]) > (combined[0] - reward[0])
+    assert abs(support_mean - 0.5) < 1e-6
+    assert abs(birth_gate_mean - 1.0) < 1e-6
+    assert net_direction == 1.0
+
+
+def test_harmful_net_contraction_credits_birth_and_penalizes_prune() -> None:
+    cfg = build_refiner_cfg("legs_blur", 10_000)
+    reward = torch.zeros(3)
+    actions = torch.tensor([1, 3, 3])
+    valid = torch.ones(3, dtype=torch.bool)
+
+    combined, _, _, _, _, _, net_direction = _compose_blur_conditioned_reward(
+        reward,
+        actions,
+        valid,
+        quality_reward=-1.0,
+        cfg=cfg,
+        step=5_000,
+    )
+
+    assert abs(net_direction + 1.0 / 3.0) < 1e-8
+    assert combined[0] > 0.0
+    assert combined[1] < 0.0
+    assert combined[2] < 0.0
 
 
 def test_blur_quality_delta_uses_online_rms_without_dataset_scale() -> None:

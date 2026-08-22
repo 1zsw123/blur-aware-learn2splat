@@ -107,6 +107,18 @@ class PPOPruneEstimator(nn.Module):
         return torch.sigmoid(self.mlp(encoded))
 
 
+class ZeroInitializedBlurAdapter(nn.Module):
+    """Inject global blur state without perturbing the exact LeGS prior."""
+
+    def __init__(self, input_dim: int, hidden_dim: int) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.zeros(hidden_dim, input_dim))
+        self.bias = nn.Parameter(torch.zeros(hidden_dim))
+
+    def forward(self, state: Tensor) -> Tensor:
+        return F.linear(state, self.weight, self.bias)
+
+
 def _scatter_mean(source: Tensor, index: Tensor, dim_size: int) -> Tensor:
     """torch_scatter.scatter_mean equivalent without an extra dependency."""
     result = source.new_zeros((dim_size, *source.shape[1:]))
@@ -121,14 +133,31 @@ class LeGSPPOController:
     def __init__(self, cfg: LeGSStrategyCfg, device: torch.device) -> None:
         self.cfg = cfg
         self.device = device
-        self.encoder = MLPStateEncoder(cfg.state_dim, cfg.hidden_dim).to(device)
+        self.base_state_dim = (
+            cfg.state_dim - cfg.blur_feature_dim
+            if cfg.blur_conditioned
+            else cfg.state_dim
+        )
+        if self.base_state_dim != 11:
+            raise ValueError(
+                "LeGS requires the official 11-D local state before blur conditioning"
+            )
+        self.encoder = MLPStateEncoder(self.base_state_dim, cfg.hidden_dim).to(device)
         self.actor = PPOActor(cfg.hidden_dim).to(device)
         self.prune_estimator = PPOPruneEstimator(cfg.hidden_dim).to(device)
+        self.blur_adapter = (
+            ZeroInitializedBlurAdapter(cfg.blur_feature_dim, cfg.hidden_dim).to(device)
+            if cfg.blur_conditioned
+            else None
+        )
         self.actor_optimizer = torch.optim.AdamW(
             self.actor.parameters(), lr=cfg.actor_lr_init, weight_decay=1e-4
         )
+        encoder_parameters = list(self.encoder.parameters())
+        if self.blur_adapter is not None:
+            encoder_parameters.extend(self.blur_adapter.parameters())
         self.encoder_optimizer = torch.optim.AdamW(
-            self.encoder.parameters(),
+            encoder_parameters,
             lr=cfg.state_encoder_lr_init,
             weight_decay=1e-4,
         )
@@ -142,6 +171,18 @@ class LeGSPPOController:
         self.last_policy_loss = 0.0
         self.last_entropy = 0.0
 
+    def _encode(self, states: Tensor) -> Tensor:
+        encoded = self.encoder(states[..., : self.base_state_dim])
+        if self.blur_adapter is not None:
+            blur_state = states[..., self.base_state_dim :]
+            if blur_state.shape[-1] != self.cfg.blur_feature_dim:
+                raise RuntimeError(
+                    f"blur adapter expected {self.cfg.blur_feature_dim} features, "
+                    f"got {blur_state.shape[-1]}"
+                )
+            encoded = encoded + self.blur_adapter(blur_state)
+        return encoded
+
     def _encode_chunks(self, states: Tensor, requires_grad: bool) -> Tensor:
         chunks = []
         size = max(1, self.cfg.ppo_chunk_size)
@@ -149,7 +190,7 @@ class LeGSPPOController:
             chunk = states[start : start + size].to(self.device)
             if requires_grad:
                 chunk = chunk.detach().requires_grad_(True)
-            chunks.append(self.encoder(chunk))
+            chunks.append(self._encode(chunk))
         return torch.cat(chunks, dim=0)
 
     @torch.no_grad()
@@ -365,7 +406,7 @@ class LeGSPPOController:
                     with torch.amp.autocast(
                         "cuda", enabled=self.cfg.use_mixed_precision
                     ):
-                        encoded = self.encoder(
+                        encoded = self._encode(
                             states[start:stop]
                             .to(self.device)
                             .detach()
@@ -441,6 +482,10 @@ class LeGSStrategyState(FastGSStrategyState):
     last_blur_capacity_cost: float = 0.0
     last_blur_feature_raw: list[float] = field(default_factory=list)
     last_blur_feature_normalized: list[float] = field(default_factory=list)
+    last_blur_condition_scale: float = 0.0
+    last_blur_action_support_mean: float = 0.0
+    last_blur_birth_penalty_gate_mean: float = 0.0
+    last_blur_net_action_direction: float = 0.0
 
     def external_pruning(self, valid_points_mask: Tensor) -> None:
         super().external_pruning(valid_points_mask)
@@ -496,6 +541,10 @@ def transfer_legs_runtime_state(
         "last_blur_capacity_cost",
         "last_blur_feature_raw",
         "last_blur_feature_normalized",
+        "last_blur_condition_scale",
+        "last_blur_action_support_mean",
+        "last_blur_birth_penalty_gate_mean",
+        "last_blur_net_action_direction",
     ):
         setattr(target, name, getattr(source, name))
 
@@ -804,6 +853,17 @@ def _standardize_blur_features(
     return features.clamp(-1.0, 1.0)
 
 
+def _blur_condition_scale(cfg: LeGSStrategyCfg, step: int) -> float:
+    """Introduce blur control only after the scene representation is established."""
+    if step <= cfg.blur_condition_start_iter:
+        return 0.0
+    return min(
+        1.0,
+        (step - cfg.blur_condition_start_iter)
+        / max(1, cfg.blur_condition_ramp_iters),
+    )
+
+
 def _normalize_blur_quality_delta(
     adc_state: LeGSStrategyState,
     psnr_delta: float,
@@ -837,24 +897,79 @@ def _compose_blur_conditioned_reward(
     valid: Tensor,
     quality_reward: float,
     cfg: LeGSStrategyCfg,
-) -> tuple[Tensor, float, float]:
-    """Credit structural actions for quality while charging representation growth."""
+    step: int,
+) -> tuple[Tensor, float, float, float, float, float, float]:
+    """Fuse global blur quality with local delayed sensitivity credit."""
     changed = (actions != 0) & valid
     structural_fraction = float(changed.sum() / valid.sum().clamp_min(1))
     birth = ((actions == 1) | (actions == 2)) & valid
     removed = (actions == 3) & valid
+    birth_count = int(birth.sum())
+    removed_count = int(removed.sum())
     relative_growth = max(
         0.0,
-        float(birth.sum() - removed.sum()) / max(1, actions.numel()),
+        float(birth_count - removed_count) / max(1, actions.numel()),
     )
+    net_action_direction = float(birth_count - removed_count) / max(
+        1, birth_count + removed_count
+    )
+    condition_scale = _blur_condition_scale(cfg, step)
+    # The local reward is already standardized per event. Its sigmoid is a
+    # threshold-free estimate of whether this particular action was supported
+    # by delayed leave-one-out sensitivity. The factor of two keeps a neutral
+    # action's global-credit magnitude unchanged while redistributing credit.
+    local_support = torch.sigmoid(reward.detach())
+    supported_gate = 2.0 * local_support
+    unsupported_gate = 2.0 * (1.0 - local_support)
+    # Global probe quality cannot identify a point, but it can identify whether
+    # this event's net expansion or contraction helped. Give birth and prune
+    # opposite signed credit according to that observed direction. This avoids
+    # the contradictory old behavior where a harmful net contraction also
+    # penalized the births needed to recover from it.
+    birth_quality = quality_reward * net_action_direction
+    prune_quality = -birth_quality
+    birth_quality_gate = (
+        supported_gate if birth_quality >= 0.0 else unsupported_gate
+    )
+    prune_quality_gate = (
+        supported_gate if prune_quality >= 0.0 else unsupported_gate
+    )
+    capacity_gate = 1.0 - max(0.0, min(1.0, quality_reward))
     reward = reward.clone()
-    reward[valid] += cfg.blur_quality_weight * quality_reward * changed[
-        valid
-    ].to(reward.dtype)
-    reward[birth] -= (
-        cfg.blur_capacity_weight * relative_growth
+    reward[birth] += (
+        condition_scale
+        * cfg.blur_quality_weight
+        * birth_quality
+        * birth_quality_gate[birth]
     )
-    return reward, structural_fraction, relative_growth
+    reward[removed] += (
+        condition_scale
+        * cfg.blur_quality_weight
+        * prune_quality
+        * prune_quality_gate[removed]
+    )
+    reward[birth] -= (
+        condition_scale
+        * cfg.blur_capacity_weight
+        * capacity_gate
+        * relative_growth
+        * unsupported_gate[birth]
+    )
+    action_support_mean = (
+        float(local_support[changed].mean()) if changed.any() else 0.0
+    )
+    birth_penalty_gate_mean = (
+        float(unsupported_gate[birth].mean()) if birth.any() else 0.0
+    )
+    return (
+        reward,
+        structural_fraction,
+        relative_growth,
+        condition_scale,
+        action_support_mean,
+        birth_penalty_gate_mean,
+        net_action_direction,
+    )
 
 
 def build_blur_conditioned_legs_state(
@@ -864,6 +979,7 @@ def build_blur_conditioned_legs_state(
     renderer,
     context: dict[str, Tensor],
     objective,
+    step: int,
 ) -> tuple[
     Tensor,
     Tensor,
@@ -905,16 +1021,19 @@ def build_blur_conditioned_legs_state(
         ]
     )
     normalized = _standardize_blur_features(adc_state, raw_features)
+    condition_scale = _blur_condition_scale(cfg, step)
+    effective = normalized * condition_scale
     adc_state.last_blur_feature_raw = [float(value) for value in raw_features]
     adc_state.last_blur_feature_normalized = [
-        float(value) for value in normalized
+        float(value) for value in effective
     ]
+    adc_state.last_blur_condition_scale = condition_scale
     if normalized.numel() != cfg.blur_feature_dim:
         raise RuntimeError(
             f"legs_blur expected {cfg.blur_feature_dim} blur features, "
             f"got {normalized.numel()}"
         )
-    conditioned = normalized[None].expand(state.shape[0], -1)
+    conditioned = effective[None].expand(state.shape[0], -1)
     state = torch.cat([state, conditioned], dim=-1)
     if state.shape[-1] != cfg.state_dim:
         raise RuntimeError(
@@ -1018,18 +1137,31 @@ def _finish_delayed_reward(
             float(pre_observation["reliability_mean"]),
             new_metric.device,
         )
-        reward, structural_fraction, capacity_cost = _compose_blur_conditioned_reward(
+        (
+            reward,
+            structural_fraction,
+            capacity_cost,
+            condition_scale,
+            action_support_mean,
+            birth_penalty_gate_mean,
+            net_action_direction,
+        ) = _compose_blur_conditioned_reward(
             reward,
             actions,
             valid,
             quality_reward,
             cfg,
+            step,
         )
         adc_state.last_blur_quality_reward = quality_reward
         adc_state.last_blur_psnr_delta = psnr_delta
         adc_state.last_blur_surplus_delta = surplus_delta
         adc_state.last_blur_structural_fraction = structural_fraction
         adc_state.last_blur_capacity_cost = capacity_cost
+        adc_state.last_blur_condition_scale = condition_scale
+        adc_state.last_blur_action_support_mean = action_support_mean
+        adc_state.last_blur_birth_penalty_gate_mean = birth_penalty_gate_mean
+        adc_state.last_blur_net_action_direction = net_action_direction
     adc_state.controller.set_reward(
         adc_state.pending_transition_index, reward, valid
     )
@@ -1234,7 +1366,7 @@ def apply_legs_strategy(
             blur_views,
             blur_sampled_views,
         ) = build_blur_conditioned_legs_state(
-            cfg, gaussians, adc_state, renderer, context, objective
+            cfg, gaussians, adc_state, renderer, context, objective, step
         )
     else:
         states, pre_metric, pre_visible, views, sampled_views = build_legs_state(
