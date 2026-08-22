@@ -29,6 +29,7 @@ class BatchedViewsDict(TypedDict, total=False):
     supervision_confidence: Float[Tensor, "batch view"]
     sampling_mass: Float[Tensor, "batch view"]
     valid_mask: Bool[Tensor, "batch view 1 height width"]
+    policy_probe: Bool[Tensor, "batch view"]
 
 
 @dataclass
@@ -60,6 +61,7 @@ class BatchedViews:
     supervision_confidence: Float[Tensor, "batch _"] | None = None
     sampling_mass: Float[Tensor, "batch _"] | None = None
     valid_mask: Bool[Tensor, "batch _ 1 _ _"] | None = None
+    policy_probe: Bool[Tensor, "batch _"] | None = None
 
     viewpoint_stack: Int64[Tensor, "batch _"] | None = None  # batch subset
     used_indices_list: list[Int64[Tensor, "_"]] | None = None  # list of tensors of shape (subset,)
@@ -101,6 +103,7 @@ class BatchedViews:
             supervision_confidence=select_optional(self.supervision_confidence),
             sampling_mass=select_optional(self.sampling_mass),
             valid_mask=select_optional(self.valid_mask),
+            policy_probe=select_optional(self.policy_probe),
         )
 
     @classmethod
@@ -125,6 +128,7 @@ class BatchedViews:
             supervision_confidence=data.get("supervision_confidence", None),
             sampling_mass=data.get("sampling_mass", None),
             valid_mask=data.get("valid_mask", None),
+            policy_probe=data.get("policy_probe", None),
         )
 
     def reset_viewpoint_stack_if_needed(self, strategy, batch_size) -> None:

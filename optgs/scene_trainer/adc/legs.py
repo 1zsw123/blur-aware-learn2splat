@@ -413,6 +413,7 @@ class LeGSStrategyState(FastGSStrategyState):
     pending_pre_metric: Tensor | None = None
     pending_pre_visible: Tensor | None = None
     pending_views: dict[str, Tensor] | None = None
+    pending_blur_views: dict[str, Tensor] | None = None
     last_event_step: int = -1
     last_reward_step: int = -1
     last_valid_count: int = 0
@@ -424,9 +425,22 @@ class LeGSStrategyState(FastGSStrategyState):
     last_cap_truncation: int = 0
     last_event_kind: str = "none"
     last_sampled_view_indices: list[int] = field(default_factory=list)
+    last_blur_probe_view_indices: list[int] = field(default_factory=list)
     opacity_reset_count: int = 0
     final_prune_count: int = 0
     event_log: list[dict[str, Any]] = field(default_factory=list)
+    initial_gaussian_count: int = 0
+    blur_feature_history: list[list[float]] = field(default_factory=list)
+    blur_quality_delta_history: list[list[float]] = field(default_factory=list)
+    fixed_blur_probe_positions: list[int] = field(default_factory=list)
+    pending_pre_blur_observation: dict[str, float | bool] | None = None
+    last_blur_quality_reward: float = 0.0
+    last_blur_psnr_delta: float = 0.0
+    last_blur_surplus_delta: float = 0.0
+    last_blur_structural_fraction: float = 0.0
+    last_blur_capacity_cost: float = 0.0
+    last_blur_feature_raw: list[float] = field(default_factory=list)
+    last_blur_feature_normalized: list[float] = field(default_factory=list)
 
     def external_pruning(self, valid_points_mask: Tensor) -> None:
         super().external_pruning(valid_points_mask)
@@ -454,6 +468,7 @@ def transfer_legs_runtime_state(
         "pending_pre_metric",
         "pending_pre_visible",
         "pending_views",
+        "pending_blur_views",
         "last_event_step",
         "last_reward_step",
         "last_valid_count",
@@ -465,9 +480,22 @@ def transfer_legs_runtime_state(
         "last_cap_truncation",
         "last_event_kind",
         "last_sampled_view_indices",
+        "last_blur_probe_view_indices",
         "opacity_reset_count",
         "final_prune_count",
         "event_log",
+        "initial_gaussian_count",
+        "blur_feature_history",
+        "blur_quality_delta_history",
+        "fixed_blur_probe_positions",
+        "pending_pre_blur_observation",
+        "last_blur_quality_reward",
+        "last_blur_psnr_delta",
+        "last_blur_surplus_delta",
+        "last_blur_structural_fraction",
+        "last_blur_capacity_cost",
+        "last_blur_feature_raw",
+        "last_blur_feature_normalized",
     ):
         setattr(target, name, getattr(source, name))
 
@@ -532,11 +560,70 @@ def _sample_official_views(
         key: context[key].index_select(1, index).detach()
         for key in ("image", "extrinsics", "intrinsics", "near", "far")
     }
+    for key in (
+        "raw_image",
+        "target_confidence",
+        "known_sharp",
+        "direct_supervision",
+        "valid_mask",
+    ):
+        if key in context and context[key] is not None:
+            views[key] = context[key].index_select(1, index).detach()
     if "index" in context and context["index"] is not None:
-        source = context["index"].index_select(1, index).reshape(-1)
+        views["index"] = context["index"].index_select(1, index).detach()
+        source = views["index"].reshape(-1)
         sampled = [int(value) for value in source.detach().cpu()]
     else:
         sampled = selected
+    return views, sampled
+
+
+def _fixed_blur_probe_views(
+    cfg: LeGSStrategyCfg,
+    context: dict[str, Tensor],
+    adc_state: LeGSStrategyState,
+) -> tuple[dict[str, Tensor], list[int]]:
+    """Select one coverage-oriented training probe set for the whole scene."""
+    total = int(context["image"].shape[1])
+    if not adc_state.fixed_blur_probe_positions:
+        probe_mask = context.get("policy_probe")
+        if probe_mask is not None:
+            positions = torch.nonzero(
+                probe_mask.reshape(-1).bool(), as_tuple=False
+            ).flatten()
+        else:
+            count = min(cfg.state_view_count, total)
+            positions = torch.linspace(
+                0, total - 1, steps=count, device=context["image"].device
+            ).round().long()
+        if positions.numel() == 0:
+            raise RuntimeError("legs_blur requires at least one training probe view")
+        adc_state.fixed_blur_probe_positions = [
+            int(value) for value in positions.detach().cpu()
+        ]
+
+    selected = adc_state.fixed_blur_probe_positions
+    if min(selected) < 0 or max(selected) >= total:
+        raise RuntimeError("legs_blur probe positions changed across optimizer phases")
+    index = torch.tensor(selected, device=context["image"].device)
+    views = {
+        key: context[key].index_select(1, index).detach()
+        for key in ("image", "extrinsics", "intrinsics", "near", "far")
+    }
+    for key in (
+        "raw_image",
+        "target_confidence",
+        "known_sharp",
+        "direct_supervision",
+        "valid_mask",
+    ):
+        if key in context and context[key] is not None:
+            views[key] = context[key].index_select(1, index).detach()
+    if "index" in context and context["index"] is not None:
+        views["index"] = context["index"].index_select(1, index).detach()
+        sampled = [int(value) for value in views["index"].reshape(-1).cpu()]
+    else:
+        sampled = list(selected)
     return views, sampled
 
 
@@ -609,6 +696,243 @@ def build_legs_state(
     return state.detach(), metric_score.detach(), visible.detach(), views, sampled
 
 
+@torch.no_grad()
+def _render_blur_policy_observation(
+    gaussians: Gaussians,
+    renderer,
+    views: dict[str, Tensor],
+    objective,
+) -> dict[str, float | bool]:
+    """Measure blur-aware policy signals on LeGS's fixed training views."""
+    if objective is None:
+        raise RuntimeError("legs_blur requires a configured BlurAwareObjective")
+    required = {"raw_image", "target_confidence", "known_sharp", "index"}
+    missing = sorted(key for key in required if key not in views)
+    if missing:
+        raise RuntimeError(f"legs_blur training views lack {missing}")
+
+    image_shape = tuple(views["image"].shape[-2:])
+    output = renderer.forward(
+        gaussians=gaussians,
+        extrinsics=views["extrinsics"],
+        intrinsics=views["intrinsics"],
+        near=views["near"],
+        far=views["far"],
+        image_shape=image_shape,
+    )
+    prediction = output.color.clamp(0.0, 1.0)
+    target = views["image"]
+    raw = views["raw_image"]
+    confidence = views["target_confidence"].float().clamp(0.0, 1.0)
+    known_sharp = views["known_sharp"].bool()
+    confidence = torch.where(known_sharp, torch.ones_like(confidence), confidence)
+    valid_mask = views.get("valid_mask")
+
+    squared_error = (prediction - target).square()
+    if valid_mask is None:
+        mse = squared_error.mean(dim=(2, 3, 4))
+    else:
+        valid = valid_mask.to(dtype=squared_error.dtype)
+        denominator = valid.sum(dim=(2, 3, 4)).clamp_min(1.0) * target.shape[2]
+        mse = (squared_error * valid).sum(dim=(2, 3, 4)) / denominator
+    per_view_psnr = -10.0 * torch.log10(mse.clamp_min(1e-12))
+    confidence_sum = confidence.sum().clamp_min(1e-8)
+    weighted_psnr = (per_view_psnr * confidence).sum() / confidence_sum
+
+    surplus = objective.measure_probe_surplus(
+        prediction,
+        raw,
+        target,
+        known_sharp,
+        confidence,
+        valid_mask,
+    )
+    direct = views.get("direct_supervision")
+    direct = known_sharp if direct is None else direct.bool()
+    active = ~direct.reshape(-1)
+    kernel_entropy = prediction.new_zeros(())
+    kernel_radius = prediction.new_zeros(())
+    mask_mean = prediction.new_zeros(())
+    if active.any():
+        _, bpn_stats = objective.bpn(
+            prediction,
+            output.depth,
+            raw,
+            target,
+            views["index"],
+        )
+        kernels = bpn_stats["kernels"][active]
+        entropy = -(kernels * kernels.clamp_min(1e-8).log()).sum(dim=-1)
+        kernel_entropy = entropy.mean() / math.log(kernels.shape[-1])
+        radius_squared = (
+            kernels
+            * (
+                objective.bpn.kernel_x.square()
+                + objective.bpn.kernel_y.square()
+            )
+        ).sum(dim=-1)
+        kernel_radius = radius_squared.clamp_min(0.0).sqrt().mean() / math.sqrt(2.0)
+        mask_mean = bpn_stats["mask"][0, active].mean()
+
+    return {
+        "weighted_psnr": float(weighted_psnr),
+        "surplus": float(surplus["surplus"]),
+        "has_surplus": bool(surplus["has_surplus"]),
+        "reliability_mean": float(confidence.mean()),
+        "reliability_std": float(
+            confidence.std(correction=1 if confidence.numel() > 1 else 0)
+        ),
+        "kernel_entropy": float(kernel_entropy),
+        "kernel_radius": float(kernel_radius),
+        "mask_mean": float(mask_mean),
+        "bpn_active": bool(active.any()),
+    }
+
+
+def _standardize_blur_features(
+    adc_state: LeGSStrategyState,
+    features: Tensor,
+) -> Tensor:
+    """Keep dimensionless blur signals on one scene-independent scale."""
+    adc_state.blur_feature_history.append(
+        [float(value) for value in features.detach().cpu()]
+    )
+    # Every input is analytically normalized before this point: confidence,
+    # normalized entropy/radius/mask and tanh(log-ratio) pressure all have a
+    # physical [-1, 1] contract. Temporal z-scoring would erase constant but
+    # important scene identity such as EVSSM reliability.
+    return features.clamp(-1.0, 1.0)
+
+
+def _normalize_blur_quality_delta(
+    adc_state: LeGSStrategyState,
+    psnr_delta: float,
+    surplus_delta: float,
+    has_surplus: bool,
+    reliability: float,
+    device: torch.device,
+) -> float:
+    """Normalize reward changes by their causal per-scene RMS."""
+    adc_state.blur_quality_delta_history.append([psnr_delta, surplus_delta])
+    history = torch.tensor(
+        adc_state.blur_quality_delta_history,
+        dtype=torch.float32,
+        device=device,
+    )
+    current = history[-1]
+    rms = history.square().mean(dim=0).sqrt().clamp_min(1e-8)
+    normalized = torch.tanh(current / rms)
+    if not has_surplus:
+        return float(normalized[0])
+    reliability = min(1.0, max(0.0, float(reliability)))
+    return float(
+        reliability * normalized[0]
+        + (1.0 - reliability) * normalized[1]
+    )
+
+
+def _compose_blur_conditioned_reward(
+    reward: Tensor,
+    actions: Tensor,
+    valid: Tensor,
+    quality_reward: float,
+    cfg: LeGSStrategyCfg,
+) -> tuple[Tensor, float, float]:
+    """Credit structural actions for quality while charging representation growth."""
+    changed = (actions != 0) & valid
+    structural_fraction = float(changed.sum() / valid.sum().clamp_min(1))
+    birth = ((actions == 1) | (actions == 2)) & valid
+    removed = (actions == 3) & valid
+    relative_growth = max(
+        0.0,
+        float(birth.sum() - removed.sum()) / max(1, actions.numel()),
+    )
+    reward = reward.clone()
+    reward[valid] += cfg.blur_quality_weight * quality_reward * changed[
+        valid
+    ].to(reward.dtype)
+    reward[birth] -= (
+        cfg.blur_capacity_weight * relative_growth
+    )
+    return reward, structural_fraction, relative_growth
+
+
+def build_blur_conditioned_legs_state(
+    cfg: LeGSStrategyCfg,
+    gaussians: Gaussians,
+    adc_state: LeGSStrategyState,
+    renderer,
+    context: dict[str, Tensor],
+    objective,
+) -> tuple[
+    Tensor,
+    Tensor,
+    Tensor,
+    dict[str, Tensor],
+    list[int],
+    dict[str, float | bool],
+    dict[str, Tensor],
+    list[int],
+]:
+    state, metric_score, visible, views, sampled = build_legs_state(
+        cfg, gaussians, renderer, context
+    )
+    blur_views, blur_sampled = _fixed_blur_probe_views(cfg, context, adc_state)
+    observation = _render_blur_policy_observation(
+        gaussians, renderer, blur_views, objective
+    )
+    if adc_state.initial_gaussian_count <= 0:
+        adc_state.initial_gaussian_count = int(gaussians.means.shape[1])
+    pressure = math.log(
+        max(1, int(gaussians.means.shape[1])) / adc_state.initial_gaussian_count
+    )
+    bpn_active = bool(observation["bpn_active"])
+    raw_features = state.new_tensor(
+        [
+            2.0 * float(observation["reliability_mean"]) - 1.0,
+            2.0 * float(observation["reliability_std"]),
+            float(observation["surplus"]),
+            2.0 * float(observation["kernel_entropy"]) - 1.0
+            if bpn_active
+            else 0.0,
+            2.0 * float(observation["kernel_radius"]) - 1.0
+            if bpn_active
+            else 0.0,
+            2.0 * float(observation["mask_mean"]) - 1.0
+            if bpn_active
+            else 0.0,
+            math.tanh(pressure),
+        ]
+    )
+    normalized = _standardize_blur_features(adc_state, raw_features)
+    adc_state.last_blur_feature_raw = [float(value) for value in raw_features]
+    adc_state.last_blur_feature_normalized = [
+        float(value) for value in normalized
+    ]
+    if normalized.numel() != cfg.blur_feature_dim:
+        raise RuntimeError(
+            f"legs_blur expected {cfg.blur_feature_dim} blur features, "
+            f"got {normalized.numel()}"
+        )
+    conditioned = normalized[None].expand(state.shape[0], -1)
+    state = torch.cat([state, conditioned], dim=-1)
+    if state.shape[-1] != cfg.state_dim:
+        raise RuntimeError(
+            f"legs_blur state has {state.shape[-1]} dimensions, "
+            f"config declares {cfg.state_dim}"
+        )
+    return (
+        state,
+        metric_score,
+        visible,
+        views,
+        sampled,
+        observation,
+        blur_views,
+        blur_sampled,
+    )
+
+
 def _cosine_opacity(cfg: LeGSStrategyCfg, step: int) -> float:
     span = max(1, cfg.refine_stop_iter - cfg.refine_start_iter)
     progress = min(1.0, max(0.0, (step - cfg.refine_start_iter) / span))
@@ -624,6 +948,7 @@ def _finish_delayed_reward(
     gaussians: Gaussians,
     adc_state: LeGSStrategyState,
     renderer,
+    objective=None,
 ) -> None:
     if step != adc_state.pending_reward_step:
         return
@@ -635,6 +960,8 @@ def _finish_delayed_reward(
         or adc_state.parent_mapping is None
     ):
         raise RuntimeError("incomplete exact-LeGS delayed reward state")
+    if cfg.blur_conditioned and adc_state.pending_blur_views is None:
+        raise RuntimeError("legs_blur delayed reward lost its fixed probe views")
 
     new_metric, new_visible = _metric_score(
         gaussians, renderer, adc_state.pending_views, clamp=True
@@ -664,6 +991,45 @@ def _finish_delayed_reward(
         reward[valid] = (values - mean) / (std + 1e-6)
         adc_state.last_reward_mean = float(mean)
         adc_state.last_reward_std = float(std)
+    if cfg.blur_conditioned:
+        if adc_state.pending_pre_blur_observation is None:
+            raise RuntimeError("legs_blur delayed reward lost its pre-action observation")
+        post_observation = _render_blur_policy_observation(
+            gaussians, renderer, adc_state.pending_blur_views, objective
+        )
+        pre_observation = adc_state.pending_pre_blur_observation
+        psnr_delta = float(post_observation["weighted_psnr"]) - float(
+            pre_observation["weighted_psnr"]
+        )
+        has_surplus = bool(pre_observation["has_surplus"]) and bool(
+            post_observation["has_surplus"]
+        )
+        surplus_delta = (
+            float(post_observation["surplus"])
+            - float(pre_observation["surplus"])
+            if has_surplus
+            else 0.0
+        )
+        quality_reward = _normalize_blur_quality_delta(
+            adc_state,
+            psnr_delta,
+            surplus_delta,
+            has_surplus,
+            float(pre_observation["reliability_mean"]),
+            new_metric.device,
+        )
+        reward, structural_fraction, capacity_cost = _compose_blur_conditioned_reward(
+            reward,
+            actions,
+            valid,
+            quality_reward,
+            cfg,
+        )
+        adc_state.last_blur_quality_reward = quality_reward
+        adc_state.last_blur_psnr_delta = psnr_delta
+        adc_state.last_blur_surplus_delta = surplus_delta
+        adc_state.last_blur_structural_fraction = structural_fraction
+        adc_state.last_blur_capacity_cost = capacity_cost
     adc_state.controller.set_reward(
         adc_state.pending_transition_index, reward, valid
     )
@@ -681,6 +1047,8 @@ def _finish_delayed_reward(
     adc_state.pending_pre_metric = None
     adc_state.pending_pre_visible = None
     adc_state.pending_views = None
+    adc_state.pending_blur_views = None
+    adc_state.pending_pre_blur_observation = None
 
 
 def _enforce_safety_cap(
@@ -806,6 +1174,7 @@ def apply_legs_strategy(
     smoothers: dict[str, Any],
     renderer,
     context: dict[str, Tensor],
+    objective=None,
     zero_t: bool = False,
 ) -> tuple[int, int, int, float | None, float | None]:
     if isinstance(gaussians, GaussiansModule):
@@ -813,7 +1182,9 @@ def apply_legs_strategy(
     if adc_state.controller is None:
         adc_state.controller = LeGSPPOController(cfg, gaussians.means.device)
 
-    _finish_delayed_reward(cfg, step, gaussians, adc_state, renderer)
+    _finish_delayed_reward(
+        cfg, step, gaussians, adc_state, renderer, objective=objective
+    )
 
     denom = adc_state.denom.clamp_min(1.0)
     grads = adc_state.grad2d_norm_accum / denom
@@ -849,9 +1220,26 @@ def apply_legs_strategy(
             "refine_every or reduce reward_delay"
         )
 
-    states, pre_metric, pre_visible, views, sampled_views = build_legs_state(
-        cfg, gaussians, renderer, context
-    )
+    pre_blur_observation = None
+    blur_views = None
+    blur_sampled_views: list[int] = []
+    if cfg.blur_conditioned:
+        (
+            states,
+            pre_metric,
+            pre_visible,
+            views,
+            sampled_views,
+            pre_blur_observation,
+            blur_views,
+            blur_sampled_views,
+        ) = build_blur_conditioned_legs_state(
+            cfg, gaussians, adc_state, renderer, context, objective
+        )
+    else:
+        states, pre_metric, pre_visible, views, sampled_views = build_legs_state(
+            cfg, gaussians, renderer, context
+        )
     valid = ((grads >= cfg.grad_thresh) | (abs_grads >= cfg.grad_abs_thresh))
     valid &= pre_visible
 
@@ -886,6 +1274,8 @@ def apply_legs_strategy(
     adc_state.pending_pre_metric = pre_metric
     adc_state.pending_pre_visible = pre_visible
     adc_state.pending_views = views
+    adc_state.pending_blur_views = blur_views
+    adc_state.pending_pre_blur_observation = pre_blur_observation
 
     n_before = actions.shape[0]
     clone_mask = actions == 1
@@ -930,6 +1320,7 @@ def apply_legs_strategy(
     adc_state.last_event_step = step
     adc_state.last_event_kind = "policy"
     adc_state.last_sampled_view_indices = sampled_views
+    adc_state.last_blur_probe_view_indices = blur_sampled_views
     adc_state.last_valid_count = int(valid.sum())
     adc_state.last_clone_count = nr_cloned
     adc_state.last_split_count = nr_split
@@ -954,6 +1345,7 @@ def apply_legs_strategy(
         "num_gaussians": int(gaussians.means.shape[1]),
         "ppo_updates": adc_state.controller.update_count,
         "sampled_view_indices": sampled_views,
+        "blur_probe_view_indices": blur_sampled_views,
         "opacity_reset": bool(
             cfg.do_opacity_reset and step > 0 and step % cfg.reset_every == 0
         ),

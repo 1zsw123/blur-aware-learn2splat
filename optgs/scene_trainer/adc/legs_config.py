@@ -8,7 +8,7 @@ from optgs.scene_trainer.adc.base import BaseStrategyCfg
 class LeGSStrategyCfg(BaseStrategyCfg):
     """Configuration for the exact transplanted LeGS capacity mechanism."""
 
-    name: Literal["legs"]
+    name: Literal["legs", "legs_blur"]
     grad_thresh: float = 0.0001
     grad_abs_thresh: float = 0.0002
     state_dim: int = 11
@@ -32,3 +32,7 @@ class LeGSStrategyCfg(BaseStrategyCfg):
     min_opacity_final: float = 0.1
     reward_normalize: bool = True
     use_prune_estimator: bool = True
+    blur_conditioned: bool = False
+    blur_feature_dim: int = 7
+    blur_quality_weight: float = 1.0
+    blur_capacity_weight: float = 1.0

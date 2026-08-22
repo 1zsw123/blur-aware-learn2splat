@@ -369,6 +369,7 @@ def build_refiner_cfg(strategy: str, num_refine: int) -> "BaseStrategyCfg":
         "adaptive": AdaptiveStrategyCfg,
         "adaptive_legacy": AdaptiveStrategyCfg,
         "legs": LeGSStrategyCfg,
+        "legs_blur": LeGSStrategyCfg,
     }.get(strategy, VanillaStrategyCfg)
     cfg = load_typed_config(OmegaConf.load(yaml_path), arm)
 
@@ -378,7 +379,7 @@ def build_refiner_cfg(strategy: str, num_refine: int) -> "BaseStrategyCfg":
 
     n = max(1, int(num_refine))
     cap = cfg.cap_max if (cfg.cap_max and cfg.cap_max > 0) else 1_500_000
-    if cfg.name == "legs":
+    if cfg.name in {"legs", "legs_blur"}:
         # Exact LeGS transplantation keeps the released 500/100/15000
         # densification schedule and the absence of a global primitive cap.
         # Scaling these values to a smoke-test horizon is the older adapted

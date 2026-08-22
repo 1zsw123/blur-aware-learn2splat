@@ -166,6 +166,38 @@ artifact 和 EMA 定义见 `objective.py` 与 `LAPLACIAN_ABLATION.md`。
 PSNR/Laplacian probe reward。因此当前组合的 blur awareness 来自监督目标，LeGS
 负责学习结构动作；不能把它写成“Laplacian reward 版 LeGS”。
 
+### 5.1 Blur-conditioned LeGS 实验分支
+
+`--adc legs_blur` 在不改动 `--adc legs` 回退路径的前提下，把模糊恢复需求真正
+接入 LeGS policy。它保留官方 11-D 逐基元状态、FastGS sensitivity、PPO、
+parent-child credit 和 prune estimator，并为每个 Gaussian 追加同一时刻的 7-D
+场景状态：
+
+```text
+[EVSSM reliability mean/std,
+ render-over-EVSSM Laplacian surplus,
+ BPN kernel entropy/radius, BPN mask strength,
+ primitive pressure]
+```
+
+这些量先按各自物理范围变成无量纲的 `[-1, 1]` 特征，而不是套用某个数据集的
+PSNR、kernel 或 primitive 阈值。策略 reward 在动作后延迟 50 steps 计算：
+
+```text
+r = r_sensitivity
+    + w_q * (confidence-weighted multi-view PSNR/surplus improvement)
+    - w_c * max(0, relative net primitive growth)
+```
+
+质量项始终读取同一组 8 个 farthest training probes；最终 hold/test 视图不会进入
+状态或 reward。actor 因而能结合局部 sensitivity 与全局模糊恢复状态选择
+`keep/clone/split`，低 opacity 的 `prune` estimator 也读取相同的 18-D 状态。
+
+三域 3K matched smoke 的平均 PSNR 比 exact LeGS 低 `0.507 dB`，总 primitive
+数少 `13.5%`。因此它已经是正确接线、可复现的机制消融，但目前只证明了容量
+压缩，不证明质量提升，也尚未替代本节的 exact LeGS 主候选。完整表、协议和
+产物见 `BLUR_CONDITIONED_LEGS_SMOKE_ZH.md`。
+
 ## 6. 当前三域 matched smoke
 
 固定条件：seed `20260822`、10K、每 1K 评测、`learned_projected`、FastGS、
@@ -204,6 +236,14 @@ CUDA_VISIBLE_DEVICES=2 "$ENV" \
   --laplacian-loss-mode surplus --laplacian-loss-weight 0.1
 ```
 
+### Blur-conditioned LeGS 实验臂
+
+```text
+--adc legs_blur --decoder-backend fastgs
+--densification-reward off
+--laplacian-loss-mode surplus --laplacian-loss-weight 0.1
+```
+
 ### 稳定 adaptive 回退
 
 ```text
@@ -232,6 +272,8 @@ CUDA_VISIBLE_DEVICES=2 "$ENV" \
 | BPN、重建 loss、surplus loss | `optgs/experimental/blur_aware/objective.py` |
 | exact LeGS policy/reward/action | `optgs/scene_trainer/adc/legs.py` |
 | exact LeGS 配置 | `optgs/scene_trainer/adc/legs_config.py` |
+| blur-conditioned LeGS 配置 | `optgs/config/scene_trainer/scene_optimizer/refiner/legs_blur.yaml` |
+| blur-conditioned 三域 smoke | `BLUR_CONDITIONED_LEGS_SMOKE_ZH.md` |
 | FastGS sensitivity 接口 | `optgs/scene_trainer/adc/fastgs.py` |
 | 三域 matched 汇总 | `summarize_adc_pairs.py` |
 | 完整 Laplacian 消融 | `LAPLACIAN_ABLATION.md` |

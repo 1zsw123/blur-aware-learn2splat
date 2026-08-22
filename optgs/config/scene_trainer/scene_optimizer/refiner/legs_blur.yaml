@@ -1,0 +1,57 @@
+name: legs_blur
+
+do_densify: true
+do_prune: true
+do_opacity_reset: true
+
+# Keep the exact LeGS structural schedule and uncapped action space. The only
+# difference from legs.yaml is blur-conditioned state and delayed reward.
+cap_max: -1
+pause_refine_after_reset: 0
+refine_every: 100
+reset_every: 3000
+refine_start_iter: 500
+refine_stop_iter: 15000
+refine_scale2d_stop_iter: 0
+
+grow_grad2d: 0.0001
+grow_scale3d: 0.001
+prune_scale3d: 0.1
+prune_scale2d: 0.15
+grow_scale2d: 0.05
+min_opacity: 0.005
+prune_zero_radii: false
+
+reduce_opacity: false
+reduce_factor: 0.0
+reduce_every: 0
+fallback_means_lr: 0.0
+
+grad_thresh: 0.0001
+grad_abs_thresh: 0.0002
+state_dim: 18
+hidden_dim: 64
+reward_delay: 50
+rollout_batch_size: 2
+ppo_epochs: 2
+ppo_chunk_size: 500000
+state_view_count: 10
+use_mixed_precision: true
+gamma: 0.99
+gae_lambda: 0.95
+policy_clip: 0.2
+actor_lr_init: 0.001
+actor_lr_final: 0.00001
+state_encoder_lr_init: 0.001
+state_encoder_lr_final: 0.00001
+prune_lr_init: 0.001
+prune_lr_final: 0.00001
+min_opacity_init: 0.005
+min_opacity_final: 0.1
+reward_normalize: true
+use_prune_estimator: true
+
+blur_conditioned: true
+blur_feature_dim: 7
+blur_quality_weight: 1.0
+blur_capacity_weight: 1.0

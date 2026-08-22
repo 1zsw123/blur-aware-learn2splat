@@ -170,7 +170,8 @@ def parse_args() -> argparse.Namespace:
         default="adaptive_legacy",
         help=(
             "OptGS ADC strategy. The validated cross-dataset default is "
-            "adaptive_legacy; adaptive is the support-conditioned v2 ablation."
+            "adaptive_legacy; legs is the exact LeGS transplant and legs_blur "
+            "adds blur-conditioned state and delayed reward."
         ),
     )
     parser.add_argument(
@@ -801,7 +802,12 @@ def collect_scene(parser: Parser, cfg: dict, evaluation_indices: list[int]) -> d
 
 
 def build_views(
-    scene: dict, indices: list[int], scene_scale: float, device: torch.device
+    scene: dict,
+    indices: list[int],
+    scene_scale: float,
+    device: torch.device,
+    *,
+    policy_probe_indices: set[int] | None = None,
 ) -> BatchedViews:
     selection = torch.tensor(indices, dtype=torch.long)
     images = scene["target_images"][selection]
@@ -817,6 +823,13 @@ def build_views(
         return tensor if dtype is None else tensor.to(dtype=dtype)
 
     v = len(indices)
+    policy_probe = torch.tensor(
+        [
+            policy_probe_indices is not None and index in policy_probe_indices
+            for index in indices
+        ],
+        dtype=torch.bool,
+    )
     return BatchedViews.from_dict(
         {
             "extrinsics": batch(c2w),
@@ -833,6 +846,7 @@ def build_views(
             ),
             "sampling_mass": batch(scene["sampling_mass"][selection]),
             "valid_mask": batch(scene["valid_mask"][selection], dtype=None),
+            "policy_probe": batch(policy_probe, dtype=None),
             "near": torch.full((1, v), NEAR_PLANE, device=device),
             "far": torch.full((1, v), FAR_PLANE, device=device),
             "index": torch.arange(v, device=device).unsqueeze(0),
@@ -1329,15 +1343,25 @@ def save_kernel_visualization(
 
 def main() -> None:
     args = parse_args()
-    if args.adc == "legs" and args.decoder_backend != "fastgs":
+    if args.adc in {"legs", "legs_blur"} and args.decoder_backend != "fastgs":
         raise ValueError(
-            "exact --adc legs requires --decoder-backend fastgs; the official "
+            "LeGS-based ADC requires --decoder-backend fastgs; the official "
             "per-Gaussian leave-one-out sensitivity is a FastGS CUDA kernel"
         )
     if args.adc == "legs" and args.densification_reward != "off":
         raise ValueError(
             "exact LeGS uses its own delayed per-Gaussian sensitivity reward; "
             "do not combine it with the adapted global probe reward"
+        )
+    if args.adc == "legs_blur" and (
+        args.objective != "blur-aware"
+        or args.laplacian_loss_mode != "surplus"
+        or args.densification_reward != "off"
+    ):
+        raise ValueError(
+            "legs_blur requires --objective blur-aware, "
+            "--laplacian-loss-mode surplus, and --densification-reward off; "
+            "its delayed blur reward is internal to the LeGS policy"
         )
     reward_enabled = args.densification_reward == "surplus_probe"
     probe_enabled = args.densification_reward != "off"
@@ -1381,7 +1405,23 @@ def main() -> None:
     )
     scene = collect_scene(parser, cfg, evaluation_indices)
     scene_scale = float(parser.scene_scale * 1.1)
-    train_views = build_views(scene, optimization_indices, scene_scale, device)
+    evaluation_set = set(evaluation_indices)
+    non_evaluation_indices = [
+        index for index in optimization_indices if index not in evaluation_set
+    ]
+    if not non_evaluation_indices:
+        non_evaluation_indices = optimization_indices
+    probe_local = farthest_probe_indices(
+        scene["c2w"][torch.tensor(non_evaluation_indices)], args.probe_views
+    )
+    probe_global = [non_evaluation_indices[index] for index in probe_local]
+    train_views = build_views(
+        scene,
+        optimization_indices,
+        scene_scale,
+        device,
+        policy_probe_indices=set(probe_global),
+    )
     test_views = build_views(scene, evaluation_indices, scene_scale, device)
 
     requested_batch_strategy = args.opt_batch_strategy
@@ -1465,15 +1505,6 @@ def main() -> None:
             reward_conditioned=reward_enabled,
         ).to(device)
 
-    non_evaluation_indices = [
-        index for index in optimization_indices if index not in set(evaluation_indices)
-    ]
-    if not non_evaluation_indices:
-        non_evaluation_indices = optimization_indices
-    probe_local = farthest_probe_indices(
-        scene["c2w"][torch.tensor(non_evaluation_indices)], args.probe_views
-    )
-    probe_global = [non_evaluation_indices[index] for index in probe_local]
     probe_views = build_views(scene, probe_global, scene_scale, device)
     optimization_names = [
         Path(parser.image_names[index]).stem for index in optimization_indices
@@ -1609,8 +1640,13 @@ def main() -> None:
                 "official Learn2Splat Dense + exact LeGS per-Gaussian PPO "
                 "+ factorized BPN + calibrated EVSSM + normalized NIMA-sharp w10"
                 if args.adc == "legs"
-                else "official Learn2Splat Dense + factorized BPN + calibrated EVSSM "
-                "+ normalized NIMA-sharp w10"
+                else (
+                    "official Learn2Splat Dense + blur-conditioned LeGS PPO "
+                    "+ factorized BPN + calibrated EVSSM + normalized NIMA-sharp w10"
+                    if args.adc == "legs_blur"
+                    else "official Learn2Splat Dense + factorized BPN + calibrated EVSSM "
+                    "+ normalized NIMA-sharp w10"
+                )
             )
             if args.optimizer == "learned"
             else (
@@ -1618,8 +1654,13 @@ def main() -> None:
                     "official Learn2Splat Dense proposal + objective-consistent "
                     "Adam residual projection + exact LeGS per-Gaussian PPO"
                     if args.adc == "legs"
-                    else "official Learn2Splat Dense proposal + objective-consistent "
-                    "Adam residual projection + blur-aware capacity controller"
+                    else (
+                        "official Learn2Splat Dense proposal + objective-consistent "
+                        "Adam residual projection + blur-conditioned LeGS PPO"
+                        if args.adc == "legs_blur"
+                        else "official Learn2Splat Dense proposal + objective-consistent "
+                        "Adam residual projection + blur-aware capacity controller"
+                    )
                 )
                 if args.optimizer == "learned_projected"
                 else "official OptGS Adam diagnostic"
@@ -1652,14 +1693,50 @@ def main() -> None:
             "densification_reward": args.densification_reward,
             "capacity_controller": (
                 {
-                    "version": "official_legs_8eb120b_exact_mechanism",
+                    "version": (
+                        "blur_conditioned_legs_v2"
+                        if args.adc == "legs_blur"
+                        else "official_legs_8eb120b_exact_mechanism"
+                    ),
                     "host_representation": "learn2splat_gaussians",
                     "sensitivity": "official_fastgs_leave_one_out_l1",
-                    "state_dim": 11,
+                    "state_dim": 18 if args.adc == "legs_blur" else 11,
                     "state_views": 10,
+                    "quality_probe_views": (
+                        len(probe_global) if args.adc == "legs_blur" else None
+                    ),
+                    "quality_probe_policy": (
+                        "fixed_farthest_training_views"
+                        if args.adc == "legs_blur"
+                        else None
+                    ),
+                    "blur_state": (
+                        [
+                            "evssm_reliability_mean",
+                            "evssm_reliability_dispersion",
+                            "laplacian_surplus",
+                            "bpn_kernel_entropy",
+                            "bpn_kernel_radius",
+                            "bpn_mask_strength",
+                            "primitive_pressure",
+                        ]
+                        if args.adc == "legs_blur"
+                        else None
+                    ),
                     "actions": ["keep", "clone", "split"],
                     "pruning": "separate_low_opacity_estimator",
                     "reward_delay": 50,
+                    "reward": (
+                        "normalized sensitivity + confidence-weighted PSNR delta "
+                        "+ Laplacian-surplus delta - relative net capacity growth"
+                        if args.adc == "legs_blur"
+                        else "normalized delayed per-Gaussian sensitivity"
+                    ),
+                    "cross_scene_normalization": (
+                        "dimensionless bounded state features and causal reward RMS"
+                        if args.adc == "legs_blur"
+                        else None
+                    ),
                     "parent_child_credit": True,
                     "schedule": {
                         "start": 500,
@@ -1669,7 +1746,7 @@ def main() -> None:
                     },
                     "global_primitive_cap": None,
                 }
-                if args.adc == "legs"
+                if args.adc in {"legs", "legs_blur"}
                 else
                 {
                     "version": (

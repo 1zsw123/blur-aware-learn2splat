@@ -933,7 +933,7 @@ class KnnBasedOptimizer(LearnedOptimizer[KnnBasedOptimizerCfg]):
         if self.cfg.any_adc:
 
             n_before_adc = updated_gaussians.means.shape[1]
-            if self.cfg.refiner.name == "legs":
+            if self.cfg.refiner.name in {"legs", "legs_blur"}:
                 meta_for_adc["legs_renderer"] = renderer
                 # Match the official ten-camera LeGS state/reward sample, not
                 # Learn2Splat's current eight-view optimization minibatch.

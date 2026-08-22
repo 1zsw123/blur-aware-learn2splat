@@ -33,7 +33,7 @@ def init_strategy_state(
     **kwargs
 ) -> VanillaStrategyState | McmcStrategyState | FastGSStrategyState | LeGSStrategyState:
 
-    if cfg.name == "legs":
+    if cfg.name in {"legs", "legs_blur"}:
         return LeGSStrategyState.initialize(
             nr_points=kwargs["nr_points"],
             device=kwargs["device"],
@@ -104,7 +104,7 @@ def apply_adc_strategy(
 ) -> tuple[int, int, int, float | None, float | None]:
     """Applies ADC strategy and returns number of cloned, split, pruned GSs."""
     
-    if cfg.name == "legs":
+    if cfg.name in {"legs", "legs_blur"}:
         from optgs.scene_trainer.adc.legs import apply_legs_strategy
         assert isinstance(adc_state, LeGSStrategyState), "adc_state type mismatch."
         return apply_legs_strategy(
@@ -115,6 +115,7 @@ def apply_adc_strategy(
             smoothers=smoothers,
             renderer=kwargs["renderer"],
             context=kwargs["context"],
+            objective=kwargs.get("objective"),
             zero_t=zero_t,
         )
     elif cfg.name == "fastgs":
@@ -177,7 +178,7 @@ def post_backward(
     # Official LeGS stops collecting densification statistics at its released
     # densify_until_iter boundary. Other strategies keep their existing update
     # behavior.
-    if cfg.name != "legs" or step < cfg.refine_stop_iter:
+    if cfg.name not in {"legs", "legs_blur"} or step < cfg.refine_stop_iter:
         update_strategy_state(
             adc_state,
             radii_2d=radii_2d,

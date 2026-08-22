@@ -33,6 +33,16 @@ does not reuse the older global/proxy `adapt` controller. The implementation,
 equations, benchmark protocols, rollback flags, smoke-test table, and
 reproduction commands are documented in
 [`experiments/blur_aware_cross_dataset/README.md`](experiments/blur_aware_cross_dataset/README.md).
+
+The separate experimental mode `--adc legs_blur` retains that exact local
+LeGS mechanism and appends seven bounded scene-level blur features: EVSSM
+reliability, Laplacian surplus, BPN kernel/mask statistics, and primitive
+pressure. Its delayed reward combines fixed-training-probe PSNR/sharpness
+improvement with the original sensitivity reward and a relative capacity
+cost. Exact LeGS remains available unchanged with `--adc legs`. The matched
+Motion/Defocus/TUM smoke results and their current quality/capacity tradeoff
+are recorded in
+[`BLUR_CONDITIONED_LEGS_SMOKE_ZH.md`](experiments/blur_aware_cross_dataset/BLUR_CONDITIONED_LEGS_SMOKE_ZH.md).
 The exact current stack, module boundaries, rollback matrix, and three-domain
 matched smoke results are also summarized in Chinese in
 [`CURRENT_ARCHITECTURE_ZH.md`](experiments/blur_aware_cross_dataset/CURRENT_ARCHITECTURE_ZH.md).

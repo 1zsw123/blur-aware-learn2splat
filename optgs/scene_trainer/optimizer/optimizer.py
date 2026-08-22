@@ -434,6 +434,9 @@ class Optimizer(nn.Module, ABC, Generic[T]):
             )
             if feedback is not None:
                 set_adaptive_densification_feedback(adc_state, feedback)
+
+        if self.cfg.refiner.name == "legs_blur":
+            meta["legs_objective"] = getattr(self, "input_objective", None)
         
         # means lr for MCMC noise injection
         # check if optimizer has means_lr_scheduler
@@ -462,6 +465,7 @@ class Optimizer(nn.Module, ABC, Generic[T]):
             lr=lr,
             renderer=meta.get("legs_renderer"),
             context=meta.get("legs_context"),
+            objective=meta.get("legs_objective"),
         )
 
         if (
@@ -510,14 +514,18 @@ class Optimizer(nn.Module, ABC, Generic[T]):
                 }
             )
         elif (
-            self.cfg.refiner.name == "legs"
+            self.cfg.refiner.name in {"legs", "legs_blur"}
             and getattr(adc_state, "last_event_step", -1) == i
         ):
             controller = adc_state.controller
             self.capacity_events.append(
                 {
                     "step": int(i),
-                    "controller": "official_legs_ppo",
+                    "controller": (
+                        "blur_conditioned_legs_ppo"
+                        if self.cfg.refiner.name == "legs_blur"
+                        else "official_legs_ppo"
+                    ),
                     "event_kind": str(adc_state.last_event_kind),
                     "valid": int(adc_state.last_valid_count),
                     "cloned": int(nr_cloned),
@@ -527,11 +535,31 @@ class Optimizer(nn.Module, ABC, Generic[T]):
                     "reward_step": int(adc_state.last_reward_step),
                     "reward_mean": float(adc_state.last_reward_mean),
                     "reward_std": float(adc_state.last_reward_std),
+                    "blur_quality_reward": float(
+                        adc_state.last_blur_quality_reward
+                    ),
+                    "blur_psnr_delta": float(adc_state.last_blur_psnr_delta),
+                    "blur_surplus_delta": float(
+                        adc_state.last_blur_surplus_delta
+                    ),
+                    "blur_structural_fraction": float(
+                        adc_state.last_blur_structural_fraction
+                    ),
+                    "blur_capacity_cost": float(
+                        adc_state.last_blur_capacity_cost
+                    ),
+                    "blur_feature_raw": list(adc_state.last_blur_feature_raw),
+                    "blur_feature_normalized": list(
+                        adc_state.last_blur_feature_normalized
+                    ),
                     "ppo_updates": int(controller.update_count),
                     "policy_loss": float(controller.last_policy_loss),
                     "policy_entropy": float(controller.last_entropy),
                     "sampled_view_indices": list(
                         adc_state.last_sampled_view_indices
+                    ),
+                    "blur_probe_view_indices": list(
+                        adc_state.last_blur_probe_view_indices
                     ),
                     "opacity_reset_count": int(adc_state.opacity_reset_count),
                     "final_prune_count": int(adc_state.final_prune_count),

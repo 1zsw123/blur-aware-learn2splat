@@ -10,9 +10,13 @@ from optgs.model.types import Gaussians
 from optgs.scene_trainer.adc.legs import (
     LeGSStrategyState,
     _apply_legs_final_prune,
+    _compose_blur_conditioned_reward,
     _enforce_safety_cap,
+    _fixed_blur_probe_views,
+    _normalize_blur_quality_delta,
     _sample_official_views,
     _scatter_mean,
+    _standardize_blur_features,
     transfer_legs_runtime_state,
 )
 from optgs.scene_trainer.adc.vanilla import transfer_adaptive_reward_state
@@ -54,6 +58,95 @@ def test_exact_legs_is_valid_for_adam_projection_phase() -> None:
     assert optimizer.cfg.refiner.refine_every == 100
 
 
+def test_blur_conditioned_legs_has_separate_eighteen_dimensional_contract() -> None:
+    exact = build_refiner_cfg("legs", 800)
+    conditioned = build_refiner_cfg("legs_blur", 800)
+
+    assert exact.state_dim == 11
+    assert not exact.blur_conditioned
+    assert conditioned.name == "legs_blur"
+    assert conditioned.state_dim == 18
+    assert conditioned.blur_feature_dim == 7
+    assert conditioned.blur_conditioned
+    assert conditioned.refine_start_iter == exact.refine_start_iter == 500
+    assert conditioned.refine_every == exact.refine_every == 100
+    assert conditioned.refine_stop_iter == exact.refine_stop_iter == 15_000
+    assert conditioned.cap_max == exact.cap_max == -1
+
+
+def test_blur_feature_normalization_preserves_bounded_scene_identity() -> None:
+    state = LeGSStrategyState.initialize(2, torch.device("cpu"), 1.0)
+    first = torch.tensor([0.2, -0.4])
+    second = torch.tensor([0.6, -0.8])
+
+    assert torch.equal(_standardize_blur_features(state, first), first)
+    normalized = _standardize_blur_features(state, second)
+
+    assert torch.equal(normalized, second)
+    assert len(state.blur_feature_history) == 2
+
+
+def test_blur_reward_credits_quality_and_charges_birth_capacity() -> None:
+    cfg = build_refiner_cfg("legs_blur", 2_000)
+    reward = torch.zeros(5)
+    actions = torch.tensor([0, 1, 2, 3, 1])
+    valid = torch.tensor([True, True, True, True, False])
+
+    combined, fraction, capacity_cost = _compose_blur_conditioned_reward(
+        reward, actions, valid, quality_reward=1.0, cfg=cfg
+    )
+
+    assert fraction == 0.75
+    assert capacity_cost == 0.2
+    assert combined[0] == 0.0
+    assert combined[1] == combined[2] == 0.8
+    assert combined[3] == 1.0
+    assert combined[4] == 0.0
+
+
+def test_blur_quality_delta_uses_online_rms_without_dataset_scale() -> None:
+    state = LeGSStrategyState.initialize(1, torch.device("cpu"), 1.0)
+    positive = _normalize_blur_quality_delta(
+        state, psnr_delta=2.0, surplus_delta=0.2, has_surplus=True,
+        reliability=0.8,
+        device=torch.device("cpu")
+    )
+    negative = _normalize_blur_quality_delta(
+        state, psnr_delta=-2.0, surplus_delta=-0.2, has_surplus=True,
+        reliability=0.8,
+        device=torch.device("cpu")
+    )
+
+    assert positive > 0.0
+    assert negative < 0.0
+    assert abs(positive + negative) < 1e-6
+
+
+def test_blur_quality_interpolates_between_teacher_and_surplus_evidence() -> None:
+    teacher_state = LeGSStrategyState.initialize(1, torch.device("cpu"), 1.0)
+    surplus_state = LeGSStrategyState.initialize(1, torch.device("cpu"), 1.0)
+
+    teacher_reliable = _normalize_blur_quality_delta(
+        teacher_state,
+        psnr_delta=-1.0,
+        surplus_delta=1.0,
+        has_surplus=True,
+        reliability=0.9,
+        device=torch.device("cpu"),
+    )
+    teacher_unreliable = _normalize_blur_quality_delta(
+        surplus_state,
+        psnr_delta=-1.0,
+        surplus_delta=1.0,
+        has_surplus=True,
+        reliability=0.1,
+        device=torch.device("cpu"),
+    )
+
+    assert teacher_reliable < 0.0
+    assert teacher_unreliable > 0.0
+
+
 def test_legs_runtime_transfer_is_not_routed_through_adaptive_state() -> None:
     source = LeGSStrategyState.initialize(4, torch.device("cpu"), 1.0)
     target = LeGSStrategyState.initialize(4, torch.device("cpu"), 1.0)
@@ -83,8 +176,36 @@ def test_exact_legs_samples_ten_training_views() -> None:
     views, source_indices = _sample_official_views(cfg, context)
 
     assert views["image"].shape[1] == 10
+    assert views["index"].shape == (1, 10)
+    assert set(int(value) for value in views["index"].flatten()).issubset(
+        set(range(100, 112))
+    )
     assert len(source_indices) == len(set(source_indices)) == 10
     assert set(source_indices).issubset(set(range(100, 112)))
+
+
+def test_blur_policy_uses_one_fixed_declared_probe_set() -> None:
+    cfg = build_refiner_cfg("legs_blur", 10_000)
+    state = LeGSStrategyState.initialize(2, torch.device("cpu"), 1.0)
+    context = {
+        "image": torch.arange(12).reshape(1, 12, 1, 1, 1).float(),
+        "extrinsics": torch.eye(4).reshape(1, 1, 4, 4).repeat(1, 12, 1, 1),
+        "intrinsics": torch.eye(3).reshape(1, 1, 3, 3).repeat(1, 12, 1, 1),
+        "near": torch.ones(1, 12),
+        "far": torch.full((1, 12), 10.0),
+        "index": torch.arange(100, 112).reshape(1, 12),
+        "policy_probe": torch.tensor(
+            [[True, False, False, True, False, False,
+              False, True, False, False, False, True]]
+        ),
+    }
+
+    first, first_indices = _fixed_blur_probe_views(cfg, context, state)
+    context["policy_probe"].logical_not_()
+    second, second_indices = _fixed_blur_probe_views(cfg, context, state)
+
+    assert first_indices == second_indices == [100, 103, 107, 111]
+    assert torch.equal(first["index"], second["index"])
 
 
 def test_parent_child_scatter_mean_matches_legs_credit_assignment() -> None:
