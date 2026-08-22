@@ -421,7 +421,13 @@ class Parser:
         image_id_to_name = {v: k for k, v in manager.name_to_image_id.items()}
         for point_id, data in manager.point3D_id_to_images.items():
             for image_id, _ in data:
-                image_name = image_id_to_name[image_id]
+                # A valid COLMAP subset may retain the full points3D model.
+                # Its tracks then reference cameras intentionally omitted from
+                # the subset images.txt; those observations are not visible in
+                # this parser instance and must not invalidate the 3D point.
+                image_name = image_id_to_name.get(image_id)
+                if image_name is None:
+                    continue
                 point_idx = manager.point3D_id_to_point3D_idx[point_id]
                 point_indices.setdefault(image_name, []).append(point_idx)
         point_indices = {
