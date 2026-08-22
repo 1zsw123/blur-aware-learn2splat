@@ -3,8 +3,9 @@ set -Eeuo pipefail
 
 REPO="/srv2/szha0669/blur_slam_exp/repos/learn2splat-official-space"
 PYTHON="/srv2/szha0669/blur_slam_exp/envs/learn2splat-py312/bin/python"
-OUTPUT_ROOT="/srv2/szha0669/blur_slam_exp/outputs/learn2splat_exact_legs_tum3_full50k_s1"
-LOG_ROOT="/srv2/szha0669/blur_slam_exp/outputs/logs/learn2splat_exact_legs_tum3_full50k_s1"
+RUN_TAG="${RUN_TAG:-s1}"
+OUTPUT_ROOT="/srv2/szha0669/blur_slam_exp/outputs/learn2splat_exact_legs_tum3_full50k_${RUN_TAG}"
+LOG_ROOT="/srv2/szha0669/blur_slam_exp/outputs/logs/learn2splat_exact_legs_tum3_full50k_${RUN_TAG}"
 RUNNER="$REPO/experiments/blur_aware_cross_dataset/run_cross_dataset.py"
 
 SCENES=(tum_fr1_desk tum_fr2_xyz tum_fr3_office)

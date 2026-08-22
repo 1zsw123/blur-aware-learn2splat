@@ -108,6 +108,11 @@ def test_exact_legs_final_prune_uses_point_one_opacity() -> None:
     cfg = build_refiner_cfg("legs", 50_000)
     gaussians = _gaussians([0.04, 0.10, 0.3])
     state = LeGSStrategyState.initialize(3, torch.device("cpu"), 1.0)
+    state.grad2d_norm_accum.fill_(1.0)
+    state.grad2d_abs_norm_accum.fill_(2.0)
+    state.denom.fill_(3.0)
+    state.radii2d.fill_(4.0)
+    state.parent_mapping = torch.arange(3)
 
     pruned = _apply_legs_final_prune(
         cfg, 18_000, gaussians, state, smoothers={}
@@ -115,4 +120,11 @@ def test_exact_legs_final_prune_uses_point_one_opacity() -> None:
 
     assert pruned == 1
     assert gaussians.means.shape[1] == 2
+    assert state.grad2d_norm_accum.shape == (2,)
+    assert state.grad2d_abs_norm_accum.shape == (2,)
+    assert state.denom.shape == (2,)
+    assert state.radii2d.shape == (2,)
+    assert state.parent_mapping.shape == (2,)
+    assert not state.grad2d_norm_accum.any()
+    assert not state.grad2d_abs_norm_accum.any()
     assert state.last_event_kind == "final_prune"

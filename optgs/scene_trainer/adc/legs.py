@@ -760,6 +760,15 @@ def _apply_legs_final_prune(
     prune_mask = _activated_opacity(gaussians).squeeze(0) < cfg.min_opacity_final
     prune(gaussians, adc_state, prune_mask)
     _prune_objects(prune_mask, smoothers)
+    if (
+        adc_state.parent_mapping is not None
+        and adc_state.parent_mapping.shape[0] == prune_mask.shape[0]
+    ):
+        adc_state.parent_mapping = adc_state.parent_mapping[~prune_mask]
+    # The shared Vanilla prune helper resizes the normal-gradient state but
+    # not FastGS's absolute-gradient accumulator. Policy events reset it after
+    # clone/split/prune; final-prune events need the same synchronization.
+    reset_fastgs_state(adc_state)
     count = int(prune_mask.sum())
     adc_state.last_event_step = step
     adc_state.last_event_kind = "final_prune"
