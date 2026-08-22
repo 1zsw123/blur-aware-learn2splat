@@ -113,10 +113,11 @@ class ZeroInitializedBlurAdapter(nn.Module):
     def __init__(self, input_dim: int, hidden_dim: int) -> None:
         super().__init__()
         self.weight = nn.Parameter(torch.zeros(hidden_dim, input_dim))
-        self.bias = nn.Parameter(torch.zeros(hidden_dim))
 
     def forward(self, state: Tensor) -> Tensor:
-        return F.linear(state, self.weight, self.bias)
+        # A bias would learn even while the curriculum feeds an all-zero blur
+        # state, silently changing exact LeGS during the intended warmup.
+        return F.linear(state, self.weight)
 
 
 def _scatter_mean(source: Tensor, index: Tensor, dim_size: int) -> Tensor:

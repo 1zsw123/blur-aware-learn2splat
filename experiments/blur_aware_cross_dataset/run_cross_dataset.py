@@ -1751,7 +1751,7 @@ def main() -> None:
             "capacity_controller": (
                 {
                     "version": (
-                        "blur_conditioned_legs_v5_directional_credit"
+                        "blur_conditioned_legs_v6_unbiased_warmup"
                         if args.adc == "legs_blur"
                         else "official_legs_8eb120b_exact_mechanism"
                     ),

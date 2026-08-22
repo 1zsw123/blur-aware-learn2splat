@@ -98,6 +98,33 @@ def test_blur_adapter_starts_as_an_exact_legs_residual() -> None:
     assert not conditioned.blur_adapter.weight.any()
 
 
+def test_blur_adapter_zero_state_update_preserves_exact_legs() -> None:
+    exact_cfg = build_refiner_cfg("legs", 10_000)
+    blur_cfg = build_refiner_cfg("legs_blur", 10_000)
+    torch.manual_seed(23)
+    exact = LeGSPPOController(exact_cfg, torch.device("cpu"))
+    torch.manual_seed(23)
+    conditioned = LeGSPPOController(blur_cfg, torch.device("cpu"))
+    local_state = torch.randn(13, 11)
+    zero_blur_state = torch.zeros(13, 7)
+
+    exact.encoder_optimizer.zero_grad(set_to_none=True)
+    conditioned.encoder_optimizer.zero_grad(set_to_none=True)
+    exact._encode(local_state).square().mean().backward()
+    conditioned._encode(
+        torch.cat([local_state, zero_blur_state], dim=-1)
+    ).square().mean().backward()
+    exact.encoder_optimizer.step()
+    conditioned.encoder_optimizer.step()
+
+    assert conditioned.blur_adapter is not None
+    assert not conditioned.blur_adapter.weight.any()
+    assert torch.equal(
+        exact._encode(local_state),
+        conditioned._encode(torch.cat([local_state, zero_blur_state], dim=-1)),
+    )
+
+
 def test_blur_condition_curriculum_is_scene_independent() -> None:
     cfg = build_refiner_cfg("legs_blur", 10_000)
 
