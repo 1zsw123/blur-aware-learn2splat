@@ -181,22 +181,35 @@ parent-child credit 和 prune estimator，并为每个 Gaussian 追加同一时�
 ```
 
 这些量先按各自物理范围变成无量纲的 `[-1, 1]` 特征，而不是套用某个数据集的
-PSNR、kernel 或 primitive 阈值。策略 reward 在动作后延迟 50 steps 计算：
+PSNR、kernel 或 primitive 阈值。策略 reward 在动作后延迟 50 steps 计算。
+记标准化后的官方逐基元 sensitivity reward 为 `r_i`，局部支持度为
+`s_i = sigmoid(r_i)`，本次有效 birth/prune 数为 `n_b/n_p`，则：
 
 ```text
-r = r_sensitivity
-    + w_q * (confidence-weighted multi-view PSNR/surplus improvement)
-    - w_c * max(0, relative net primitive growth)
+d = (n_b - n_p) / max(1, n_b + n_p)
+q = normalized(confidence-weighted PSNR/surplus improvement)
+q_birth = q * d
+q_prune = -q * d
+
+r_birth_i = r_i + alpha * w_q * q_birth * local_gate_i
+                    - alpha * w_c * unsupported_i * relative_growth
+r_prune_i = r_i + alpha * w_q * q_prune * local_gate_i
 ```
+
+`local_gate_i` 根据 credit 正负选择 `2s_i` 或 `2(1-s_i)`；`alpha` 在 2K 前
+为零，2K--5K 线性升到一。blur adapter 是无 bias 的零初始化残差，因此 zero
+blur state 在 optimizer update 后仍保持 exact LeGS 表示，不会在 warmup 阶段
+偷学无条件 policy 偏置。
 
 质量项始终读取同一组 8 个 farthest training probes；最终 hold/test 视图不会进入
 状态或 reward。actor 因而能结合局部 sensitivity 与全局模糊恢复状态选择
 `keep/clone/split`，低 opacity 的 `prune` estimator 也读取相同的 18-D 状态。
 
-三域 3K matched smoke 的平均 PSNR 比 exact LeGS 低 `0.507 dB`，总 primitive
-数少 `13.5%`。因此它已经是正确接线、可复现的机制消融，但目前只证明了容量
-压缩，不证明质量提升，也尚未替代本节的 exact LeGS 主候选。完整表、协议和
-产物见 `BLUR_CONDITIONED_LEGS_SMOKE_ZH.md`。
+最新三域 10K matched smoke 的固定终点平均 PSNR 比 exact LeGS 高 `0.044 dB`，
+总 primitive 少 `0.9%`；best-checkpoint 平均差为 `-0.007 dB`。因此当前证据
+支持机制已正确工作且不再系统性伤害质量，但差值尚不显著，仍不能取代 exact
+LeGS 主候选。TUM 8K 还出现过一次可恢复的结构振荡。完整表、协议和产物见
+`BLUR_CONDITIONED_LEGS_SMOKE_ZH.md`。
 
 ## 6. 当前三域 matched smoke
 

@@ -34,7 +34,7 @@ class LeGSStrategyCfg(BaseStrategyCfg):
     use_prune_estimator: bool = True
     blur_conditioned: bool = False
     blur_feature_dim: int = 7
-    blur_quality_weight: float = 0.5
-    blur_capacity_weight: float = 0.25
+    blur_quality_weight: float = 1.0
+    blur_capacity_weight: float = 0.10
     blur_condition_start_iter: int = 2000
     blur_condition_ramp_iters: int = 3000

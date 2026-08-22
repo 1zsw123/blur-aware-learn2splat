@@ -74,6 +74,8 @@ def test_blur_conditioned_legs_has_separate_eighteen_dimensional_contract() -> N
     assert conditioned.refine_every == exact.refine_every == 100
     assert conditioned.refine_stop_iter == exact.refine_stop_iter == 15_000
     assert conditioned.cap_max == exact.cap_max == -1
+    assert conditioned.blur_quality_weight == 1.0
+    assert conditioned.blur_capacity_weight == 0.10
     assert conditioned.blur_condition_start_iter == 2000
     assert conditioned.blur_condition_ramp_iters == 3000
 
@@ -168,9 +170,9 @@ def test_blur_reward_credits_quality_and_charges_birth_capacity() -> None:
     assert capacity_cost == 0.2
     assert scale == 1.0
     assert combined[0] == 0.0
-    assert abs(float(combined[1]) - 1.0 / 6.0) < 1e-6
-    assert abs(float(combined[2]) - 1.0 / 6.0) < 1e-6
-    assert abs(float(combined[3]) + 1.0 / 6.0) < 1e-6
+    assert abs(float(combined[1]) - 1.0 / 3.0) < 1e-6
+    assert abs(float(combined[2]) - 1.0 / 3.0) < 1e-6
+    assert abs(float(combined[3]) + 1.0 / 3.0) < 1e-6
     assert combined[4] == 0.0
     assert support_mean == 0.5
     assert birth_gate_mean == 1.0

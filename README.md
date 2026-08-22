@@ -39,7 +39,9 @@ LeGS mechanism and appends seven bounded scene-level blur features: EVSSM
 reliability, Laplacian surplus, BPN kernel/mask statistics, and primitive
 pressure. Its delayed reward combines fixed-training-probe PSNR/sharpness
 improvement with the original sensitivity reward and a relative capacity
-cost. Exact LeGS remains available unchanged with `--adc legs`. The matched
+cost. A bias-free zero-initialized adapter preserves exact LeGS throughout the
+2K warmup, then introduces the blur state linearly through 5K. Exact LeGS
+remains available unchanged with `--adc legs`. The matched
 Motion/Defocus/TUM smoke results and their current quality/capacity tradeoff
 are recorded in
 [`BLUR_CONDITIONED_LEGS_SMOKE_ZH.md`](experiments/blur_aware_cross_dataset/BLUR_CONDITIONED_LEGS_SMOKE_ZH.md).

@@ -1,57 +1,73 @@
-# Blur-conditioned LeGS smoke 记录
+# Blur-conditioned LeGS matched smoke
 
-日期：2026-08-22
+日期：2026-08-23
 
 ## 方法边界
 
-`--adc legs` 保留原始 LeGS 的 11 维状态、PPO 和动作逻辑；新方法仅由
-`--adc legs_blur` 启用。新控制器在原始逐基元 sensitivity 状态后加入：
+`--adc legs` 仍是未修改的官方 LeGS 容量机制。实验模式
+`--adc legs_blur` 保留其 11-D 逐基元状态、FastGS sensitivity、PPO、
+parent-child credit、`keep/clone/split` actor 和 prune estimator，并加入 7-D
+场景级模糊状态：
 
-1. EVSSM reliability 的均值和离散度；
-2. render-over-EVSSM Laplacian surplus；
-3. BPN kernel entropy、kernel radius 和 mask strength；
-4. 相对初始基元数的 primitive pressure。
+```text
+[EVSSM reliability mean/std,
+ render-over-EVSSM Laplacian surplus,
+ BPN kernel entropy/radius, BPN mask strength,
+ primitive pressure]
+```
 
-所有状态采用有物理范围的无量纲映射到 `[-1, 1]`。EVSSM reliability
-等场景常量不会再被时间 z-score 消成零。质量 reward 使用同一组 8 个
-farthest training probes，在动作前后 50 步比较 confidence-weighted PSNR
-和 Laplacian surplus；容量成本为相对净增长 `max(0, Delta N / N)`。
-官方逐基元 sensitivity、parent-child credit、PPO、clone/split 以及单独的
-prune estimator 均保留。
+状态只读取固定训练 probe，不读取 hold/test。动作后 50 steps，在同一组 8 个
+训练 probe 上测量 confidence-weighted PSNR 与 Laplacian surplus 的变化。全局
+质量信号按本次动作的净扩张方向，给 birth 与 prune 相反符号的 credit；逐基元
+官方 sensitivity 的 sigmoid 作为局部 support gate，未被局部证据支持的 birth
+额外承担相对净容量成本。
 
-## Smoke 协议
+模糊分支在 2K 前为零，2K--5K 线性引入。2026-08-23 的审计发现旧 adapter
+带可学习 bias，导致输入虽为零但 2K 前 bias 仍被 PPO 更新。当前版本移除了
+该无条件 bias，并有回归测试保证 zero-state optimizer update 后仍保持 exact
+LeGS 表示。`--adc legs` 回退路径未改变。
+
+## 协议
 
 - 场景：`motion_blurcoffee`、`defocus_cisco`、`tum_fr2_xyz`
 - seed：`20260822`
-- 训练：3K steps；1K/2K/3K 评测
+- 训练：10K steps，每 1K 评测
 - 共同配置：Learn2Splat `learned_projected`、FastGS、blur-aware objective、
-  Laplacian surplus weight 0.1
-- 对照：同 seed、同数据和同评测帧的 exact `--adc legs`
+  Laplacian surplus weight `0.1`
+- conditioned 参数：quality weight `1.0`、capacity weight `0.10`
+- LPIPS：smoke 中跳过
+- TUM exact：在当前提交上与 conditioned 同时 fresh 重跑；motion/defocus 使用
+  同 seed、同协议且 exact 路径未变的既有冻结 receipt
 
 ## 结果
 
-| scene | exact 3K PSNR | legs_blur v2 3K PSNR | delta | exact SSIM | v2 SSIM | exact N | v2 N | N delta |
+| scene | exact best | conditioned best | delta | exact 10K | conditioned 10K | delta | exact N | conditioned N |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| motion_blurcoffee | 41.722 | 40.686 | -1.036 | 0.9880 | 0.9858 | 130,486 | 119,316 | -8.6% |
-| defocus_cisco | 31.261 | 31.055 | -0.206 | 0.9549 | 0.9522 | 281,236 | 274,894 | -2.3% |
-| tum_fr2_xyz | 24.954 | 24.673 | -0.281 | 0.8362 | 0.8218 | 399,169 | 307,023 | -23.1% |
-| average / total N | 32.646 | 32.138 | -0.507 | 0.9264 | 0.9199 | 810,891 | 701,233 | -13.5% |
+| motion_blurcoffee | 46.003 @9K | 45.993 @9K | -0.011 | 45.391 | 45.389 | -0.002 | 289,251 | 285,165 (-1.4%) |
+| defocus_cisco | 34.595 @9K | 34.528 @9K | -0.067 | 34.283 | 34.356 | +0.073 | 492,593 | 477,741 (-3.0%) |
+| tum_fr2_xyz | 26.550 @9K | 26.608 @9K | +0.057 | 26.396 | 26.457 | +0.061 | 805,431 | 810,784 (+0.7%) |
+| average / total N | 35.716 | 35.709 | -0.007 | 35.357 | 35.401 | +0.044 | 1,587,275 | 1,573,690 (-0.9%) |
 
-平均 PSNR 差在 1K 为 -0.019 dB，在 2K 为 -0.094 dB，在 3K 为
--0.507 dB。可视化未发现黑块、大面积错误或 NaN。
+TUM conditioned 在 8K 曾从约 26.36 dB 降至 25.30 dB，可视化出现黄色拉长
+基元，9K 恢复到 26.61 dB。该异常没有被平均值隐藏，说明在线 policy 已能恢复，
+但单次结构动作仍可能振荡。
 
 ## 结论
 
-工程接入通过，且 policy 的动作确实受到 blur state/reward 影响；三种域上
-都出现了容量控制。当前 3K 证据只支持“接近质量下减少容量”，不支持
-“PSNR 已超过 exact LeGS”。因此不能据此启动全量主表或宣称指标提升；
-下一步应先在一个 late-training 场景跑到 10K/20K，判断少量早期容量是否
-在后期恢复，随后再决定是否做全量。
+无偏 warmup 修复后，blur-conditioned LeGS 不再像早期 3K 版本那样系统性损失
+质量。三个域的固定 10K 平均提高 `0.044 dB`，总基元减少 `0.9%`；best 平均
+基本持平（`-0.007 dB`）。这支持“模糊状态、全局锐化 reward 与逐基元 LeGS
+动作已经正确协同并可跨三域运行”，但单场景单 seed 的差值太小，不能宣称显著
+优于 exact LeGS，也不能据此替代论文主结果。下一阶段需要多 seed、全量场景、
+LPIPS、运行时间及 TUM 瞬时振荡消融。
 
 ## 产物
 
-- 首版输出：`outputs/learn2splat_legs_blur_smoke3_3k_s1`
-- 修正版输出：`outputs/learn2splat_legs_blur_smoke3_3k_s2`
-- 修正版日志：`outputs/logs/learn2splat_legs_blur_smoke3_3k_s2`
-- 运行门：`outputs/learn2splat_legs_blur_runtime_gate801_s4`
-
+- conditioned receipts：
+  `/srv2/szha0669/blur_slam_exp/outputs/learn2splat_legs_blur_v7_warmupfix_crossdomain10k_s1`
+- fresh TUM exact receipt：
+  `/srv2/szha0669/blur_slam_exp/outputs/learn2splat_legs_exact_current8416a8e_tum10k_s1`
+- 汇总 CSV、逐视角表和曲线：
+  `/srv2/szha0669/blur_slam_exp/outputs/learn2splat_legs_blur_v7_warmupfix_summary_s1`
+- controller receipt version：`blur_conditioned_legs_v6_unbiased_warmup`
+- 代码提交：`8416a8e`
