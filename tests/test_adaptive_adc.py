@@ -475,6 +475,36 @@ def test_dynamic_evssm_uncertainty_requires_stable_cross_view_surplus() -> None:
     )
 
 
+def test_frozen_policy_observation_does_not_advance_surplus_state() -> None:
+    objective = BlurAwareObjective(
+        2,
+        BlurAwareObjectiveConfig(
+            laplacian_loss_mode="surplus",
+            surplus_ema_decay=0.5,
+        ),
+        torch.zeros(2, dtype=torch.bool),
+    )
+    confidence = torch.full((1, 2), 0.8)
+    indices = torch.arange(2).view(1, 2)
+    non_sharp = torch.zeros(1, 2, dtype=torch.bool)
+    objective.train()
+
+    with objective.frozen_observation(step=17):
+        objective._update_surplus_reliability(
+            torch.ones(1, 2), confidence, non_sharp, indices
+        )
+        assert objective.step == 17
+        assert not objective.training
+
+    assert objective.step == 0
+    assert objective.training
+    assert not objective.surplus_gain_updates.any()
+    objective._update_surplus_reliability(
+        torch.ones(1, 2), confidence, non_sharp, indices
+    )
+    assert torch.equal(objective.surplus_gain_updates, torch.ones(2))
+
+
 def test_surplus_laplacian_short_circuits_an_all_sharp_batch() -> None:
     objective = BlurAwareObjective(
         1,

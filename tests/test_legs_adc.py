@@ -4,6 +4,7 @@ import math
 import random
 
 import torch
+import optgs.scene_trainer.adc.legs as legs_module
 
 from optgs.experimental.api.integration.config_bridge import build_refiner_cfg
 from optgs.experimental.api.integration.config_bridge import build_adam_baseline
@@ -16,10 +17,12 @@ from optgs.scene_trainer.adc.legs import (
     _compose_blur_conditioned_reward,
     _enforce_safety_cap,
     _fixed_blur_probe_views,
+    _has_blur_evidence,
     _normalize_blur_quality_delta,
     _sample_official_views,
     _scatter_mean,
     _standardize_blur_features,
+    build_legs_state,
     transfer_legs_runtime_state,
 )
 from optgs.scene_trainer.adc.vanilla import transfer_adaptive_reward_state
@@ -104,6 +107,8 @@ def test_blur_conditioned_legs_has_separate_eighteen_dimensional_contract() -> N
     assert conditioned.state_dim == 18
     assert conditioned.blur_feature_dim == 7
     assert conditioned.blur_conditioned
+    assert not exact.local_objective_conditioned
+    assert conditioned.local_objective_conditioned
     assert conditioned.refine_start_iter == exact.refine_start_iter == 500
     assert conditioned.refine_every == exact.refine_every == 100
     assert conditioned.refine_stop_iter == exact.refine_stop_iter == 15_000
@@ -112,6 +117,97 @@ def test_blur_conditioned_legs_has_separate_eighteen_dimensional_contract() -> N
     assert conditioned.blur_capacity_weight == 0.10
     assert conditioned.blur_condition_start_iter == 2000
     assert conditioned.blur_condition_ramp_iters == 3000
+
+
+def test_blur_local_state_uses_joint_objective_without_training_it(monkeypatch) -> None:
+    cfg = build_refiner_cfg("legs_blur", 10_000)
+    gaussians = _gaussians([0.2, 0.4, 0.6])
+    objective = object()
+    observed = {}
+
+    def fake_gradients(*args, **kwargs):
+        observed.update(kwargs)
+        count = gaussians.means.shape[1]
+        return None, {
+            "means": torch.ones(1, count, 3),
+            "scales": torch.ones(1, count, 3),
+            "rotations": torch.ones(1, count, 4),
+            "opacities": torch.ones(1, count),
+            "sh0s": torch.ones(1, count, 3, 1),
+            "shNs": None,
+        }, None
+
+    monkeypatch.setattr(legs_module, "calc_input_gradients", fake_gradients)
+    monkeypatch.setattr(
+        legs_module,
+        "_metric_score",
+        lambda *args, **kwargs: (torch.ones(3), torch.ones(3, dtype=torch.bool)),
+    )
+    context = {
+        "image": torch.zeros(1, 10, 3, 4, 4),
+        "extrinsics": torch.eye(4).view(1, 1, 4, 4).repeat(1, 10, 1, 1),
+        "intrinsics": torch.eye(3).view(1, 1, 3, 3).repeat(1, 10, 1, 1),
+        "near": torch.ones(1, 10),
+        "far": torch.ones(1, 10) * 10.0,
+    }
+
+    state, *_ = build_legs_state(
+        cfg, gaussians, object(), context, objective=objective, step=2300
+    )
+
+    assert state.shape == (3, 11)
+    assert observed["input_objective"] is objective
+    assert observed["optimize_input_objective"] is False
+    assert observed["step"] == 2300
+
+
+def test_all_direct_views_use_exact_legs_local_objective(monkeypatch) -> None:
+    cfg = build_refiner_cfg("legs_blur", 10_000)
+    gaussians = _gaussians([0.2, 0.4, 0.6])
+    objective = object()
+    observed = {}
+
+    def fake_gradients(*args, **kwargs):
+        observed.update(kwargs)
+        count = gaussians.means.shape[1]
+        return None, {
+            "means": torch.ones(1, count, 3),
+            "scales": torch.ones(1, count, 3),
+            "rotations": torch.ones(1, count, 4),
+            "opacities": torch.ones(1, count),
+            "sh0s": torch.ones(1, count, 3, 1),
+            "shNs": None,
+        }, None
+
+    monkeypatch.setattr(legs_module, "calc_input_gradients", fake_gradients)
+    monkeypatch.setattr(
+        legs_module,
+        "_metric_score",
+        lambda *args, **kwargs: (torch.ones(3), torch.ones(3, dtype=torch.bool)),
+    )
+    context = {
+        "image": torch.zeros(1, 10, 3, 4, 4),
+        "extrinsics": torch.eye(4).view(1, 1, 4, 4).repeat(1, 10, 1, 1),
+        "intrinsics": torch.eye(3).view(1, 1, 3, 3).repeat(1, 10, 1, 1),
+        "near": torch.ones(1, 10),
+        "far": torch.ones(1, 10) * 10.0,
+        "direct_supervision": torch.ones(1, 10, dtype=torch.bool),
+        "known_sharp": torch.ones(1, 10, dtype=torch.bool),
+    }
+
+    state, *_ = build_legs_state(
+        cfg, gaussians, object(), context, objective=objective, step=2300
+    )
+
+    assert state.shape == (3, 11)
+    assert observed["input_objective"] is None
+    assert observed["optimize_input_objective"] is False
+
+
+def test_blur_evidence_requires_bpn_or_laplacian_surplus() -> None:
+    assert not _has_blur_evidence({"bpn_active": False, "has_surplus": False})
+    assert _has_blur_evidence({"bpn_active": True, "has_surplus": False})
+    assert _has_blur_evidence({"bpn_active": False, "has_surplus": True})
 
 
 def test_blur_adapter_starts_as_an_exact_legs_residual() -> None:
@@ -204,9 +300,9 @@ def test_blur_reward_credits_quality_and_charges_birth_capacity() -> None:
     assert capacity_cost == 0.2
     assert scale == 1.0
     assert combined[0] == 0.0
-    assert abs(float(combined[1]) - 1.0 / 3.0) < 1e-6
-    assert abs(float(combined[2]) - 1.0 / 3.0) < 1e-6
-    assert abs(float(combined[3]) + 1.0 / 3.0) < 1e-6
+    assert float(combined[1]) == 1.0
+    assert float(combined[2]) == 1.0
+    assert float(combined[3]) == 1.0
     assert combined[4] == 0.0
     assert support_mean == 0.5
     assert birth_gate_mean == 1.0
@@ -251,7 +347,7 @@ def test_blur_reward_protects_locally_supported_births_from_global_regression() 
     assert net_direction == 1.0
 
 
-def test_harmful_net_contraction_credits_birth_and_penalizes_prune() -> None:
+def test_global_regression_penalizes_all_changed_actions_not_net_direction() -> None:
     cfg = build_refiner_cfg("legs_blur", 10_000)
     reward = torch.zeros(3)
     actions = torch.tensor([1, 3, 3])
@@ -267,9 +363,28 @@ def test_harmful_net_contraction_credits_birth_and_penalizes_prune() -> None:
     )
 
     assert abs(net_direction + 1.0 / 3.0) < 1e-8
-    assert combined[0] > 0.0
+    assert combined[0] < 0.0
     assert combined[1] < 0.0
     assert combined[2] < 0.0
+
+
+def test_balanced_reallocation_keeps_global_quality_credit() -> None:
+    cfg = build_refiner_cfg("legs_blur", 10_000)
+    reward = torch.zeros(2)
+    actions = torch.tensor([1, 3])
+    valid = torch.ones(2, dtype=torch.bool)
+
+    combined, _, _, _, _, _, net_direction = _compose_blur_conditioned_reward(
+        reward,
+        actions,
+        valid,
+        quality_reward=0.75,
+        cfg=cfg,
+        step=5_000,
+    )
+
+    assert net_direction == 0.0
+    assert torch.all(combined > 0.0)
 
 
 def test_blur_quality_delta_uses_online_rms_without_dataset_scale() -> None:

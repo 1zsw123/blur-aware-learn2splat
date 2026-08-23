@@ -1,4 +1,5 @@
 import warnings
+from contextlib import nullcontext
 from dataclasses import dataclass
 import torch.nn.functional as F
 import math
@@ -177,6 +178,7 @@ def calc_input_gradients(
     loss_with_ssim: bool = True,
     opacity_reg_lambda: float = 0.0,  # L1 opacity regularization weight (3DGS-MCMC)
     input_objective=None,
+    optimize_input_objective: bool = True,
     step: int | None = None,
     clamp_images: bool = False,
 ) -> tuple[Tensor, dict[str, Tensor], dict[str, Tensor | None] | None]:
@@ -246,9 +248,14 @@ def calc_input_gradients(
     # --- Forward + autograd.grad loop ---
     # Per-chunk gradients for the leaf params are summed here, then averaged below.
     accumulated_grads: list[Tensor] | None = None
-    if input_objective is not None:
+    if input_objective is not None and optimize_input_objective:
         input_objective.begin_step(step=step, context=iter_context)
-    with torch.enable_grad():
+    observation_context = (
+        input_objective.frozen_observation(step)
+        if input_objective is not None and not optimize_input_objective
+        else nullcontext()
+    )
+    with observation_context, torch.enable_grad():
         assert not torch.is_inference_mode_enabled()
 
         for chunk_idx, start, stop in tqdm(chunk_index_iter(v, chunk_size), disable=nr_chunks <= 1,
@@ -327,7 +334,7 @@ def calc_input_gradients(
                     grad_inputs.append(output_renderer.means2d_abs)
             geometry_input_count = len(grad_inputs)
             objective_parameters = []
-            if input_objective is not None:
+            if input_objective is not None and optimize_input_objective:
                 objective_parameters = input_objective.trainable_parameters()
                 grad_inputs.extend(objective_parameters)
 
@@ -357,12 +364,12 @@ def calc_input_gradients(
                             (h, w),
                         )
                     )
-            if input_objective is not None:
+            if input_objective is not None and optimize_input_objective:
                 input_objective.accumulate_parameter_grads(
                     chunk_grads[geometry_input_count:]
                 )
 
-    if input_objective is not None:
+    if input_objective is not None and optimize_input_objective:
         input_objective.end_step()
 
     # --- Average grads for multi-chunk ---

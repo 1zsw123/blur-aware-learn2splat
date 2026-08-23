@@ -715,10 +715,28 @@ def build_legs_state(
     gaussians: Gaussians,
     renderer,
     context: dict[str, Tensor],
+    objective=None,
+    step: int | None = None,
 ) -> tuple[Tensor, Tensor, Tensor, dict[str, Tensor], list[int]]:
     """Build the official 11-D gradient+sensitivity state."""
     views, sampled = _sample_official_views(cfg, context)
     raw = _raw_parameter_clones(gaussians)
+    direct = views.get("direct_supervision")
+    known_sharp = views.get("known_sharp")
+    all_direct = bool(direct.all()) if direct is not None else (
+        bool(known_sharp.all()) if known_sharp is not None else False
+    )
+    local_objective = (
+        objective
+        if cfg.blur_conditioned
+        and cfg.local_objective_conditioned
+        and not all_direct
+        else None
+    )
+    if cfg.local_objective_conditioned and objective is None:
+        raise RuntimeError(
+            "objective-conditioned LeGS local state requires BlurAwareObjective"
+        )
     _, gradients, _ = calc_input_gradients(
         views,
         *raw,
@@ -726,7 +744,9 @@ def build_legs_state(
         need_2d_grads=False,
         chunk_size=-1,
         any_adc=False,
-        input_objective=None,
+        input_objective=local_objective,
+        optimize_input_objective=False,
+        step=step,
         clamp_images=True,
     )
     gradients = squeeze_grad_dict(gradients)
@@ -879,6 +899,36 @@ def _standardize_blur_features(
     return features.clamp(-1.0, 1.0)
 
 
+def _has_blur_evidence(observation: dict[str, float | bool]) -> bool:
+    """True only when blur-specific state/reward has observable support."""
+    return bool(observation["bpn_active"]) or bool(observation["has_surplus"])
+
+
+def _all_views_are_direct(views: dict[str, Tensor]) -> bool:
+    """Return whether this view set has authoritative direct supervision only."""
+    direct = views.get("direct_supervision")
+    if direct is not None:
+        return bool(direct.all())
+    known_sharp = views.get("known_sharp")
+    return bool(known_sharp.all()) if known_sharp is not None else False
+
+
+def _direct_only_blur_observation() -> dict[str, float | bool]:
+    """Identity observation used when a scene has no blur-specific learning task."""
+    return {
+        "weighted_psnr": 0.0,
+        "weighted_raw_psnr": 0.0,
+        "surplus": 0.0,
+        "has_surplus": False,
+        "reliability_mean": 1.0,
+        "reliability_std": 0.0,
+        "kernel_entropy": 0.0,
+        "kernel_radius": 0.0,
+        "mask_mean": 0.0,
+        "bpn_active": False,
+    }
+
+
 def _blur_condition_scale(cfg: LeGSStrategyCfg, step: int) -> float:
     """Introduce blur control only after the scene representation is established."""
     if step <= cfg.blur_condition_start_iter:
@@ -969,32 +1019,17 @@ def _compose_blur_conditioned_reward(
     local_support = torch.sigmoid(reward.detach())
     supported_gate = 2.0 * local_support
     unsupported_gate = 2.0 * (1.0 - local_support)
-    # Global probe quality cannot identify a point, but it can identify whether
-    # this event's net expansion or contraction helped. Give birth and prune
-    # opposite signed credit according to that observed direction. This avoids
-    # the contradictory old behavior where a harmful net contraction also
-    # penalized the births needed to recover from it.
-    birth_quality = quality_reward * net_action_direction
-    prune_quality = -birth_quality
-    birth_quality_gate = (
-        supported_gate if birth_quality >= 0.0 else unsupported_gate
-    )
-    prune_quality_gate = (
-        supported_gate if prune_quality >= 0.0 else unsupported_gate
-    )
+    # Quality is measured after the complete structural event. Birth and prune
+    # can both be necessary in the same successful reallocation, so net count
+    # direction is diagnostic only and must not erase or invert event credit.
+    quality_gate = supported_gate if quality_reward >= 0.0 else unsupported_gate
     capacity_gate = 1.0 - max(0.0, min(1.0, quality_reward))
     reward = reward.clone()
-    reward[birth] += (
+    reward[changed] += (
         condition_scale
         * cfg.blur_quality_weight
-        * birth_quality
-        * birth_quality_gate[birth]
-    )
-    reward[removed] += (
-        condition_scale
-        * cfg.blur_quality_weight
-        * prune_quality
-        * prune_quality_gate[removed]
+        * quality_reward
+        * quality_gate[changed]
     )
     reward[birth] -= (
         condition_scale
@@ -1039,11 +1074,15 @@ def build_blur_conditioned_legs_state(
     list[int],
 ]:
     state, metric_score, visible, views, sampled = build_legs_state(
-        cfg, gaussians, renderer, context
+        cfg, gaussians, renderer, context, objective=objective, step=step
     )
     blur_views, blur_sampled = _fixed_blur_probe_views(cfg, context, adc_state)
-    observation = _render_blur_policy_observation(
-        gaussians, renderer, blur_views, objective
+    observation = (
+        _direct_only_blur_observation()
+        if _all_views_are_direct(context)
+        else _render_blur_policy_observation(
+            gaussians, renderer, blur_views, objective
+        )
     )
     if adc_state.initial_gaussian_count <= 0:
         adc_state.initial_gaussian_count = int(gaussians.means.shape[1])
@@ -1068,8 +1107,15 @@ def build_blur_conditioned_legs_state(
             math.tanh(pressure),
         ]
     )
-    normalized = _standardize_blur_features(adc_state, raw_features)
-    condition_scale = _blur_condition_scale(cfg, step)
+    blur_evidence_active = _has_blur_evidence(observation)
+    normalized = (
+        _standardize_blur_features(adc_state, raw_features)
+        if blur_evidence_active
+        else torch.zeros_like(raw_features)
+    )
+    condition_scale = (
+        _blur_condition_scale(cfg, step) if blur_evidence_active else 0.0
+    )
     effective = normalized * condition_scale
     adc_state.last_blur_feature_raw = [float(value) for value in raw_features]
     adc_state.last_blur_feature_normalized = [
@@ -1161,15 +1207,26 @@ def _finish_delayed_reward(
     if cfg.blur_conditioned:
         if adc_state.pending_pre_blur_observation is None:
             raise RuntimeError("legs_blur delayed reward lost its pre-action observation")
-        post_observation = _render_blur_policy_observation(
-            gaussians, renderer, adc_state.pending_blur_views, objective
-        )
         pre_observation = adc_state.pending_pre_blur_observation
-        psnr_delta = float(post_observation["weighted_psnr"]) - float(
-            pre_observation["weighted_psnr"]
+        pre_has_blur_evidence = _has_blur_evidence(pre_observation)
+        post_observation = (
+            _render_blur_policy_observation(
+                gaussians, renderer, adc_state.pending_blur_views, objective
+            )
+            if pre_has_blur_evidence
+            else _direct_only_blur_observation()
         )
-        raw_psnr_delta = float(post_observation["weighted_raw_psnr"]) - float(
-            pre_observation["weighted_raw_psnr"]
+        psnr_delta = (
+            float(post_observation["weighted_psnr"])
+            - float(pre_observation["weighted_psnr"])
+            if pre_has_blur_evidence
+            else 0.0
+        )
+        raw_psnr_delta = (
+            float(post_observation["weighted_raw_psnr"])
+            - float(pre_observation["weighted_raw_psnr"])
+            if pre_has_blur_evidence
+            else 0.0
         )
         has_surplus = bool(pre_observation["has_surplus"]) and bool(
             post_observation["has_surplus"]
@@ -1180,37 +1237,61 @@ def _finish_delayed_reward(
             if has_surplus
             else 0.0
         )
-        quality_reward = _normalize_blur_quality_delta(
-            adc_state,
-            psnr_delta,
-            surplus_delta,
-            has_surplus,
-            float(pre_observation["reliability_mean"]),
-            new_metric.device,
-            raw_psnr_delta=(
-                raw_psnr_delta if objective.cfg.coupled_dual_bpn else None
-            ),
-            raw_evidence_weight=math.sqrt(
-                max(0.0, float(pre_observation["mask_mean"]))
-                * max(0.0, float(post_observation["mask_mean"]))
-            ),
-        )
-        (
-            reward,
-            structural_fraction,
-            capacity_cost,
-            condition_scale,
-            action_support_mean,
-            birth_penalty_gate_mean,
-            net_action_direction,
-        ) = _compose_blur_conditioned_reward(
-            reward,
-            actions,
-            valid,
-            quality_reward,
-            cfg,
-            step,
-        )
+        blur_evidence_active = _has_blur_evidence(
+            pre_observation
+        ) or _has_blur_evidence(post_observation)
+        if blur_evidence_active:
+            quality_reward = _normalize_blur_quality_delta(
+                adc_state,
+                psnr_delta,
+                surplus_delta,
+                has_surplus,
+                float(pre_observation["reliability_mean"]),
+                new_metric.device,
+                raw_psnr_delta=(
+                    raw_psnr_delta if objective.cfg.coupled_dual_bpn else None
+                ),
+                raw_evidence_weight=math.sqrt(
+                    max(0.0, float(pre_observation["mask_mean"]))
+                    * max(0.0, float(post_observation["mask_mean"]))
+                ),
+            )
+            (
+                reward,
+                structural_fraction,
+                capacity_cost,
+                condition_scale,
+                action_support_mean,
+                birth_penalty_gate_mean,
+                net_action_direction,
+            ) = _compose_blur_conditioned_reward(
+                reward,
+                actions,
+                valid,
+                quality_reward,
+                cfg,
+                step,
+            )
+        else:
+            # An all-authoritative-sharp scene is exactly the original LeGS
+            # problem.  Do not let confidence constants or capacity terms create
+            # a synthetic blur policy where no blur observation exists.
+            quality_reward = 0.0
+            changed = (actions != 0) & valid
+            birth = ((actions == 1) | (actions == 2)) & valid
+            removed = (actions == 3) & valid
+            structural_fraction = float(changed.sum() / valid.sum().clamp_min(1))
+            capacity_cost = max(
+                0.0,
+                float(int(birth.sum()) - int(removed.sum()))
+                / max(1, actions.numel()),
+            )
+            condition_scale = 0.0
+            action_support_mean = 0.0
+            birth_penalty_gate_mean = 0.0
+            net_action_direction = float(
+                int(birth.sum()) - int(removed.sum())
+            ) / max(1, int(birth.sum()) + int(removed.sum()))
         adc_state.last_blur_quality_reward = quality_reward
         adc_state.last_blur_psnr_delta = psnr_delta
         adc_state.last_blur_raw_psnr_delta = raw_psnr_delta
@@ -1429,7 +1510,7 @@ def apply_legs_strategy(
         )
     else:
         states, pre_metric, pre_visible, views, sampled_views = build_legs_state(
-            cfg, gaussians, renderer, context
+            cfg, gaussians, renderer, context, objective=objective, step=step
         )
     valid = ((grads >= cfg.grad_thresh) | (abs_grads >= cfg.grad_abs_thresh))
     valid &= pre_visible

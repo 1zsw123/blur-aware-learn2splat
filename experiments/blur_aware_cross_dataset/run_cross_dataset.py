@@ -227,6 +227,16 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Override the blur-policy conditioning ramp duration.",
     )
+    parser.add_argument(
+        "--legs-local-objective",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Use the complete blur-aware objective for LeGS's per-Gaussian "
+            "local gradient state. --no-legs-local-objective is the exact "
+            "target-only local-state ablation."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -238,6 +248,7 @@ def configure_legs_blur_ablation(refiner_cfg, args: argparse.Namespace) -> None:
             args.legs_blur_capacity_weight,
             args.legs_blur_start_iter,
             args.legs_blur_ramp_iters,
+            args.legs_local_objective,
         )
         if any(value is not None for value in overrides):
             raise ValueError("--legs-blur-* overrides require --adc legs_blur")
@@ -258,6 +269,8 @@ def configure_legs_blur_ablation(refiner_cfg, args: argparse.Namespace) -> None:
         if args.legs_blur_ramp_iters <= 0:
             raise ValueError("legs_blur ramp duration must be positive")
         refiner_cfg.blur_condition_ramp_iters = args.legs_blur_ramp_iters
+    if args.legs_local_objective is not None:
+        refiner_cfg.local_objective_conditioned = args.legs_local_objective
 
 
 def read_hold(data_dir: Path) -> int:
@@ -1804,6 +1817,12 @@ def main() -> None:
                     "host_representation": "learn2splat_gaussians",
                     "sensitivity": "official_fastgs_leave_one_out_l1",
                     "state_dim": 18 if args.adc == "legs_blur" else 11,
+                    "local_state_objective": (
+                        "evssm_bpn+raw_bpn+laplacian_surplus"
+                        if args.adc == "legs_blur"
+                        and refiner_cfg.local_objective_conditioned
+                        else "target_only"
+                    ),
                     "state_views": 10,
                     "quality_probe_views": (
                         len(probe_global) if args.adc == "legs_blur" else None

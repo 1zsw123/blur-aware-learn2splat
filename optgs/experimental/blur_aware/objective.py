@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from typing import Callable
 
@@ -244,6 +245,7 @@ class BlurAwareObjective(nn.Module):
         self.last_diagnostics: dict[str, float] = {}
         self._densification_feedback_revision = 0
         self._densification_feedback: dict[str, float | int | bool] | None = None
+        self._freeze_statistics_depth = 0
 
     def configure_run(self, num_steps: int) -> None:
         self.num_steps = max(1, int(num_steps))
@@ -256,6 +258,26 @@ class BlurAwareObjective(nn.Module):
 
     def trainable_parameters(self) -> list[nn.Parameter]:
         return [parameter for parameter in self.parameters() if parameter.requires_grad]
+
+    @contextmanager
+    def frozen_observation(self, step: int | None = None):
+        """Evaluate the joint objective without training BPN or reliability state.
+
+        LeGS queries the same objective to construct its per-Gaussian policy
+        state.  That query is observational: it must not perform a second BPN
+        optimizer step or count the same render twice in the surplus EMA.
+        """
+        previous_step = self.step
+        previous_training = self.training
+        self.step = previous_step if step is None else int(step)
+        self._freeze_statistics_depth += 1
+        self.eval()
+        try:
+            yield self
+        finally:
+            self._freeze_statistics_depth -= 1
+            self.step = previous_step
+            self.train(previous_training)
 
     def set_densification_feedback(
         self,
@@ -607,22 +629,25 @@ class BlurAwareObjective(nn.Module):
             raise IndexError("view index is outside the objective's view state")
 
         decay = self.cfg.surplus_ema_decay
-        flat_gain = relative_gain.detach().float().reshape(-1)
-        flat_sharp = known_sharp.reshape(-1)
-        for index, value, is_sharp in zip(flat_indices, flat_gain, flat_sharp):
-            if bool(is_sharp):
-                continue
-            idx = int(index)
-            count = self.surplus_gain_updates[idx]
-            if float(count) == 0.0:
-                self.surplus_gain_ema[idx] = value
-                self.surplus_gain_square_ema[idx] = value.square()
-            else:
-                self.surplus_gain_ema[idx].mul_(decay).add_(value, alpha=1.0 - decay)
-                self.surplus_gain_square_ema[idx].mul_(decay).add_(
-                    value.square(), alpha=1.0 - decay
-                )
-            self.surplus_gain_updates[idx].add_(1.0)
+        if self._freeze_statistics_depth == 0:
+            flat_gain = relative_gain.detach().float().reshape(-1)
+            flat_sharp = known_sharp.reshape(-1)
+            for index, value, is_sharp in zip(flat_indices, flat_gain, flat_sharp):
+                if bool(is_sharp):
+                    continue
+                idx = int(index)
+                count = self.surplus_gain_updates[idx]
+                if float(count) == 0.0:
+                    self.surplus_gain_ema[idx] = value
+                    self.surplus_gain_square_ema[idx] = value.square()
+                else:
+                    self.surplus_gain_ema[idx].mul_(decay).add_(
+                        value, alpha=1.0 - decay
+                    )
+                    self.surplus_gain_square_ema[idx].mul_(
+                        decay
+                    ).add_(value.square(), alpha=1.0 - decay)
+                self.surplus_gain_updates[idx].add_(1.0)
 
         variance = (
             self.surplus_gain_square_ema - self.surplus_gain_ema.square()
