@@ -333,9 +333,10 @@ class AdamInputSmoothing(nn.Module):
         if zero_t:
             new_t = torch.zeros((num_new_rows, *self.t.shape[1:]), device=self.t.device, dtype=self.t.dtype)
         else:
-            # Only t needs to copy repeated original values
+            # Gaussian splitting emits one complete parent block per child pass:
+            # [rest, selected_child_0, selected_child_1, ...].
             sel = torch.where(split_mask)[0]
-            new_t = self.t[sel].repeat_interleave(N, dim=0)
+            new_t = self.t[sel].repeat(N, *([1] * (self.t.ndim - 1)))
 
         rest_sel = torch.where(~split_mask)[0]
 

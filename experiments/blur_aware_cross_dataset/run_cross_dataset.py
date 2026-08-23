@@ -54,6 +54,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--output-root", required=True)
+    parser.add_argument(
+        "--initial-ply",
+        default=None,
+        help=(
+            "Optional rollback-safe continuation initializer. Loads an existing "
+            "3DGS PLY instead of rebuilding geometry from SfM/depth; intended "
+            "for post-training convergence and capacity-schedule diagnostics."
+        ),
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
         "--decoder-backend",
@@ -153,6 +162,14 @@ def parse_args() -> argparse.Namespace:
             "spatial matches signed multiscale edges; surplus treats EVSSM as "
             "a one-sided edge floor and adapts its confidence from stable "
             "render-over-teacher gain; energy reproduces the old ablation."
+        ),
+    )
+    parser.add_argument(
+        "--coupled-dual-bpn",
+        action="store_true",
+        help=(
+            "Use a shared blur-mode kernel with ordered EVSSM/RAW strengths. "
+            "Without this flag the original single-RAW-kernel objective is exact."
         ),
     )
     parser.add_argument(
@@ -1258,11 +1275,16 @@ def blur_kernel_statistics(
 ) -> tuple[Tensor, list[dict[str, object]]]:
     """Return interpretable per-view BPN kernel diagnostics."""
     with torch.no_grad():
-        embeddings = objective.bpn.camera_embedding.weight
-        kernels = torch.softmax(objective.bpn.kernel_head(embeddings), dim=-1)
-        kernels = kernels.view(
+        indices = torch.arange(
+            objective.bpn.camera_embedding.num_embeddings,
+            device=objective.bpn.camera_embedding.weight.device,
+        )
+        family = objective.bpn.kernel_family(indices)
+        kernels = family["raw_kernels"].view(
             -1, objective.cfg.kernel_size, objective.cfg.kernel_size
         ).cpu()
+        teacher_strength = family["teacher_strength"].cpu()
+        raw_strength = family["raw_strength"].cpu()
     sharp = known_sharp.detach().bool().cpu().flatten()
     if kernels.shape[0] != len(names) or kernels.shape[0] != sharp.numel():
         raise ValueError(
@@ -1291,6 +1313,8 @@ def blur_kernel_statistics(
                 "index": index,
                 "name": names[index],
                 "known_sharp": bool(sharp[index]),
+                "teacher_strength": float(teacher_strength[index]),
+                "raw_strength": float(raw_strength[index]),
                 "rms_radius_px": radius,
                 "center_shift_px": math.hypot(center_x, center_y),
                 "normalized_entropy": entropy,
@@ -1510,17 +1534,37 @@ def main() -> None:
     init_budget, init_budget_source = resolve_initialization_budget(
         args.num_init_points, optgs
     )
-    gaussians, init_stats = depth_fused_initialization(
-        parser,
-        scene,
-        cfg,
-        optimization_indices,
-        target_count=init_budget,
-        max_sfm_points=args.max_sfm_points,
-        sh_degree=optgs.sh_degree,
-        device=device,
-        seed=args.seed,
-    )
+    if args.initial_ply is None:
+        gaussians, init_stats = depth_fused_initialization(
+            parser,
+            scene,
+            cfg,
+            optimization_indices,
+            target_count=init_budget,
+            max_sfm_points=args.max_sfm_points,
+            sh_degree=optgs.sh_degree,
+            device=device,
+            seed=args.seed,
+        )
+    else:
+        from optgs.experimental.api.integration.inria_bridge import (
+            optgs_gaussians_from_ply,
+        )
+
+        initial_ply = Path(args.initial_ply).resolve()
+        if not initial_ply.is_file():
+            raise FileNotFoundError(f"continuation PLY does not exist: {initial_ply}")
+        gaussians = optgs_gaussians_from_ply(
+            initial_ply,
+            sh_degree=optgs.sh_degree,
+            device=device,
+            dtype=optgs.dtype,
+        )
+        init_stats = {
+            "source": "existing_ply_continuation",
+            "path": str(initial_ply),
+            "total": int(gaussians.means.shape[1]),
+        }
     objective = None
     if args.objective == "blur-aware":
         objective = BlurAwareObjective(
@@ -1531,6 +1575,7 @@ def main() -> None:
                 ),
                 laplacian_loss_weight=args.laplacian_loss_weight,
                 laplacian_loss_mode=args.laplacian_loss_mode,
+                coupled_dual_bpn=args.coupled_dual_bpn,
             ),
             known_sharp_mask=scene["known_sharp"][optimization_selection],
         )
@@ -1741,6 +1786,7 @@ def main() -> None:
             "num_init_points_requested": args.num_init_points,
             "num_init_points_effective": init_budget,
             "num_init_points_source": init_budget_source,
+            "initial_ply": args.initial_ply,
             "opt_batch_size": args.opt_batch_size,
             "opt_batch_strategy_requested": requested_batch_strategy,
             "opt_batch_strategy_effective": optgs.opt_batch_strategy,
@@ -1784,10 +1830,19 @@ def main() -> None:
                     "pruning": "separate_low_opacity_estimator",
                     "reward_delay": 50,
                     "reward": (
-                        "normalized sensitivity + confidence-weighted PSNR delta "
-                        "+ Laplacian-surplus delta - relative net capacity growth, "
-                        "directionally assigned to birth/prune and soft-assigned "
-                        "by local sensitivity support"
+                        (
+                            "normalized sensitivity + confidence-weighted teacher "
+                            "PSNR delta + reliability-complement RAW-BPN PSNR delta "
+                            "+ Laplacian-surplus delta - relative net capacity growth, "
+                            "directionally assigned to birth/prune and soft-assigned "
+                            "by local sensitivity support"
+                            if args.coupled_dual_bpn
+                            else
+                            "normalized sensitivity + confidence-weighted PSNR delta "
+                            "+ Laplacian-surplus delta - relative net capacity growth, "
+                            "directionally assigned to birth/prune and soft-assigned "
+                            "by local sensitivity support"
+                        )
                         if args.adc == "legs_blur"
                         else "normalized delayed per-Gaussian sensitivity"
                     ),

@@ -539,6 +539,9 @@ class Optimizer(nn.Module, ABC, Generic[T]):
                         adc_state.last_blur_quality_reward
                     ),
                     "blur_psnr_delta": float(adc_state.last_blur_psnr_delta),
+                    "blur_raw_psnr_delta": float(
+                        adc_state.last_blur_raw_psnr_delta
+                    ),
                     "blur_surplus_delta": float(
                         adc_state.last_blur_surplus_delta
                     ),

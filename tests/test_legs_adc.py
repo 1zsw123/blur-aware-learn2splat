@@ -22,6 +22,8 @@ from optgs.scene_trainer.adc.legs import (
     transfer_legs_runtime_state,
 )
 from optgs.scene_trainer.adc.vanilla import transfer_adaptive_reward_state
+from optgs.scene_trainer.optimizer.layer import AdamInputSmoothing
+from optgs.scene_trainer.optimizer.optimizer_knn_based import KnnBasedOptimizerState
 
 
 def _gaussians(opacities: list[float]) -> Gaussians:
@@ -38,6 +40,37 @@ def _gaussians(opacities: list[float]) -> Gaussians:
         rotations_unnorm=rotations.clone(),
         stores_activated=True,
     )
+
+
+def test_learned_state_split_matches_gaussian_child_order() -> None:
+    state = KnnBasedOptimizerState(
+        state=torch.tensor([[10.0], [20.0], [30.0], [40.0]]),
+        init_state=torch.tensor([[110.0], [120.0], [130.0], [140.0]]),
+    )
+    split_mask = torch.tensor([False, True, False, True])
+
+    state.split(split_mask, num_splits=2, zero_t=False)
+
+    assert torch.equal(
+        state.state,
+        torch.tensor([[10.0], [30.0], [20.0], [40.0], [20.0], [40.0]]),
+    )
+    assert torch.equal(
+        state.init_state,
+        torch.tensor(
+            [[110.0], [130.0], [120.0], [140.0], [120.0], [140.0]]
+        ),
+    )
+
+
+def test_adam_split_step_state_matches_gaussian_child_order() -> None:
+    smoother = AdamInputSmoothing(shape=(4, 1), device=torch.device("cpu"))
+    smoother.t = torch.tensor([10, 20, 30, 40])
+    split_mask = torch.tensor([False, True, False, True])
+
+    smoother.split(split_mask, N=2, zero_t=False)
+
+    assert torch.equal(smoother.t, torch.tensor([10, 30, 20, 40, 20, 40]))
 
 
 def test_exact_legs_schedule_is_not_rescaled_by_smoke_horizon() -> None:
@@ -279,6 +312,21 @@ def test_blur_quality_interpolates_between_teacher_and_surplus_evidence() -> Non
 
     assert teacher_reliable < 0.0
     assert teacher_unreliable > 0.0
+
+
+def test_dual_bpn_reward_uses_raw_consistency_when_teacher_is_unreliable() -> None:
+    state = LeGSStrategyState.initialize(1, torch.device("cpu"), 1.0)
+    reward = _normalize_blur_quality_delta(
+        state,
+        psnr_delta=-1.0,
+        surplus_delta=0.0,
+        has_surplus=False,
+        reliability=0.0,
+        device=torch.device("cpu"),
+        raw_psnr_delta=1.0,
+    )
+
+    assert reward > 0.0
 
 
 def test_legs_runtime_transfer_is_not_routed_through_adaptive_state() -> None:

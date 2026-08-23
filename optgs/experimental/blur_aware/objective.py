@@ -32,6 +32,7 @@ class BlurAwareObjectiveConfig:
     laplacian_loss_weight: float = 0.1
     laplacian_loss_mode: str = "spatial"
     surplus_ema_decay: float = 0.95
+    coupled_dual_bpn: bool = False
 
     def __post_init__(self):
         if self.kernel_size < 3 or self.kernel_size % 2 == 0:
@@ -85,12 +86,66 @@ class FactorizedBlurFormation(nn.Module):
         self.kernel_head[-1].bias.data[k2 // 2] = 4.0
         nn.init.zeros_(self.mask_net[-1].weight)
         nn.init.constant_(self.mask_net[-1].bias, -2.0)
+        self.strength_head: nn.Linear | None = None
+        if cfg.coupled_dual_bpn:
+            self.strength_head = nn.Linear(d, 2)
+            nn.init.zeros_(self.strength_head.weight)
+            # EVSSM starts near identity; RAW starts with substantially more
+            # of the same blur mode while remaining learnable per view.
+            self.strength_head.bias.data.copy_(torch.tensor((-4.0, 2.0)))
 
         radius = cfg.kernel_size // 2
         axis = torch.linspace(-1.0, 1.0, cfg.kernel_size)
         yy, xx = torch.meshgrid(axis, axis, indexing="ij")
         self.register_buffer("kernel_x", xx.reshape(1, -1), persistent=False)
         self.register_buffer("kernel_y", yy.reshape(1, -1), persistent=False)
+
+    def kernel_family(self, view_indices: Tensor) -> dict[str, Tensor]:
+        """Return coupled EVSSM/RAW kernels in Gaussian split-independent order."""
+        indices = view_indices.reshape(-1).long()
+        embedding = self.camera_embedding(indices)
+        base = torch.softmax(self.kernel_head(embedding), dim=-1)
+        identity = torch.zeros_like(base)
+        identity[:, base.shape[-1] // 2] = 1.0
+        if self.strength_head is None:
+            teacher_strength = base.new_zeros(base.shape[0])
+            raw_strength = base.new_ones(base.shape[0])
+        else:
+            strength_logits = self.strength_head(embedding)
+            teacher_strength = torch.sigmoid(strength_logits[:, 0])
+            raw_residual = torch.sigmoid(strength_logits[:, 1])
+            raw_strength = teacher_strength + (
+                1.0 - teacher_strength
+            ) * raw_residual
+
+        def mix(strength: Tensor) -> Tensor:
+            return identity + strength[:, None] * (base - identity)
+
+        return {
+            "base_kernels": base,
+            "teacher_kernels": mix(teacher_strength),
+            "raw_kernels": mix(raw_strength),
+            "teacher_strength": teacher_strength,
+            "raw_strength": raw_strength,
+        }
+
+    def _apply_kernels(self, sharp: Tensor, kernels: Tensor) -> Tensor:
+        count, channels, height, width = sharp.shape
+        kernel_2d = kernels.view(
+            count, 1, self.cfg.kernel_size, self.cfg.kernel_size
+        )
+        grouped_weight = kernel_2d.repeat_interleave(channels, dim=0)
+        grouped_input = sharp.reshape(1, count * channels, height, width)
+        pad = (self.cfg.kernel_size // 2) * self.cfg.kernel_dilation
+        grouped_input = F.pad(
+            grouped_input, (pad, pad, pad, pad), mode="reflect"
+        )
+        return F.conv2d(
+            grouped_input,
+            grouped_weight,
+            dilation=self.cfg.kernel_dilation,
+            groups=count * channels,
+        ).reshape(count, channels, height, width)
 
     @staticmethod
     def _gray(images: Tensor) -> Tensor:
@@ -110,21 +165,11 @@ class FactorizedBlurFormation(nn.Module):
         sharp_flat = sharp.reshape(flat_count, c, h, w)
         raw_flat = raw.reshape(flat_count, c, h, w)
         target_flat = target.reshape(flat_count, c, h, w)
-        indices = view_indices.reshape(-1).long()
-
-        kernel_logits = self.kernel_head(self.camera_embedding(indices))
-        kernels = torch.softmax(kernel_logits, dim=-1)
-        kernel_2d = kernels.view(flat_count, 1, self.cfg.kernel_size, self.cfg.kernel_size)
-        grouped_weight = kernel_2d.repeat_interleave(c, dim=0)
-        grouped_input = sharp_flat.reshape(1, flat_count * c, h, w)
-        pad = (self.cfg.kernel_size // 2) * self.cfg.kernel_dilation
-        grouped_input = F.pad(grouped_input, (pad, pad, pad, pad), mode="reflect")
-        blurred = F.conv2d(
-            grouped_input,
-            grouped_weight,
-            dilation=self.cfg.kernel_dilation,
-            groups=flat_count * c,
-        ).reshape(flat_count, c, h, w)
+        family = self.kernel_family(view_indices)
+        raw_blurred = self._apply_kernels(sharp_flat, family["raw_kernels"])
+        teacher_blurred = self._apply_kernels(
+            sharp_flat, family["teacher_kernels"]
+        )
 
         low_h, low_w = max(8, (h + 15) // 16), max(8, (w + 15) // 16)
         raw_gray = self._gray(raw_flat.detach())
@@ -143,10 +188,12 @@ class FactorizedBlurFormation(nn.Module):
         mask_input = torch.cat((raw_low, target_low, residual_low, depth_low), dim=1)
         mask_low = torch.sigmoid(self.mask_net(mask_input))
         mask = F.interpolate(mask_low, (h, w), mode="bilinear", align_corners=False)
-        formed = mask * blurred + (1.0 - mask) * sharp_flat
+        formed = mask * raw_blurred + (1.0 - mask) * sharp_flat
+        teacher_formed = mask * teacher_blurred + (1.0 - mask) * sharp_flat
 
-        center_x = (kernels * self.kernel_x).sum(dim=-1)
-        center_y = (kernels * self.kernel_y).sum(dim=-1)
+        kernels = family["raw_kernels"]
+        center_x = (family["base_kernels"] * self.kernel_x).sum(dim=-1)
+        center_y = (family["base_kernels"] * self.kernel_y).sum(dim=-1)
         center_loss = (center_x.square() + center_y.square()).mean()
         residual_scale = residual_low.flatten(1).quantile(0.9, dim=1).view(-1, 1, 1, 1)
         mask_target = (residual_low / (residual_scale + 1e-6)).clamp(0.0, 1.0)
@@ -157,6 +204,8 @@ class FactorizedBlurFormation(nn.Module):
 
         return formed.view(b, v, c, h, w), {
             "kernels": kernels,
+            **family,
+            "teacher_formed": teacher_formed.view(b, v, c, h, w),
             "mask": mask.view(b, v, 1, h, w),
             "mask_low": mask_low,
             "center_loss": center_loss,
@@ -1048,8 +1097,22 @@ class BlurAwareObjective(nn.Module):
             view_indices,
         )
 
+        teacher_prediction = (
+            bpn_stats["teacher_formed"]
+            if self.cfg.coupled_dual_bpn
+            else output_renderer.color
+        )
+        if self.cfg.coupled_dual_bpn:
+            # Authoritative sharp views are identity observations. The weak
+            # teacher kernel is only allowed to explain residual blur in the
+            # deblurred, non-authoritative EVSSM targets.
+            teacher_prediction = torch.where(
+                direct_supervision[..., None, None, None],
+                output_renderer.color,
+                teacher_prediction,
+            )
         direct_loss = self._per_view_loss(
-            output_renderer.color, target, with_ssim, valid
+            teacher_prediction, target, with_ssim, valid
         )
         raw_loss = self._per_view_loss(formed, raw, with_ssim, valid)
         laplacian_per_view, laplacian_stats = self._laplacian_objective(

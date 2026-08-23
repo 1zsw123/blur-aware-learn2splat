@@ -38,7 +38,7 @@
     "evssm_dir": "/srv2/szha0669/datasets/tum_rgbd/evssm_all/rgbd_dataset_freiburg1_desk/evssm_all",
     "depth_dir": "/srv2/szha0669/blur_slam_exp/data/i2slam_trigsplat/tum_fr1_desk_officialkf_abl1/depth",
     "sharp_json": "/srv2/szha0669/blur_slam_exp/outputs/logs/tum_fr1desk_officialkf_nima06_sharp_frames.json",
-    "sharp_supervision_policy": "sharp_json_only",
+    "sharp_supervision_policy": "evaluation_is_sharp",
     "evaluation_manifest": {
       "path": "/srv2/szha0669/blur_slam_exp/repos/learn2splat-official-space/experiments/blur_aware_cross_dataset/tum_fr1_desk_official_sharp_eval.json",
       "label": "unblurslam_official_sharp_keyframes_14"
@@ -47,7 +47,7 @@
       "distortion": [0.2624, -0.9531, -0.0054, 0.0026, 1.1633],
       "resize": [528, 400],
       "crop": [8, 8, 8, 8],
-      "undistort_depth": true
+      "undistort_depth": false
     }
   },
   "tum_fr2_xyz": {
@@ -61,7 +61,7 @@
     "evssm_dir": "/srv2/szha0669/datasets/tum_rgbd/evssm_all/rgbd_dataset_freiburg2_xyz/evssm_all",
     "depth_dir": "/srv2/szha0669/blur_slam_exp/data/i2slam_trigsplat/tum_fr2_xyz_officialkf_abl1/depth",
     "sharp_json": "/srv2/szha0669/blur_slam_exp/outputs/logs/tum_fr2xyz_officialkf_nima06_sharp_frames.json",
-    "sharp_supervision_policy": "sharp_json_only",
+    "sharp_supervision_policy": "evaluation_is_sharp",
     "evaluation_manifest": {
       "path": "/srv2/szha0669/blur_slam_exp/repos/learn2splat-official-space/experiments/blur_aware_cross_dataset/tum_fr2_xyz_official_mapping_keyframes.json",
       "label": "unblurslam_official_sharp_keyframes_42"
@@ -70,7 +70,30 @@
       "distortion": [0.2312, -0.7849, -0.0033, -0.0001, 0.9172],
       "resize": [528, 400],
       "crop": [8, 8, 8, 8],
-      "undistort_depth": true
+      "undistort_depth": false
+    }
+  },
+  "tum_fr2_xyz_authoritative_sharp": {
+    "dataset": "TUM fr2_xyz (Unblur-SLAM/I2-SLAM authoritative sharp supervision)",
+    "benchmark_role": "official_benchmark_protocol_alignment",
+    "protocol_description": "optimize and evaluate the exact 42 released I2-SLAM keyframes; all 42 authoritative-sharp observations bypass EVSSM/BPN and receive w10",
+    "data_dir": "/srv2/szha0669/blur_slam_exp/data/i2slam_trigsplat/tum_fr2_xyz_officialkf_abl1",
+    "factor": 1,
+    "raw_dir": "/srv2/szha0669/blur_slam_exp/data/TUM_RGBD/rgbd_dataset_freiburg2_xyz/rgb",
+    "raw_mode": "sorted_index",
+    "evssm_dir": "/srv2/szha0669/datasets/tum_rgbd/evssm_all/rgbd_dataset_freiburg2_xyz/evssm_all",
+    "depth_dir": "/srv2/szha0669/blur_slam_exp/data/i2slam_trigsplat/tum_fr2_xyz_officialkf_abl1/depth",
+    "sharp_json": "/srv2/szha0669/blur_slam_exp/repos/learn2splat-official-space/experiments/blur_aware_cross_dataset/tum_fr2_xyz_official_mapping_keyframes.json",
+    "sharp_supervision_policy": "evaluation_is_sharp",
+    "evaluation_manifest": {
+      "path": "/srv2/szha0669/blur_slam_exp/repos/learn2splat-official-space/experiments/blur_aware_cross_dataset/tum_fr2_xyz_official_mapping_keyframes.json",
+      "label": "unblurslam_official_sharp_keyframes_42"
+    },
+    "camera_preprocess": {
+      "distortion": [0.2312, -0.7849, -0.0033, -0.0001, 0.9172],
+      "resize": [528, 400],
+      "crop": [8, 8, 8, 8],
+      "undistort_depth": false
     }
   },
   "tum_fr2_xyz_full": {
@@ -115,7 +138,7 @@
     "evssm_dir": "/srv2/szha0669/datasets/tum_rgbd/evssm_all/rgbd_dataset_freiburg3_long_office_household/evssm_all",
     "depth_dir": "/srv2/szha0669/blur_slam_exp/data/i2slam_trigsplat/tum_fr3_office_officialkf_abl1/depth",
     "sharp_json": "/srv2/szha0669/blur_slam_exp/outputs/logs/tum_fr3office_officialkf_nima06_sharp_frames.json",
-    "sharp_supervision_policy": "sharp_json_only",
+    "sharp_supervision_policy": "evaluation_is_sharp",
     "evaluation_manifest": {
       "path": "/srv2/szha0669/blur_slam_exp/repos/learn2splat-official-space/experiments/blur_aware_cross_dataset/tum_fr3_office_official_sharp_eval.json",
       "label": "unblurslam_official_sharp_keyframes_55_of_57_registered"

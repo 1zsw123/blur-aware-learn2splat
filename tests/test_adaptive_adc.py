@@ -113,6 +113,44 @@ def test_sharp_w10_is_not_applied_twice_when_sampler_realizes_it() -> None:
     assert torch.equal(weights, torch.ones_like(weights))
 
 
+def test_coupled_dual_bpn_shares_mode_and_orders_blur_strength() -> None:
+    objective = BlurAwareObjective(
+        3, BlurAwareObjectiveConfig(coupled_dual_bpn=True)
+    )
+    family = objective.bpn.kernel_family(torch.tensor([[0, 1, 2]]))
+
+    assert torch.allclose(
+        family["teacher_kernels"].sum(dim=-1), torch.ones(3)
+    )
+    assert torch.allclose(family["raw_kernels"].sum(dim=-1), torch.ones(3))
+    assert torch.all(family["raw_strength"] >= family["teacher_strength"])
+    identity = torch.zeros_like(family["base_kernels"])
+    identity[:, identity.shape[-1] // 2] = 1.0
+    teacher_direction = family["teacher_kernels"] - identity
+    raw_direction = family["raw_kernels"] - identity
+    # Both branches can only move along the same learned blur mode.
+    assert torch.allclose(
+        teacher_direction * family["raw_strength"][:, None],
+        raw_direction * family["teacher_strength"][:, None],
+        atol=1e-7,
+    )
+
+
+def test_single_bpn_rollback_keeps_identity_teacher_and_original_raw_kernel() -> None:
+    objective = BlurAwareObjective(
+        2, BlurAwareObjectiveConfig(coupled_dual_bpn=False)
+    )
+    indices = torch.tensor([[0, 1]])
+    family = objective.bpn.kernel_family(indices)
+    embedding = objective.bpn.camera_embedding(indices.reshape(-1))
+    original = torch.softmax(objective.bpn.kernel_head(embedding), dim=-1)
+    identity = torch.zeros_like(original)
+    identity[:, identity.shape[-1] // 2] = 1.0
+
+    assert torch.equal(family["teacher_kernels"], identity)
+    assert torch.equal(family["raw_kernels"], original)
+
+
 def _checkerboard(size: int = 32) -> torch.Tensor:
     y, x = torch.meshgrid(torch.arange(size), torch.arange(size), indexing="ij")
     image = ((x + y) % 2).float().view(1, 1, 1, size, size)

@@ -478,6 +478,7 @@ class LeGSStrategyState(FastGSStrategyState):
     pending_pre_blur_observation: dict[str, float | bool] | None = None
     last_blur_quality_reward: float = 0.0
     last_blur_psnr_delta: float = 0.0
+    last_blur_raw_psnr_delta: float = 0.0
     last_blur_surplus_delta: float = 0.0
     last_blur_structural_fraction: float = 0.0
     last_blur_capacity_cost: float = 0.0
@@ -537,6 +538,7 @@ def transfer_legs_runtime_state(
         "pending_pre_blur_observation",
         "last_blur_quality_reward",
         "last_blur_psnr_delta",
+        "last_blur_raw_psnr_delta",
         "last_blur_surplus_delta",
         "last_blur_structural_fraction",
         "last_blur_capacity_cost",
@@ -800,17 +802,20 @@ def _render_blur_policy_observation(
     direct = views.get("direct_supervision")
     direct = known_sharp if direct is None else direct.bool()
     active = ~direct.reshape(-1)
+    raw_prediction = prediction
     kernel_entropy = prediction.new_zeros(())
     kernel_radius = prediction.new_zeros(())
     mask_mean = prediction.new_zeros(())
     if active.any():
-        _, bpn_stats = objective.bpn(
+        formed, bpn_stats = objective.bpn(
             prediction,
             output.depth,
             raw,
             target,
             views["index"],
         )
+        direct_image_mask = direct[..., None, None, None]
+        raw_prediction = torch.where(direct_image_mask, prediction, formed)
         kernels = bpn_stats["kernels"][active]
         entropy = -(kernels * kernels.clamp_min(1e-8).log()).sum(dim=-1)
         kernel_entropy = entropy.mean() / math.log(kernels.shape[-1])
@@ -824,8 +829,28 @@ def _render_blur_policy_observation(
         kernel_radius = radius_squared.clamp_min(0.0).sqrt().mean() / math.sqrt(2.0)
         mask_mean = bpn_stats["mask"][0, active].mean()
 
+    raw_squared_error = (raw_prediction - raw).square()
+    if valid_mask is None:
+        raw_mse = raw_squared_error.mean(dim=(2, 3, 4))
+    else:
+        valid = valid_mask.to(dtype=raw_squared_error.dtype)
+        denominator = valid.sum(dim=(2, 3, 4)).clamp_min(1.0) * raw.shape[2]
+        raw_mse = (raw_squared_error * valid).sum(dim=(2, 3, 4)) / denominator
+    raw_per_view_psnr = -10.0 * torch.log10(raw_mse.clamp_min(1e-12))
+    # RAW/BPN consistency is complementary evidence for blurry views. Direct
+    # sharp views are already measured by weighted_psnr and must not be counted
+    # a second time here, otherwise a few sharp anchors can drown out the RAW
+    # consistency signal that the coupled kernel was introduced to measure.
+    raw_weight = (~direct).float() * (1.0 - confidence)
+    raw_weight_sum = raw_weight.sum()
+    if float(raw_weight_sum) == 0.0:
+        raw_weight = torch.ones_like(raw_weight)
+        raw_weight_sum = raw_weight.sum()
+    weighted_raw_psnr = (raw_per_view_psnr * raw_weight).sum() / raw_weight_sum
+
     return {
         "weighted_psnr": float(weighted_psnr),
+        "weighted_raw_psnr": float(weighted_raw_psnr),
         "surplus": float(surplus["surplus"]),
         "has_surplus": bool(surplus["has_surplus"]),
         "reliability_mean": float(confidence.mean()),
@@ -872,9 +897,13 @@ def _normalize_blur_quality_delta(
     has_surplus: bool,
     reliability: float,
     device: torch.device,
+    raw_psnr_delta: float | None = None,
 ) -> float:
     """Normalize reward changes by their causal per-scene RMS."""
-    adc_state.blur_quality_delta_history.append([psnr_delta, surplus_delta])
+    values = [psnr_delta, surplus_delta]
+    if raw_psnr_delta is not None:
+        values.append(raw_psnr_delta)
+    adc_state.blur_quality_delta_history.append(values)
     history = torch.tensor(
         adc_state.blur_quality_delta_history,
         dtype=torch.float32,
@@ -883,9 +912,19 @@ def _normalize_blur_quality_delta(
     current = history[-1]
     rms = history.square().mean(dim=0).sqrt().clamp_min(1e-8)
     normalized = torch.tanh(current / rms)
-    if not has_surplus:
+    if raw_psnr_delta is None and not has_surplus:
         return float(normalized[0])
     reliability = min(1.0, max(0.0, float(reliability)))
+    if raw_psnr_delta is not None:
+        raw_and_surplus = (
+            0.5 * (normalized[1] + normalized[2])
+            if has_surplus
+            else normalized[2]
+        )
+        return float(
+            reliability * normalized[0]
+            + (1.0 - reliability) * raw_and_surplus
+        )
     return float(
         reliability * normalized[0]
         + (1.0 - reliability) * normalized[1]
@@ -1121,6 +1160,9 @@ def _finish_delayed_reward(
         psnr_delta = float(post_observation["weighted_psnr"]) - float(
             pre_observation["weighted_psnr"]
         )
+        raw_psnr_delta = float(post_observation["weighted_raw_psnr"]) - float(
+            pre_observation["weighted_raw_psnr"]
+        )
         has_surplus = bool(pre_observation["has_surplus"]) and bool(
             post_observation["has_surplus"]
         )
@@ -1137,6 +1179,9 @@ def _finish_delayed_reward(
             has_surplus,
             float(pre_observation["reliability_mean"]),
             new_metric.device,
+            raw_psnr_delta=(
+                raw_psnr_delta if objective.cfg.coupled_dual_bpn else None
+            ),
         )
         (
             reward,
@@ -1156,6 +1201,7 @@ def _finish_delayed_reward(
         )
         adc_state.last_blur_quality_reward = quality_reward
         adc_state.last_blur_psnr_delta = psnr_delta
+        adc_state.last_blur_raw_psnr_delta = raw_psnr_delta
         adc_state.last_blur_surplus_delta = surplus_delta
         adc_state.last_blur_structural_fraction = structural_fraction
         adc_state.last_blur_capacity_cost = capacity_cost

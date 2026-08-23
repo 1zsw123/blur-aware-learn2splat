@@ -311,15 +311,31 @@ class KnnBasedOptimizerState(OptimizerState):
 
     def split(self, split_mask: torch.Tensor, num_splits: int, zero_t: bool) -> None:
         if self.state is not None:
-            chunks = self.state[split_mask].chunk(num_splits, dim=0)
-            new_states = [torch.zeros_like(c) if zero_t else c for c in chunks]
-            self.state = torch.cat([self.state, *new_states], dim=0)
+            selected = self.state[split_mask]
+            children = (
+                torch.zeros(
+                    (selected.shape[0] * num_splits, *selected.shape[1:]),
+                    device=selected.device,
+                    dtype=selected.dtype,
+                )
+                if zero_t
+                else selected.repeat(num_splits, *([1] * (selected.ndim - 1)))
+            )
+            self.state = torch.cat([self.state[~split_mask], children], dim=0)
         if self.init_state is not None:
-            # NOTE: split Gaussians inherit the parent's init_state (or zeros when zero_t).
-            # Whether a split should keep, reset, or re-derive init_state is an open design question.
-            init_chunks = self.init_state[split_mask].chunk(num_splits, dim=0)
-            new_init = [torch.zeros_like(c) if zero_t else c for c in init_chunks]
-            self.init_state = torch.cat([self.init_state, *new_init], dim=0)
+            selected = self.init_state[split_mask]
+            children = (
+                torch.zeros(
+                    (selected.shape[0] * num_splits, *selected.shape[1:]),
+                    device=selected.device,
+                    dtype=selected.dtype,
+                )
+                if zero_t
+                else selected.repeat(num_splits, *([1] * (selected.ndim - 1)))
+            )
+            self.init_state = torch.cat(
+                [self.init_state[~split_mask], children], dim=0
+            )
 
     def replace(self, from_indices: torch.Tensor, dest_indices: torch.Tensor, zero_t: bool) -> None:
         if self.state is not None:
