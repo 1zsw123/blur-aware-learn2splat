@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 REPO="/srv2/szha0669/blur_slam_exp/repos/learn2splat-official-space"
 PYTHON="/srv2/szha0669/blur_slam_exp/envs/learn2splat-py312/bin/python"
-RUN_TAG="${RUN_TAG:-s1}"
+RUN_TAG="${RUN_TAG:-dual_bpn_maskgated_s1}"
 OUTPUT_ROOT="/srv2/szha0669/blur_slam_exp/outputs/learn2splat_legs_blur_tum3_full50k_${RUN_TAG}"
 LOG_ROOT="/srv2/szha0669/blur_slam_exp/outputs/logs/learn2splat_legs_blur_tum3_full50k_${RUN_TAG}"
 RUNNER="$REPO/experiments/blur_aware_cross_dataset/run_cross_dataset.py"
@@ -54,6 +54,8 @@ launch_scene() {
     --legs-blur-capacity-weight 0.10 \
     --legs-blur-start-iter 2000 \
     --legs-blur-ramp-iters 3000 \
+    --coupled-dual-bpn \
+    --skip-lpips \
     > "$log" 2>&1 &
   local pid=$!
   PIDS+=("$pid")

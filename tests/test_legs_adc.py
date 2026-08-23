@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import random
 
 import torch
@@ -327,6 +328,31 @@ def test_dual_bpn_reward_uses_raw_consistency_when_teacher_is_unreliable() -> No
     )
 
     assert reward > 0.0
+
+
+def test_dual_bpn_reward_is_noop_when_blur_mask_is_zero() -> None:
+    single_state = LeGSStrategyState.initialize(1, torch.device("cpu"), 1.0)
+    dual_state = LeGSStrategyState.initialize(1, torch.device("cpu"), 1.0)
+    single = _normalize_blur_quality_delta(
+        single_state,
+        psnr_delta=1.0,
+        surplus_delta=-0.25,
+        has_surplus=True,
+        reliability=0.2,
+        device=torch.device("cpu"),
+    )
+    dual = _normalize_blur_quality_delta(
+        dual_state,
+        psnr_delta=1.0,
+        surplus_delta=-0.25,
+        has_surplus=True,
+        reliability=0.2,
+        device=torch.device("cpu"),
+        raw_psnr_delta=-4.0,
+        raw_evidence_weight=0.0,
+    )
+
+    assert math.isclose(dual, single, rel_tol=1e-7, abs_tol=1e-7)
 
 
 def test_legs_runtime_transfer_is_not_routed_through_adaptive_state() -> None:

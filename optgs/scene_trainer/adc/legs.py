@@ -898,6 +898,7 @@ def _normalize_blur_quality_delta(
     reliability: float,
     device: torch.device,
     raw_psnr_delta: float | None = None,
+    raw_evidence_weight: float = 1.0,
 ) -> float:
     """Normalize reward changes by their causal per-scene RMS."""
     values = [psnr_delta, surplus_delta]
@@ -916,14 +917,21 @@ def _normalize_blur_quality_delta(
         return float(normalized[0])
     reliability = min(1.0, max(0.0, float(reliability)))
     if raw_psnr_delta is not None:
-        raw_and_surplus = (
-            0.5 * (normalized[1] + normalized[2])
-            if has_surplus
-            else normalized[2]
+        raw_evidence_weight = min(1.0, max(0.0, float(raw_evidence_weight)))
+        if has_surplus:
+            single_auxiliary = normalized[1]
+            dual_auxiliary = 0.5 * (normalized[1] + normalized[2])
+        else:
+            single_auxiliary = normalized[0]
+            dual_auxiliary = normalized[2]
+        auxiliary = torch.lerp(
+            single_auxiliary,
+            dual_auxiliary,
+            raw_evidence_weight,
         )
         return float(
             reliability * normalized[0]
-            + (1.0 - reliability) * raw_and_surplus
+            + (1.0 - reliability) * auxiliary
         )
     return float(
         reliability * normalized[0]
@@ -1181,6 +1189,10 @@ def _finish_delayed_reward(
             new_metric.device,
             raw_psnr_delta=(
                 raw_psnr_delta if objective.cfg.coupled_dual_bpn else None
+            ),
+            raw_evidence_weight=math.sqrt(
+                max(0.0, float(pre_observation["mask_mean"]))
+                * max(0.0, float(post_observation["mask_mean"]))
             ),
         )
         (
