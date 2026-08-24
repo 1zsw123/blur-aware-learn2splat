@@ -1,0 +1,200 @@
+{
+  "motion_blurball": {
+    "dataset": "Deblur-NeRF motion",
+    "data_dir": "/srv2/szha0669/blur_slam_exp/data/deblurnerf/real_camera_motion_blur_all/blurball",
+    "factor": 4,
+    "raw_dir": "/srv2/szha0669/blur_slam_exp/data/deblurnerf/real_camera_motion_blur_all/blurball/images_4",
+    "raw_mode": "stem",
+    "evssm_dir": "/srv2/szha0669/blur_slam_exp/data/evssm_deblurred_deblurnerf/blurball_unblurslam",
+    "depth_dir": "/srv2/szha0669/blur_slam_exp/data/deblurnerf/real_camera_motion_blur_all/blurball/depth",
+    "sharp_json": "/srv2/szha0669/blur_slam_exp/outputs/logs/blurball_nima06_sharp_frames.json",
+    "evaluation_manifest": {"path": "/srv2/szha0669/blur_slam_exp/outputs/logs/blurball_nima06_sharp_frames.json", "label": "nima06_sharp_frames"}
+  },
+  "motion_blurbasket": {
+    "dataset": "Deblur-NeRF motion",
+    "data_dir": "/srv2/szha0669/blur_slam_exp/data/deblurnerf_extra/real_camera_motion_blur/blurbasket",
+    "factor": 4,
+    "raw_dir": "/srv2/szha0669/blur_slam_exp/data/deblurnerf_extra/real_camera_motion_blur/blurbasket/images_4",
+    "raw_mode": "stem",
+    "evssm_dir": "/srv2/szha0669/blur_slam_exp/data/evssm_deblurred_deblurnerf/blurbasket_unblurslam",
+    "depth_dir": "/srv2/szha0669/blur_slam_exp/data/deblurnerf_extra/real_camera_motion_blur/blurbasket/depth",
+    "sharp_json": "/srv2/szha0669/blur_slam_exp/outputs/logs/blurbasket_nima06_sharp_frames.json",
+    "evaluation_manifest": {"path": "/srv2/szha0669/blur_slam_exp/outputs/logs/blurbasket_nima06_sharp_frames.json", "label": "nima06_sharp_frames"}
+  },
+  "motion_blurbuick": {
+    "dataset": "Deblur-NeRF motion",
+    "data_dir": "/srv2/szha0669/blur_slam_exp/data/deblurnerf_extra/real_camera_motion_blur/blurbuick",
+    "factor": 4,
+    "raw_dir": "/srv2/szha0669/blur_slam_exp/data/deblurnerf_extra/real_camera_motion_blur/blurbuick/images_4",
+    "raw_mode": "stem",
+    "evssm_dir": "/srv2/szha0669/blur_slam_exp/data/evssm_deblurred_deblurnerf/blurbuick_unblurslam",
+    "depth_dir": "/srv2/szha0669/blur_slam_exp/data/deblurnerf_extra/real_camera_motion_blur/blurbuick/depth",
+    "sharp_json": "/srv2/szha0669/blur_slam_exp/outputs/logs/blurbuick_nima06_sharp_frames.json",
+    "evaluation_manifest": {"path": "/srv2/szha0669/blur_slam_exp/outputs/logs/blurbuick_nima06_sharp_frames.json", "label": "nima06_sharp_frames"}
+  },
+  "motion_blurdecoration": {
+    "dataset": "Deblur-NeRF motion",
+    "data_dir": "/srv2/szha0669/blur_slam_exp/data/deblurnerf_extra/real_camera_motion_blur/blurdecoration",
+    "factor": 4,
+    "raw_dir": "/srv2/szha0669/blur_slam_exp/data/deblurnerf_extra/real_camera_motion_blur/blurdecoration/images_4",
+    "raw_mode": "stem",
+    "evssm_dir": "/srv2/szha0669/blur_slam_exp/data/evssm_deblurred_deblurnerf/blurdecoration_unblurslam",
+    "depth_dir": "/srv2/szha0669/blur_slam_exp/data/deblurnerf_extra/real_camera_motion_blur/blurdecoration/depth",
+    "sharp_json": "/srv2/szha0669/blur_slam_exp/outputs/logs/blurdecoration_nima06_sharp_frames.json",
+    "evaluation_manifest": {"path": "/srv2/szha0669/blur_slam_exp/outputs/logs/blurdecoration_nima06_sharp_frames.json", "label": "nima06_sharp_frames"}
+  },
+  "motion_blurgirl": {
+    "dataset": "Deblur-NeRF motion",
+    "data_dir": "/srv2/szha0669/blur_slam_exp/data/deblurnerf_extra/real_camera_motion_blur/blurgirl",
+    "factor": 4,
+    "raw_dir": "/srv2/szha0669/blur_slam_exp/data/deblurnerf_extra/real_camera_motion_blur/blurgirl/images_4",
+    "raw_mode": "stem",
+    "evssm_dir": "/srv2/szha0669/blur_slam_exp/data/evssm_deblurred_deblurnerf/blurgirl_unblurslam",
+    "depth_dir": "/srv2/szha0669/blur_slam_exp/data/deblurnerf_extra/real_camera_motion_blur/blurgirl/depth",
+    "sharp_json": "/srv2/szha0669/blur_slam_exp/outputs/logs/blurgirl_nima06_sharp_frames.json",
+    "evaluation_manifest": {"path": "/srv2/szha0669/blur_slam_exp/outputs/logs/blurgirl_nima06_sharp_frames.json", "label": "nima06_sharp_frames"}
+  },
+  "motion_blurheron": {
+    "dataset": "Deblur-NeRF motion",
+    "data_dir": "/srv2/szha0669/blur_slam_exp/data/deblurnerf_extra/real_camera_motion_blur/blurheron",
+    "factor": 4,
+    "raw_dir": "/srv2/szha0669/blur_slam_exp/data/deblurnerf_extra/real_camera_motion_blur/blurheron/images_4",
+    "raw_mode": "stem",
+    "evssm_dir": "/srv2/szha0669/blur_slam_exp/data/evssm_deblurred_deblurnerf/blurheron_unblurslam",
+    "depth_dir": "/srv2/szha0669/blur_slam_exp/data/deblurnerf_extra/real_camera_motion_blur/blurheron/depth",
+    "sharp_json": "/srv2/szha0669/blur_slam_exp/outputs/logs/blurheron_nima06_sharp_frames.json",
+    "evaluation_manifest": {"path": "/srv2/szha0669/blur_slam_exp/outputs/logs/blurheron_nima06_sharp_frames.json", "label": "nima06_sharp_frames"}
+  },
+  "motion_blurparterre": {
+    "dataset": "Deblur-NeRF motion",
+    "data_dir": "/srv2/szha0669/blur_slam_exp/data/deblurnerf_extra/real_camera_motion_blur/blurparterre",
+    "factor": 4,
+    "raw_dir": "/srv2/szha0669/blur_slam_exp/data/deblurnerf_extra/real_camera_motion_blur/blurparterre/images_4",
+    "raw_mode": "stem",
+    "evssm_dir": "/srv2/szha0669/blur_slam_exp/data/evssm_deblurred_deblurnerf/blurparterre_unblurslam",
+    "depth_dir": "/srv2/szha0669/blur_slam_exp/data/deblurnerf_extra/real_camera_motion_blur/blurparterre/depth",
+    "sharp_json": "/srv2/szha0669/blur_slam_exp/outputs/logs/blurparterre_nima06_sharp_frames.json",
+    "evaluation_manifest": {"path": "/srv2/szha0669/blur_slam_exp/outputs/logs/blurparterre_nima06_sharp_frames.json", "label": "nima06_sharp_frames"}
+  },
+  "motion_blurpuppet": {
+    "dataset": "Deblur-NeRF motion",
+    "data_dir": "/srv2/szha0669/blur_slam_exp/data/motion10_images4_trigsplat/blurpuppet",
+    "factor": 4,
+    "raw_dir": "/srv2/szha0669/blur_slam_exp/data/motion10_images4_trigsplat/blurpuppet/images_4",
+    "raw_mode": "stem",
+    "evssm_dir": "/srv2/szha0669/blur_slam_exp/data/evssm_deblurred_deblurnerf/blurpuppet_unblurslam",
+    "depth_dir": "/srv2/szha0669/blur_slam_exp/data/motion10_images4_trigsplat/blurpuppet/depth",
+    "sharp_json": "/srv2/szha0669/blur_slam_exp/outputs/logs/blurpuppet_nima06_sharp_frames.json",
+    "evaluation_manifest": {"path": "/srv2/szha0669/blur_slam_exp/outputs/logs/blurpuppet_nima06_sharp_frames.json", "label": "nima06_sharp_frames"}
+  },
+  "motion_blurstair": {
+    "dataset": "Deblur-NeRF motion",
+    "data_dir": "/srv2/szha0669/blur_slam_exp/data/deblurnerf_extra/real_camera_motion_blur/blurstair",
+    "factor": 4,
+    "raw_dir": "/srv2/szha0669/blur_slam_exp/data/deblurnerf_extra/real_camera_motion_blur/blurstair/images_4",
+    "raw_mode": "stem",
+    "evssm_dir": "/srv2/szha0669/blur_slam_exp/data/evssm_deblurred_deblurnerf/blurstair_unblurslam",
+    "depth_dir": "/srv2/szha0669/blur_slam_exp/data/deblurnerf_extra/real_camera_motion_blur/blurstair/depth",
+    "sharp_json": "/srv2/szha0669/blur_slam_exp/outputs/logs/blurstair_nima06_sharp_frames.json",
+    "evaluation_manifest": {"path": "/srv2/szha0669/blur_slam_exp/outputs/logs/blurstair_nima06_sharp_frames.json", "label": "nima06_sharp_frames"}
+  },
+  "defocus_cake": {
+    "dataset": "Deblur-NeRF defocus",
+    "data_dir": "/srv2/szha0669/blur_slam_exp/data/i2slam_trigsplat_defocus_images4_r1/defocuscake_abl1",
+    "factor": 4,
+    "raw_dir": "/srv2/szha0669/blur_slam_exp/data/i2slam_trigsplat_defocus_images4_r1/defocuscake_abl1/images_4",
+    "raw_mode": "stem",
+    "evssm_dir": "/srv2/szha0669/blur_slam_exp/data/evssm_deblurred_deblurnerf/defocuscake_unblurslam",
+    "depth_dir": "/srv2/szha0669/blur_slam_exp/data/i2slam_trigsplat_defocus_images4_r1/defocuscake_abl1/depth",
+    "sharp_json": "/srv2/szha0669/blur_slam_exp/outputs/logs/defocuscake_nima06_sharp_frames.json",
+    "evaluation_manifest": {"path": "/srv2/szha0669/blur_slam_exp/outputs/logs/defocuscake_nima06_sharp_frames.json", "label": "nima06_sharp_frames"}
+  },
+  "defocus_caps": {
+    "dataset": "Deblur-NeRF defocus",
+    "data_dir": "/srv2/szha0669/blur_slam_exp/data/i2slam_trigsplat_defocus_images4_r1/defocuscaps_abl1",
+    "factor": 4,
+    "raw_dir": "/srv2/szha0669/blur_slam_exp/data/i2slam_trigsplat_defocus_images4_r1/defocuscaps_abl1/images_4",
+    "raw_mode": "stem",
+    "evssm_dir": "/srv2/szha0669/blur_slam_exp/data/evssm_deblurred_deblurnerf/defocuscaps_unblurslam",
+    "depth_dir": "/srv2/szha0669/blur_slam_exp/data/deblurnerf_extra/real_defocus_blur/defocuscaps/depth",
+    "sharp_json": "/srv2/szha0669/blur_slam_exp/outputs/logs/defocuscaps_nima06_sharp_frames.json",
+    "evaluation_manifest": {"path": "/srv2/szha0669/blur_slam_exp/outputs/logs/defocuscaps_nima06_sharp_frames.json", "label": "nima06_sharp_frames"}
+  },
+  "defocus_coral": {
+    "dataset": "Deblur-NeRF defocus",
+    "data_dir": "/srv2/szha0669/blur_slam_exp/data/i2slam_trigsplat_defocus_images4_r1/defocuscoral_abl1",
+    "factor": 4,
+    "raw_dir": "/srv2/szha0669/blur_slam_exp/data/deblurnerf_extra/real_defocus_blur/defocuscoral/images_4",
+    "raw_mode": "stem",
+    "evssm_dir": "/srv2/szha0669/blur_slam_exp/data/evssm_deblurred_deblurnerf/defocuscoral_unblurslam",
+    "depth_dir": "/srv2/szha0669/blur_slam_exp/data/deblurnerf_extra/real_defocus_blur/defocuscoral/depth",
+    "sharp_json": "/srv2/szha0669/blur_slam_exp/outputs/logs/defocuscoral_nima06_sharp_frames.json",
+    "evaluation_manifest": {"path": "/srv2/szha0669/blur_slam_exp/outputs/logs/defocuscoral_nima06_sharp_frames.json", "label": "nima06_sharp_frames"}
+  },
+  "defocus_cupcake": {
+    "dataset": "Deblur-NeRF defocus",
+    "data_dir": "/srv2/szha0669/blur_slam_exp/data/i2slam_trigsplat_defocus_images4_r1/defocuscupcake_abl1",
+    "factor": 4,
+    "raw_dir": "/srv2/szha0669/blur_slam_exp/data/deblurnerf_extra/real_defocus_blur/defocuscupcake/images_4",
+    "raw_mode": "stem",
+    "evssm_dir": "/srv2/szha0669/blur_slam_exp/data/evssm_deblurred_deblurnerf/defocuscupcake_unblurslam",
+    "depth_dir": "/srv2/szha0669/blur_slam_exp/data/deblurnerf_extra/real_defocus_blur/defocuscupcake/depth",
+    "sharp_json": "/srv2/szha0669/blur_slam_exp/outputs/logs/defocuscupcake_nima06_sharp_frames.json",
+    "evaluation_manifest": {"path": "/srv2/szha0669/blur_slam_exp/outputs/logs/defocuscupcake_nima06_sharp_frames.json", "label": "nima06_sharp_frames"}
+  },
+  "defocus_cups": {
+    "dataset": "Deblur-NeRF defocus",
+    "data_dir": "/srv2/szha0669/blur_slam_exp/data/i2slam_trigsplat_defocus_images4_r1/defocuscups_abl1",
+    "factor": 4,
+    "raw_dir": "/srv2/szha0669/blur_slam_exp/data/deblurnerf_extra/real_defocus_blur/defocuscups/images_4",
+    "raw_mode": "stem",
+    "evssm_dir": "/srv2/szha0669/blur_slam_exp/data/evssm_deblurred_deblurnerf/defocuscups_unblurslam",
+    "depth_dir": "/srv2/szha0669/blur_slam_exp/data/deblurnerf_extra/real_defocus_blur/defocuscups/depth",
+    "sharp_json": "/srv2/szha0669/blur_slam_exp/outputs/logs/defocuscups_nima06_sharp_frames.json",
+    "evaluation_manifest": {"path": "/srv2/szha0669/blur_slam_exp/outputs/logs/defocuscups_nima06_sharp_frames.json", "label": "nima06_sharp_frames"}
+  },
+  "defocus_daisy": {
+    "dataset": "Deblur-NeRF defocus",
+    "data_dir": "/srv2/szha0669/blur_slam_exp/data/i2slam_trigsplat_defocus_images4_r1/defocusdaisy_abl1",
+    "factor": 4,
+    "raw_dir": "/srv2/szha0669/blur_slam_exp/data/i2slam_trigsplat_defocus_images4_r1/defocusdaisy_abl1/images_4",
+    "raw_mode": "stem",
+    "evssm_dir": "/srv2/szha0669/blur_slam_exp/data/evssm_deblurred_deblurnerf/defocusdaisy_unblurslam",
+    "depth_dir": "/srv2/szha0669/blur_slam_exp/data/deblurnerf_extra/real_defocus_blur/defocusdaisy/depth",
+    "sharp_json": "/srv2/szha0669/blur_slam_exp/outputs/logs/defocusdaisy_nima06_sharp_frames.json",
+    "evaluation_manifest": {"path": "/srv2/szha0669/blur_slam_exp/outputs/logs/defocusdaisy_nima06_sharp_frames.json", "label": "nima06_sharp_frames"}
+  },
+  "defocus_sausage": {
+    "dataset": "Deblur-NeRF defocus",
+    "data_dir": "/srv2/szha0669/blur_slam_exp/data/i2slam_trigsplat_defocus_images4_r1/defocussausage_abl1",
+    "factor": 4,
+    "raw_dir": "/srv2/szha0669/blur_slam_exp/data/deblurnerf_extra/real_defocus_blur/defocussausage/images_4",
+    "raw_mode": "stem",
+    "evssm_dir": "/srv2/szha0669/blur_slam_exp/data/evssm_deblurred_deblurnerf/defocussausage_unblurslam",
+    "depth_dir": "/srv2/szha0669/blur_slam_exp/data/deblurnerf_extra/real_defocus_blur/defocussausage/depth",
+    "sharp_json": "/srv2/szha0669/blur_slam_exp/outputs/logs/defocussausage_nima06_sharp_frames.json",
+    "evaluation_manifest": {"path": "/srv2/szha0669/blur_slam_exp/outputs/logs/defocussausage_nima06_sharp_frames.json", "label": "nima06_sharp_frames"}
+  },
+  "defocus_seal": {
+    "dataset": "Deblur-NeRF defocus",
+    "data_dir": "/srv2/szha0669/blur_slam_exp/data/i2slam_trigsplat_defocus_images4_r1/defocusseal_abl1",
+    "factor": 4,
+    "raw_dir": "/srv2/szha0669/blur_slam_exp/data/deblurnerf_extra/real_defocus_blur/defocusseal/images_4",
+    "raw_mode": "stem",
+    "evssm_dir": "/srv2/szha0669/blur_slam_exp/data/evssm_deblurred_deblurnerf/defocusseal_unblurslam",
+    "depth_dir": "/srv2/szha0669/blur_slam_exp/data/deblurnerf_extra/real_defocus_blur/defocusseal/depth",
+    "sharp_json": "/srv2/szha0669/blur_slam_exp/outputs/logs/defocusseal_nima06_sharp_frames.json",
+    "evaluation_manifest": {"path": "/srv2/szha0669/blur_slam_exp/outputs/logs/defocusseal_nima06_sharp_frames.json", "label": "nima06_sharp_frames"}
+  },
+  "defocus_tools": {
+    "dataset": "Deblur-NeRF defocus",
+    "data_dir": "/srv2/szha0669/blur_slam_exp/data/i2slam_trigsplat_defocus_images4_r1/defocustools_abl1",
+    "factor": 4,
+    "raw_dir": "/srv2/szha0669/blur_slam_exp/data/deblurnerf_extra/real_defocus_blur/defocustools/images_4",
+    "raw_mode": "stem",
+    "evssm_dir": "/srv2/szha0669/blur_slam_exp/data/evssm_deblurred_deblurnerf/defocustools_unblurslam",
+    "depth_dir": "/srv2/szha0669/blur_slam_exp/data/deblurnerf_extra/real_defocus_blur/defocustools/depth",
+    "sharp_json": "/srv2/szha0669/blur_slam_exp/outputs/logs/defocustools_nima06_sharp_frames.json",
+    "evaluation_manifest": {"path": "/srv2/szha0669/blur_slam_exp/outputs/logs/defocustools_nima06_sharp_frames.json", "label": "nima06_sharp_frames"}
+  }
+}
