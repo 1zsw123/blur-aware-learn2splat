@@ -63,6 +63,15 @@ def parse_args() -> argparse.Namespace:
             "for post-training convergence and capacity-schedule diagnostics."
         ),
     )
+    parser.add_argument(
+        "--initial-objective-state",
+        default=None,
+        help=(
+            "Optional blur-aware objective checkpoint paired with --initial-ply. "
+            "Restores the learned BPN/kernel state for cross-domain residual "
+            "refinement; omitted for exact legacy behavior."
+        ),
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
         "--decoder-backend",
@@ -1579,6 +1588,7 @@ def main() -> None:
             "total": int(gaussians.means.shape[1]),
         }
     objective = None
+    initial_objective_stats = None
     if args.objective == "blur-aware":
         objective = BlurAwareObjective(
             len(optimization_indices),
@@ -1593,6 +1603,28 @@ def main() -> None:
             known_sharp_mask=scene["known_sharp"][optimization_selection],
         )
         optgs.configure_input_objective(objective)
+        if args.initial_objective_state is not None:
+            if args.initial_ply is None:
+                raise ValueError("--initial-objective-state requires --initial-ply")
+            objective_path = Path(args.initial_objective_state).resolve()
+            if not objective_path.is_file():
+                raise FileNotFoundError(
+                    f"objective continuation state does not exist: {objective_path}"
+                )
+            objective_payload = torch.load(
+                objective_path, map_location=device, weights_only=True
+            )
+            saved_config = objective_payload.get("config")
+            if saved_config != objective.export_config():
+                raise RuntimeError(
+                    "objective continuation config differs from the requested run"
+                )
+            objective.load_state_dict(objective_payload["model"], strict=True)
+            initial_objective_stats = {
+                "source": "existing_blur_aware_objective",
+                "path": str(objective_path),
+                "optimizer_state_restored": False,
+            }
     optgs.initialize_from_tensors(gaussians, train_views)
 
     lpips_model = None
@@ -1800,6 +1832,7 @@ def main() -> None:
             "num_init_points_effective": init_budget,
             "num_init_points_source": init_budget_source,
             "initial_ply": args.initial_ply,
+            "initial_objective_state": args.initial_objective_state,
             "opt_batch_size": args.opt_batch_size,
             "opt_batch_strategy_requested": requested_batch_strategy,
             "opt_batch_strategy_effective": optgs.opt_batch_strategy,
@@ -1955,6 +1988,7 @@ def main() -> None:
         "probe_train_indices": probe_global,
         "densification_probe_history": densification_probe_history,
         "initialization": init_stats,
+        "objective_initialization": initial_objective_stats,
         "camera_preprocess": [
             {
                 "camera_id": int(camera_id),
