@@ -54,6 +54,7 @@ launch_scene() {
     --legs-blur-capacity-weight 0.10 \
     --legs-blur-start-iter 2000 \
     --legs-blur-ramp-iters 3000 \
+    --legs-local-objective \
     --coupled-dual-bpn \
     --skip-lpips \
     > "$log" 2>&1 &
