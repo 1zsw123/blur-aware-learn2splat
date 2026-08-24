@@ -133,12 +133,12 @@
   },
   "defocus_cupcake": {
     "dataset": "Deblur-NeRF defocus",
-    "data_dir": "/srv2/szha0669/blur_slam_exp/data/i2slam_trigsplat_defocus_images4_r1/defocuscupcake_abl1",
+    "data_dir": "/srv2/szha0669/blur_slam_exp/data/i2slam_trigsplat_defocus_images4_r1_official43/defocuscupcake_abl1",
     "factor": 4,
-    "raw_dir": "/srv2/szha0669/blur_slam_exp/data/deblurnerf_extra/real_defocus_blur/defocuscupcake/images_4",
+    "raw_dir": "/srv2/szha0669/blur_slam_exp/data/i2slam_trigsplat_defocus_images4_r1_official43/defocuscupcake_abl1/images_4",
     "raw_mode": "stem",
     "evssm_dir": "/srv2/szha0669/blur_slam_exp/data/evssm_deblurred_deblurnerf/defocuscupcake_unblurslam",
-    "depth_dir": "/srv2/szha0669/blur_slam_exp/data/deblurnerf_extra/real_defocus_blur/defocuscupcake/depth",
+    "depth_dir": "/srv2/szha0669/blur_slam_exp/data/i2slam_trigsplat_defocus_images4_r1_official43/defocuscupcake_abl1/depth",
     "sharp_json": "/srv2/szha0669/blur_slam_exp/outputs/logs/defocuscupcake_nima06_sharp_frames.json",
     "evaluation_manifest": {"path": "/srv2/szha0669/blur_slam_exp/outputs/logs/defocuscupcake_nima06_sharp_frames.json", "label": "nima06_sharp_frames"}
   },

@@ -6,8 +6,8 @@ PYTHON="/srv2/szha0669/blur_slam_exp/envs/learn2splat-py312/bin/python"
 RUNNER="$REPO/experiments/blur_aware_cross_dataset/run_cross_dataset.py"
 SCENE_CONFIG="$REPO/experiments/blur_aware_cross_dataset/scenes_deblurnerf_remaining18.json"
 RUN_TAG="${RUN_TAG:-local_joint_s1}"
-OUTPUT_ROOT="/srv2/szha0669/blur_slam_exp/outputs/learn2splat_legs_blur_deblurnerf_remaining17_50k_${RUN_TAG}"
-LOG_ROOT="/srv2/szha0669/blur_slam_exp/outputs/logs/learn2splat_legs_blur_deblurnerf_remaining17_50k_${RUN_TAG}"
+OUTPUT_ROOT="/srv2/szha0669/blur_slam_exp/outputs/learn2splat_legs_blur_deblurnerf_remaining18_50k_${RUN_TAG}"
+LOG_ROOT="/srv2/szha0669/blur_slam_exp/outputs/logs/learn2splat_legs_blur_deblurnerf_remaining18_50k_${RUN_TAG}"
 
 GPU2_SCENES=(
   motion_blurball
@@ -26,6 +26,7 @@ GPU3_SCENES=(
   motion_blurheron
   motion_blurpuppet
   defocus_cake
+  defocus_cupcake
   defocus_cups
   defocus_sausage
   defocus_tools
@@ -43,8 +44,6 @@ done
 
 git rev-parse HEAD > "$LOG_ROOT/code_head.txt"
 git diff --binary > "$LOG_ROOT/uncommitted.patch"
-printf '%s\tBLOCKED_MISSING_EVSSM_043\tdefocus_cupcake\tNONE\n' \
-  "$(date --iso-8601=seconds)" >> "$LOG_ROOT/status.tsv"
 
 wait_for_gpu() {
   local gpu="$1"
