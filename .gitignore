@@ -6,3 +6,4 @@ __pycache__/
 venv/
 outputs/
 checkpoints/
+experiments/blur_aware_cross_dataset/scenes_deblurnerf20_turtle_bsd.generated.json
