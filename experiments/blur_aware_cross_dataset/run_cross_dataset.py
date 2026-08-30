@@ -673,7 +673,17 @@ def resolve_scene_indices(
     protocol_spec = cfg.get("frame_protocol")
     if protocol_spec is None:
         evaluation, source = resolve_evaluation_indices(parser, cfg, data_dir, hold)
-        return list(range(len(parser.image_names))), evaluation, source, None
+        optimization = list(range(len(parser.image_names)))
+        if cfg.get("exclude_evaluation_from_optimization", False):
+            evaluation_set = set(evaluation)
+            optimization = [
+                index for index in optimization if index not in evaluation_set
+            ]
+            if not optimization:
+                raise RuntimeError(
+                    "excluding evaluation views leaves no optimization views"
+                )
+        return optimization, evaluation, source, None
 
     resolved = resolve_frame_protocol(protocol_spec)
     optimization = _indices_for_names(
@@ -777,6 +787,10 @@ def collect_scene(parser: Parser, cfg: dict, evaluation_indices: list[int]) -> d
             "auxiliary supervision images absent from COLMAP scene: "
             f"{sorted(missing_auxiliary)}"
         )
+    evaluation_names = {
+        Path(parser.image_names[index]).stem for index in evaluation_indices
+    }
+    evaluation_direct = bool(cfg.get("evaluation_direct_supervision", False))
     sharp_auxiliary_overlap = sharp_names & auxiliary_confidence.keys()
     if sharp_auxiliary_overlap:
         raise RuntimeError(
@@ -817,7 +831,14 @@ def collect_scene(parser: Parser, cfg: dict, evaluation_indices: list[int]) -> d
         evssm_path = evssm_resolver.resolve(image_name)
         is_sharp = stem in sharp_names
         is_auxiliary = stem in auxiliary_confidence
-        is_direct = is_sharp or is_auxiliary
+        # Direct supervision and w10 are separate contracts. Evaluation-based
+        # direct supervision is retained only for explicit diagnostic configs;
+        # hold-blind runs derive direct supervision solely from sharp_json.
+        is_direct = (
+            is_sharp
+            or is_auxiliary
+            or (evaluation_direct and stem in evaluation_names)
+        )
         preprocessor = camera_preprocessors[index]
         raw = load_rgb(raw_path, intrinsics[index], preprocessor)
         target = (
@@ -901,9 +922,15 @@ def build_views(
     device: torch.device,
     *,
     policy_probe_indices: set[int] | None = None,
+    image_source: str = "target",
 ) -> BatchedViews:
     selection = torch.tensor(indices, dtype=torch.long)
-    images = scene["target_images"][selection]
+    if image_source == "target":
+        images = scene["target_images"][selection]
+    elif image_source == "raw":
+        images = scene["raw_images"][selection]
+    else:
+        raise ValueError(f"unsupported view image source {image_source!r}")
     raw = scene["raw_images"][selection]
     c2w = scene["c2w"][selection]
     intrinsics = scene["intrinsics"][selection].clone()
@@ -1504,11 +1531,31 @@ def main() -> None:
         parser, cfg, Path(cfg["data_dir"]), hold
     )
     scene = collect_scene(parser, cfg, evaluation_indices)
+    if cfg.get("exclude_evaluation_from_optimization", False):
+        overlap = set(optimization_indices) & set(evaluation_indices)
+        if overlap:
+            raise RuntimeError(
+                f"evaluation views leaked into optimization: {sorted(overlap)}"
+            )
+    if cfg.get("require_sharp_evaluation_targets", False):
+        evaluation_selection = torch.tensor(evaluation_indices, dtype=torch.long)
+        if not bool(scene["direct_supervision"][evaluation_selection].all()):
+            raise RuntimeError(
+                "an evaluation view is not using authoritative direct supervision"
+            )
+        for index in evaluation_indices:
+            if scene["target_paths"][index] != scene["raw_paths"][index]:
+                raise RuntimeError(
+                    "authoritative sharp evaluation target was replaced: "
+                    f"{parser.image_names[index]}"
+                )
     scene_scale = float(parser.scene_scale * 1.1)
     evaluation_set = set(evaluation_indices)
-    non_evaluation_indices = [
-        index for index in optimization_indices if index not in evaluation_set
-    ]
+    non_evaluation_indices = (
+        list(optimization_indices)
+        if cfg.get("hold_blind_training", False)
+        else [index for index in optimization_indices if index not in evaluation_set]
+    )
     if not non_evaluation_indices:
         non_evaluation_indices = optimization_indices
     probe_local = farthest_probe_indices(
@@ -1522,7 +1569,13 @@ def main() -> None:
         device,
         policy_probe_indices=set(probe_global),
     )
-    test_views = build_views(scene, evaluation_indices, scene_scale, device)
+    test_views = build_views(
+        scene,
+        evaluation_indices,
+        scene_scale,
+        device,
+        image_source="raw",
+    )
 
     requested_batch_strategy = args.opt_batch_strategy
     optgs = OptGS(
@@ -1718,7 +1771,7 @@ def main() -> None:
             save_visualization(
                 output_dir / f"hold_step_{iteration:04d}.png",
                 scene["raw_images"][torch.tensor(evaluation_indices)],
-                scene["target_images"][torch.tensor(evaluation_indices)],
+                scene["raw_images"][torch.tensor(evaluation_indices)],
                 hold_metrics["prediction"],
                 [Path(parser.image_names[index]).stem for index in evaluation_indices],
             )

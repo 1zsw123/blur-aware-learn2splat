@@ -138,6 +138,24 @@ capacity policy.
    scale-free capacity rule remain unchanged, so the second stage converges the
    same scene objective instead of replacing it with a TUM-specific loss.
 
+## Scene-Adaptive Sharp Anchor Discovery
+
+The hold-blind pipeline does not use a global NIMA score or a manually selected
+top percentage. It robustly normalizes all NIMA scores within a scene, fits a
+two-component Gaussian mixture, and assigns frames to the higher-quality
+component at posterior probability greater than `0.5`. The selected ratio is
+therefore scene-dependent. Selected anchors receive direct RAW supervision,
+BPN bypass, and the existing `w10` weighted-fair sampling; benchmark hold/test
+identities remain evaluation-only metadata.
+
+On ExBlur, the method automatically selects 39/244 frames versus 38/244 frozen
+hold frames. It recovers all 38 hold frames and adds only
+`stone_lantern/029`, giving 100% recall and 97.44% precision/Jaccard overlap.
+This selection diagnostic does not substitute for the ongoing matched 50K
+reconstruction evaluation. Equations, fail-closed gates, protocol boundaries,
+the per-scene table, and reproduction commands are in
+[`SCENE_ADAPTIVE_SHARP_ANCHORS.md`](SCENE_ADAPTIVE_SHARP_ANCHORS.md).
+
 ## Evaluation protocol
 
 - Deblur-NeRF Motion/Defocus: optimize all input frames and evaluate every name

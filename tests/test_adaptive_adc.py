@@ -15,6 +15,7 @@ from experiments.blur_aware_cross_dataset.run_cross_dataset import (
     resolve_depth_samples_per_view,
     resolve_initialization_budget,
     resolve_auxiliary_supervision,
+    resolve_scene_indices,
     resolve_sharp_supervision,
     resolve_update_budget,
     stratified_kernel_indices,
@@ -735,6 +736,27 @@ def test_keyless_evaluation_manifest_freezes_named_subset(tmp_path) -> None:
 
     assert indices == [0, 2]
     assert source == "manifest:sharp"
+
+
+def test_scene_indices_can_exclude_frozen_evaluation_views(tmp_path) -> None:
+    manifest = tmp_path / "test.json"
+    manifest.write_text('["000.png", "002.png"]')
+    parser = SimpleNamespace(image_names=["000.png", "001.png", "002.png"])
+
+    optimization, evaluation, source, protocol = resolve_scene_indices(
+        parser,
+        {
+            "evaluation_manifest": {"path": str(manifest), "label": "test"},
+            "exclude_evaluation_from_optimization": True,
+        },
+        tmp_path,
+        hold=2,
+    )
+
+    assert optimization == [1]
+    assert evaluation == [0, 2]
+    assert source == "manifest:test"
+    assert protocol is None
 
 
 def test_sharp_json_only_does_not_promote_evaluation_views(tmp_path) -> None:

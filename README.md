@@ -19,6 +19,9 @@ offline deblurring. The current tested pipeline combines:
 - the released Learn2Splat optimizer followed by an objective-consistent Adam
   projection stage;
 - BPN image-formation supervision and NIMA-sharp weighted view sampling;
+- Scene-Adaptive Sharp Anchor Discovery, which fits a hold-blind scene-relative
+  NIMA mixture and infers the sharp-anchor ratio instead of fixing a score or
+  top percentage;
 - a confidence-gated, multiscale Laplacian surplus objective that allows
   supported render sharpness to exceed the EVSSM initialization; and
 - two capacity paths: a scale-free adaptive rollback whose delayed reward uses
@@ -33,6 +36,9 @@ does not reuse the older global/proxy `adapt` controller. The implementation,
 equations, benchmark protocols, rollback flags, smoke-test table, and
 reproduction commands are documented in
 [`experiments/blur_aware_cross_dataset/README.md`](experiments/blur_aware_cross_dataset/README.md).
+The selector equations, ExBlur 8-scene split audit, and label-leakage boundary
+are documented separately in
+[`SCENE_ADAPTIVE_SHARP_ANCHORS.md`](experiments/blur_aware_cross_dataset/SCENE_ADAPTIVE_SHARP_ANCHORS.md).
 
 The separate experimental mode `--adc legs_blur` retains that exact local
 LeGS mechanism and appends seven bounded scene-level blur features: EVSSM
