@@ -60,6 +60,9 @@ longitudinal/Laplacian ablation are recorded in
 [`PRISM3D_RESIDUAL_ROOT_CAUSE.md`](experiments/blur_aware_cross_dataset/PRISM3D_RESIDUAL_ROOT_CAUSE.md),
 and
 [`PRISM3D_50K_LONGITUDINAL_AND_LAPLACIAN_S2.md`](experiments/blur_aware_cross_dataset/PRISM3D_50K_LONGITUDINAL_AND_LAPLACIAN_S2.md).
+The SHA-bound inference checkpoints, receipts, diagnostics, and RAW-input
+visualizations are published in the public Hugging Face dataset
+[`qizhangslam/blur-aware-learn2splat-prism3d`](https://huggingface.co/datasets/qizhangslam/blur-aware-learn2splat-prism3d).
 Dataset paths are intentionally external; pass a local JSON file with
 `--scene-config` and a released Learn2Splat checkpoint with `--checkpoint`.
 
