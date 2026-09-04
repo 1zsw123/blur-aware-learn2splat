@@ -1,0 +1,4 @@
+dataset,optimization_frames,evaluation_frames,checkpoint_policy,restoration_teacher,nima,bpn,blur_legs,notes
+Deblur-NeRF,retained_scene_protocol,official_hold,best_psnr_per_scene,EVSSM,NIMA_gt_0.6_w10,enabled,enabled,LPIPS reported at 50K
+TUM-RGBD,retained_all_frame_protocol,official_keyframes,50K,EVSSM,NIMA_gt_0.6_w10,enabled,enabled,exact retained run has no LPIPS
+PRISM3D,all_frames_hold_identity_blind,official_hold,uniform_10K,TURTLE_stage1_step024000,NIMA_gt_0.6_w10,25x25_dilation2,enabled,accepted eight-scene result

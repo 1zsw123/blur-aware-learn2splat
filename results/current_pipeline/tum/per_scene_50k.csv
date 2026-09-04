@@ -1,0 +1,4 @@
+scene,step,psnr,ssim,lpips,evaluation_protocol
+"tum_fr1_desk",50000,41.42234802246094,0.9874141216278076,"","official_keyframes"
+"tum_fr2_xyz",50000,30.655332565307617,0.9316537380218506,"","official_keyframes"
+"tum_fr3_office",50000,32.78127670288086,0.9454398155212402,"","official_keyframes"

@@ -1,0 +1,6 @@
+dataset	component	code_commit	result_selection
+Deblur-NeRF	remaining18	0f23433d3ff8ab6434ac9f2369fc298aa52ce2e4	best PSNR checkpoint plus 50K LPIPS
+Deblur-NeRF	coffee_cisco	9e8bb25edac3c20c9d358b7043874bda6774bc1b	best PSNR checkpoint plus 50K LPIPS
+Deblur-NeRF	bush_seal_supplement	a28afbf6b7d8439c95fe23f47ae4f3e1dfc21516	50K
+TUM-RGBD	local_joint_s2	f6368d2fa2de78f2c2b5a2cbfcfd2194a90bfeb9	50K official keyframes
+PRISM3D	dilation2_fix_e8	74f55e6f36396d2e4c4281d06757c4738a37e544	uniform accepted 10K

@@ -1,0 +1,8 @@
+dataset,subset,scene_count,psnr,ssim,lpips,metric_selection,teacher,paper_main
+Deblur-NeRF,Motion10,10,45.840594,0.993318,0.005101,best_psnr_checkpoint_lpips_50k,EVSSM,yes
+Deblur-NeRF,Defocus10,10,41.932874,0.985798,0.013421,best_psnr_checkpoint_lpips_50k,EVSSM,yes
+Deblur-NeRF,Motion10+Defocus10,20,43.886734,0.989558,0.009261,best_psnr_checkpoint_lpips_50k,EVSSM,yes
+Deblur-NeRF,Defocus11_with_bush,11,41.814969,0.985393,0.013467,best_psnr_checkpoint_lpips_50k,EVSSM,no
+Deblur-NeRF,Motion10+Defocus11,21,43.731933,0.989167,0.009484,best_psnr_checkpoint_lpips_50k,EVSSM,no
+TUM-RGBD,official_3_scenes,3,34.952986,0.954836,,50k_official_keyframes,EVSSM,yes
+PRISM3D,accepted_8_scenes,8,37.794834,0.937011,0.046374,uniform_10k,TURTLE_stage1_step024000,yes
