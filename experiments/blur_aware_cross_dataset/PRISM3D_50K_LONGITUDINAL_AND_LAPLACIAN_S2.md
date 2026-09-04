@@ -50,6 +50,11 @@ default.
 - Interrupted `jars2` recovery: `run_prism3d_jars2_dilation2_fix_50k_recovery_s2.sh`.
 - Matched Laplacian ablation: `run_prism3d_sunflowers_lap02_50k_s2.sh`.
 - Fixed-view visualization: `combine_raw_10k_50k_visual.py`.
+- Intermediate-state visualization: `make_intermediate_variable_visuals.py`
+  produces matched RAW/teacher/Ours panels, colored projections of the latent
+  Gaussian centers, and measured capacity/action/reward curves. The accepted
+  PRISM3D run uses Turtle step-24K as its teacher; an EVSSM panel is labeled as
+  a comparison baseline rather than an intermediate of that run.
 - The published `point_cloud.ply` and `blur_aware_objective.pt` files are
   inference/render checkpoints. They do not include optimizer state and must
   not be described as resumable training checkpoints.
