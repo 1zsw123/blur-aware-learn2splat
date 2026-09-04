@@ -33,6 +33,9 @@ class DecoderOutput:
     # FastGS [N,4] screen tensor). Only the FastGS decoder populates it; reachable via autograd.
     means2d_abs: Float[Tensor, "batch view n 2"] | None = None
     visibility_filter: Bool[Tensor, "batch view n"] | None = None
+    # Optional training-only exposure integral. Standard render/eval paths leave
+    # this unset and continue to interpret ``color`` as the center-pose image.
+    exposure_color: Float[Tensor, "batch view 3 height width"] | None = None
 
 
 T = TypeVar("T")

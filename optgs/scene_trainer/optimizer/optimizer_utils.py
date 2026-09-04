@@ -292,10 +292,23 @@ def calc_input_gradients(
                     extrinsics=extrinsics_chunk, intrinsics=intrinsics_chunk,
                     near=near_chunk, far=far_chunk, image_shape=(h, w))
             else:
-                output_renderer: DecoderOutput = renderer.forward(
-                    gaussians=tmp_gaussians,
-                    extrinsics=extrinsics_chunk, intrinsics=intrinsics_chunk,
-                    near=near_chunk, far=far_chunk, image_shape=(h, w))
+                if (
+                    input_objective is not None
+                    and input_objective.uses_exposure_trajectory
+                ):
+                    output_renderer = input_objective.render_training_output(
+                        renderer=renderer,
+                        gaussians=tmp_gaussians,
+                        context=iter_context,
+                        start=start,
+                        stop=stop,
+                        image_shape=(h, w),
+                    )
+                else:
+                    output_renderer = renderer.forward(
+                        gaussians=tmp_gaussians,
+                        extrinsics=extrinsics_chunk, intrinsics=intrinsics_chunk,
+                        near=near_chunk, far=far_chunk, image_shape=(h, w))
 
             if input_objective is None:
                 loss = inner_loss_for_input_gradients(

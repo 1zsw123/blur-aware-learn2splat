@@ -1,0 +1,22 @@
+{
+  "prism3d_exblur_bench_turtle": {
+    "dataset": "PRISM3D-E VGGSfM + ExBlur-NeRF RGB + Turtle stage1 step024000",
+    "data_dir": "/srv2/szha0669/blur_slam_exp/data/prism3d_e_exblur_learn2splat_nima06_s1/bench",
+    "factor": 1,
+    "raw_dir": "/srv2/szha0669/blur_slam_exp/data/exblurnerf/exblur_release/bench/images",
+    "raw_mode": "stem",
+    "evssm_dir": "/srv2/szha0669/blur_slam_exp/data/turtle_stage1_step024000_prism3d_exblur_s1/prism3d_exblur_bench",
+    "depth_dir": "/srv2/szha0669/blur_slam_exp/data/prism3d_e_exblur_learn2splat_nima06_s1/bench/depth_empty",
+    "sharp_json": "/srv2/szha0669/blur_slam_exp/outputs/logs/bench_exblur_nima06_sharp_frames.json",
+    "sharp_supervision_policy": "sharp_json_only",
+    "evaluation_direct_supervision": false,
+    "exclude_evaluation_from_optimization": false,
+    "hold_blind_training": true,
+    "require_sharp_evaluation_targets": false,
+    "protocol_description": "PRISM3D-E VGGSfM sparse initialization; all input views optimized without exposing hold identity; Turtle stage1 step024000 and NIMA>0.6/w10 are the only restoration/sharpness supervision",
+    "evaluation_manifest": {
+      "path": "/srv2/szha0669/blur_slam_exp/outputs/logs/exblur8_official_protocol_s1/bench_official_test.json",
+      "label": "prism3d_exblur_official_test"
+    }
+  }
+}

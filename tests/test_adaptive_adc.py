@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from experiments.blur_aware_cross_dataset.run_cross_dataset import (
@@ -26,6 +27,9 @@ from experiments.blur_aware_cross_dataset.protocols import (
 from optgs.dataset.data_types import BatchedViews
 from optgs.experimental.api import OptGS
 from optgs.experimental.blur_aware import BlurAwareObjective, BlurAwareObjectiveConfig
+from optgs.scene_trainer.adc.legs import (
+    veto_negative_quality_births,
+)
 from optgs.scene_trainer.adc.vanilla import (
     AdaptiveStrategyCfg,
     VanillaStrategyState,
@@ -114,6 +118,57 @@ def test_sharp_w10_is_not_applied_twice_when_sampler_realizes_it() -> None:
     assert torch.equal(weights, torch.ones_like(weights))
 
 
+def test_latent_assignment_rejects_frozen_sharp_sampler() -> None:
+    with pytest.raises(ValueError, match="loss-space weighting"):
+        BlurAwareObjectiveConfig(
+            latent_blur_assignment=True,
+            sharp_weight_in_sampler=True,
+        )
+
+
+def test_latent_assignment_prefers_direct_or_blur_model_from_mdl_evidence() -> None:
+    objective = BlurAwareObjective(
+        2,
+        BlurAwareObjectiveConfig(
+            kernel_size=3,
+            latent_blur_assignment=True,
+            latent_ema_decay=0.0,
+        ),
+    )
+    objective.configure_run(100)
+    mask = torch.ones(1, 2, 1, 8, 8)
+    identity = torch.zeros(2, 9)
+    identity[:, 4] = 1.0
+    stats = {"mask": mask, "raw_kernels": identity}
+    posterior, diagnostics = objective._latent_assignment(
+        torch.tensor([[0.05, 0.20]]),
+        torch.tensor([[0.10, 0.05]]),
+        stats,
+        torch.tensor([[0, 1]]),
+    )
+
+    assert posterior[0, 0] > 0.5
+    assert posterior[0, 1] < 0.5
+    assert torch.equal(diagnostics["latent_mdl_cost"], torch.zeros(1, 2))
+
+
+def test_latent_assignment_mdl_penalizes_active_nonidentity_kernel() -> None:
+    objective = BlurAwareObjective(
+        1,
+        BlurAwareObjectiveConfig(kernel_size=3, latent_blur_assignment=True),
+    )
+    objective.configure_run(100)
+    kernel = torch.zeros(1, 9)
+    kernel[:, 0] = 1.0
+    _, diagnostics = objective._latent_assignment(
+        torch.tensor([[0.1]]),
+        torch.tensor([[0.1]]),
+        {"mask": torch.ones(1, 1, 1, 8, 8), "raw_kernels": kernel},
+        torch.tensor([[0]]),
+    )
+    assert diagnostics["latent_mdl_cost"].item() > 0.0
+
+
 def test_coupled_dual_bpn_shares_mode_and_orders_blur_strength() -> None:
     objective = BlurAwareObjective(
         3, BlurAwareObjectiveConfig(coupled_dual_bpn=True)
@@ -135,6 +190,183 @@ def test_coupled_dual_bpn_shares_mode_and_orders_blur_strength() -> None:
         raw_direction * family["teacher_strength"][:, None],
         atol=1e-7,
     )
+
+
+def test_spatial_blur_bases_are_normalized_and_rollback_safe() -> None:
+    objective = BlurAwareObjective(
+        2,
+        BlurAwareObjectiveConfig(
+            kernel_size=3,
+            kernel_bases=2,
+            coupled_dual_bpn=True,
+        ),
+    )
+    sharp = torch.rand(1, 2, 3, 16, 16)
+    raw = torch.rand_like(sharp)
+    target = torch.rand_like(sharp)
+    formed, stats = objective.bpn(
+        sharp,
+        None,
+        raw,
+        target,
+        torch.tensor([[0, 1]]),
+    )
+
+    assert formed.shape == sharp.shape
+    assert stats["basis_weights"].shape == (1, 2, 2, 16, 16)
+    assert torch.allclose(
+        stats["basis_weights"].sum(dim=2),
+        torch.ones(1, 2, 16, 16),
+    )
+    assert torch.allclose(stats["raw_kernels"].sum(dim=-1), torch.ones(2))
+    assert stats["raw_kernel_bases"].shape == (2, 2, 9)
+
+
+def test_spatial_blur_bases_validate_positive_count() -> None:
+    with pytest.raises(ValueError, match="kernel_bases"):
+        BlurAwareObjectiveConfig(kernel_bases=0)
+
+
+def test_exposure_trajectory_is_opt_in_and_validates_sample_count() -> None:
+    rollback = BlurAwareObjective(2, BlurAwareObjectiveConfig())
+    enabled = BlurAwareObjective(
+        2, BlurAwareObjectiveConfig(exposure_trajectory_samples=3)
+    )
+
+    assert not rollback.uses_exposure_trajectory
+    assert enabled.uses_exposure_trajectory
+    assert enabled.exposure_trajectory is not None
+    assert enabled.exposure_trajectory.shape == (2, 2, 6)
+    with pytest.raises(ValueError, match="odd and >= 3"):
+        BlurAwareObjectiveConfig(exposure_trajectory_samples=2)
+
+
+def test_exposure_endpoint_parameterization_is_bounded_and_differentiable() -> None:
+    cfg = BlurAwareObjectiveConfig(
+        exposure_trajectory_samples=3,
+        exposure_trajectory_max_rotation=0.04,
+        exposure_trajectory_max_translation_fraction=0.03,
+    )
+    objective = BlurAwareObjective(2, cfg)
+    objective.exposure_scene_extent.fill_(2.0)
+    assert objective.exposure_trajectory is not None
+    with torch.no_grad():
+        objective.exposure_trajectory.fill_(100.0)
+    endpoints = objective._bounded_exposure_endpoints(torch.tensor([[0, 1]]))
+
+    assert endpoints[..., :3].abs().max() <= 0.04 + 1e-7
+    assert endpoints[..., 3:].abs().max() <= 0.06 + 1e-7
+    with torch.no_grad():
+        objective.exposure_trajectory.zero_()
+    matrices = objective._se3_matrix(
+        objective._bounded_exposure_endpoints(torch.tensor([[0]]))[0]
+    )
+    matrices[..., :3, 3].sum().backward()
+    assert objective.exposure_trajectory.grad is not None
+    assert objective.exposure_trajectory.grad.abs().sum() > 0
+
+
+def test_exposure_integral_is_raw_formation_source_not_teacher_source() -> None:
+    objective = BlurAwareObjective(
+        1,
+        BlurAwareObjectiveConfig(
+            kernel_size=3,
+            coupled_dual_bpn=True,
+            exposure_trajectory_samples=3,
+        ),
+    )
+    center = torch.zeros(1, 1, 3, 16, 16)
+    exposure = torch.full_like(center, 0.75)
+    raw = torch.ones_like(center)
+    target = torch.zeros_like(center)
+    formed, stats = objective.bpn(
+        center,
+        None,
+        raw,
+        target,
+        torch.tensor([[0]]),
+        raw_sharp=exposure,
+    )
+
+    assert formed.mean() > 0.7
+    assert stats["teacher_formed"].abs().max() < 1e-7
+
+
+def test_coupled_basis_responses_follow_kernel_linearity() -> None:
+    objective = BlurAwareObjective(
+        3,
+        BlurAwareObjectiveConfig(
+            kernel_size=5,
+            kernel_dilation=2,
+            kernel_bases=2,
+            coupled_dual_bpn=True,
+        ),
+    )
+    sharp = torch.rand(3, 3, 24, 24)
+    family = objective.bpn.kernel_family(torch.arange(3))
+    base = objective.bpn._apply_kernel_bases(
+        sharp, family["base_kernel_bases"]
+    )
+    residual = base - sharp[:, None]
+
+    for branch in ("raw", "teacher"):
+        derived = sharp[:, None] + family[f"{branch}_strength"][
+            :, None, None, None, None
+        ] * residual
+        direct = objective.bpn._apply_kernel_bases(
+            sharp, family[f"{branch}_kernel_bases"]
+        )
+        assert torch.allclose(derived, direct, atol=1e-6, rtol=1e-6)
+
+
+def test_teacher_blur_model_selection_requires_coupled_branch() -> None:
+    with pytest.raises(ValueError, match="requires coupled_dual_bpn"):
+        BlurAwareObjectiveConfig(teacher_blur_model_selection=True)
+
+
+def test_teacher_blur_model_selection_uses_gain_and_complexity() -> None:
+    objective = BlurAwareObjective(
+        2,
+        BlurAwareObjectiveConfig(
+            kernel_size=3,
+            coupled_dual_bpn=True,
+            teacher_blur_model_selection=True,
+            teacher_blur_temperature=0.1,
+        ),
+    )
+    identity = torch.zeros(2, 9)
+    identity[:, 4] = 1.0
+    mask = torch.ones(1, 2, 1, 8, 8)
+    posterior, evidence, mdl = objective._teacher_blur_assignment(
+        torch.tensor([[0.10, 0.10]]),
+        torch.tensor([[0.05, 0.20]]),
+        {"teacher_kernels": identity, "mask": mask},
+    )
+
+    assert posterior[0, 0] > 0.5
+    assert posterior[0, 1] < 0.5
+    assert evidence[0, 0] > 0.0
+    assert evidence[0, 1] < 0.0
+    assert torch.equal(mdl, torch.zeros_like(mdl))
+
+
+def test_teacher_blur_model_selection_penalizes_nonidentity_kernel() -> None:
+    objective = BlurAwareObjective(
+        1,
+        BlurAwareObjectiveConfig(
+            kernel_size=3,
+            coupled_dual_bpn=True,
+            teacher_blur_model_selection=True,
+        ),
+    )
+    kernel = torch.zeros(1, 9)
+    kernel[:, 0] = 1.0
+    _, _, mdl = objective._teacher_blur_assignment(
+        torch.tensor([[0.1]]),
+        torch.tensor([[0.1]]),
+        {"teacher_kernels": kernel, "mask": torch.ones(1, 1, 1, 8, 8)},
+    )
+    assert mdl.item() > 0.0
 
 
 def test_single_bpn_rollback_keeps_identity_teacher_and_original_raw_kernel() -> None:
@@ -538,7 +770,8 @@ def test_fixed_probe_surplus_detects_supported_render_gain() -> None:
     target = 0.5 + 0.2 * (_vertical_stripes() - 0.5)
     stronger = 0.5 + 0.3 * (_vertical_stripes() - 0.5)
 
-    measured = BlurAwareObjective.measure_probe_surplus(
+    objective = BlurAwareObjective(1)
+    measured = objective.measure_probe_surplus(
         stronger,
         raw,
         target,
@@ -546,7 +779,7 @@ def test_fixed_probe_surplus_detects_supported_render_gain() -> None:
         torch.ones(1, 1),
         None,
     )
-    sharp = BlurAwareObjective.measure_probe_surplus(
+    sharp = objective.measure_probe_surplus(
         stronger,
         raw,
         target,
@@ -559,6 +792,60 @@ def test_fixed_probe_surplus_detects_supported_render_gain() -> None:
     assert float(measured["surplus"]) > 0.0
     assert sharp["has_surplus"] is False
     assert float(sharp["surplus"]) == 0.0
+
+
+def test_raw_neighborhood_support_rejects_displaced_teacher_edge() -> None:
+    raw = torch.zeros(1, 1, 1, 9, 9)
+    teacher = torch.zeros_like(raw)
+    raw[..., 4, 1] = 2.0
+    teacher[..., 4, 7] = 3.0
+
+    union = BlurAwareObjective(
+        1,
+        BlurAwareObjectiveConfig(laplacian_support_mode="union"),
+    )._surplus_support_evidence(teacher, raw)
+    neighborhood = BlurAwareObjective(
+        1,
+        BlurAwareObjectiveConfig(laplacian_support_mode="raw_neighborhood"),
+    )._surplus_support_evidence(teacher, raw)
+
+    assert union[..., 4, 7].item() == 3.0
+    assert neighborhood[..., 4, 7].item() == 0.0
+    assert neighborhood[..., 4, 1].item() == 2.0
+
+
+def test_negative_blur_quality_vetoes_only_birth_actions() -> None:
+    cfg = SimpleNamespace(
+        blur_conditioned=True,
+        blur_negative_birth_veto=True,
+    )
+    state = SimpleNamespace(last_reward_step=100, last_blur_quality_reward=-0.2)
+    actions = torch.tensor([0, 1, 2, 3, 2])
+    valid = torch.tensor([True, True, True, True, False])
+
+    vetoed = veto_negative_quality_births(cfg, state, actions, valid)
+
+    assert vetoed == 2
+    assert torch.equal(actions, torch.tensor([0, 0, 0, 3, 2]))
+
+
+def test_positive_blur_quality_preserves_birth_actions() -> None:
+    cfg = SimpleNamespace(
+        blur_conditioned=True,
+        blur_negative_birth_veto=True,
+    )
+    state = SimpleNamespace(last_reward_step=100, last_blur_quality_reward=0.2)
+    actions = torch.tensor([1, 2])
+
+    vetoed = veto_negative_quality_births(
+        cfg,
+        state,
+        actions,
+        torch.ones_like(actions, dtype=torch.bool),
+    )
+
+    assert vetoed == 0
+    assert torch.equal(actions, torch.tensor([1, 2]))
 
 
 def test_supervision_fps_realizes_scene_level_w10_without_duplicates() -> None:

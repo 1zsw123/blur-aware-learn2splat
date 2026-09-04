@@ -58,3 +58,5 @@ blur_quality_weight: 1.0
 blur_capacity_weight: 0.10
 blur_condition_start_iter: 2000
 blur_condition_ramp_iters: 3000
+blur_negative_birth_veto: false
+blur_quality_gated_final_prune: false

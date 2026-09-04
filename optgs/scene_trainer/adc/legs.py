@@ -488,6 +488,8 @@ class LeGSStrategyState(FastGSStrategyState):
     last_blur_action_support_mean: float = 0.0
     last_blur_birth_penalty_gate_mean: float = 0.0
     last_blur_net_action_direction: float = 0.0
+    last_blur_birth_veto_count: int = 0
+    blur_final_prune_skip_count: int = 0
 
     def external_pruning(self, valid_points_mask: Tensor) -> None:
         super().external_pruning(valid_points_mask)
@@ -548,6 +550,8 @@ def transfer_legs_runtime_state(
         "last_blur_action_support_mean",
         "last_blur_birth_penalty_gate_mean",
         "last_blur_net_action_direction",
+        "last_blur_birth_veto_count",
+        "blur_final_prune_skip_count",
     ):
         setattr(target, name, getattr(source, name))
 
@@ -938,6 +942,35 @@ def _blur_condition_scale(cfg: LeGSStrategyCfg, step: int) -> float:
         (step - cfg.blur_condition_start_iter)
         / max(1, cfg.blur_condition_ramp_iters),
     )
+
+
+def negative_blur_quality_is_active(
+    cfg: LeGSStrategyCfg,
+    adc_state: LeGSStrategyState,
+) -> bool:
+    """Return whether a completed blur observation currently reports harm."""
+    return bool(
+        cfg.blur_conditioned
+        and adc_state.last_reward_step >= 0
+        and adc_state.last_blur_quality_reward < 0.0
+    )
+
+
+def veto_negative_quality_births(
+    cfg: LeGSStrategyCfg,
+    adc_state: LeGSStrategyState,
+    actions: Tensor,
+    valid: Tensor,
+) -> int:
+    """Convert harmful clone/split proposals to keep actions."""
+    if not cfg.blur_negative_birth_veto or not negative_blur_quality_is_active(
+        cfg, adc_state
+    ):
+        return 0
+    birth = ((actions == 1) | (actions == 2)) & valid
+    count = int(birth.sum())
+    actions[birth] = 0
+    return count
 
 
 def _normalize_blur_quality_delta(
@@ -1481,6 +1514,18 @@ def apply_legs_strategy(
             and step > cfg.refine_stop_iter
             and step % cfg.reset_every == 0
         ):
+            if cfg.blur_quality_gated_final_prune and negative_blur_quality_is_active(
+                cfg, adc_state
+            ):
+                adc_state.last_event_step = step
+                adc_state.last_event_kind = "final_prune_skipped_negative_quality"
+                adc_state.last_valid_count = 0
+                adc_state.last_clone_count = 0
+                adc_state.last_split_count = 0
+                adc_state.last_prune_count = 0
+                adc_state.last_blur_birth_veto_count = 0
+                adc_state.blur_final_prune_skip_count += 1
+                return 0, 0, 0, max_radii, max_grad
             nr_pruned = _apply_legs_final_prune(
                 cfg, step, gaussians, adc_state, smoothers
             )
@@ -1527,6 +1572,10 @@ def apply_legs_strategy(
 
     actions, confidence = adc_state.controller.act(
         states, valid, prune_eligible
+    )
+    adc_state.last_blur_birth_veto_count = 0
+    adc_state.last_blur_birth_veto_count = veto_negative_quality_births(
+        cfg, adc_state, actions, valid
     )
     if not cfg.use_prune_estimator:
         actions[prune_eligible] = 3

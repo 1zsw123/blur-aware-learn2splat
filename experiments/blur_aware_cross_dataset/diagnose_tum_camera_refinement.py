@@ -30,6 +30,7 @@ from optgs.scene_trainer.common.gaussians import build_covariance
 from experiments.blur_aware_cross_dataset.run_cross_dataset import (
     build_views,
     collect_scene,
+    load_rgb,
     read_hold,
     resolve_scene_indices,
 )
@@ -50,6 +51,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pose-smoothness", type=float, default=1e-3)
     parser.add_argument("--sampling", choices=("random", "cyclic"), default="random")
     parser.add_argument("--retain-best", action="store_true")
+    parser.add_argument("--indices", help="optional comma-separated dataset indices")
+    parser.add_argument("--sharp-reference-dir")
+    parser.add_argument(
+        "--target-source",
+        choices=("teacher", "raw", "sharp"),
+        default="teacher",
+        help=(
+            "photometric target used only by this diagnostic; raw or sharp may "
+            "expose references and must never be reported as a training result"
+        ),
+    )
     parser.add_argument(
         "--gradient-route",
         choices=("camera", "gaussian_equivalent"),
@@ -202,7 +214,20 @@ def main() -> None:
         parser, cfg, Path(cfg["data_dir"]), read_hold(Path(cfg["data_dir"]))
     )
     scene = collect_scene(parser, cfg, evaluation)
-    views = build_views(scene, evaluation, float(parser.scene_scale * 1.1), device)
+    selected_indices = (
+        [int(value) for value in args.indices.split(",")]
+        if args.indices
+        else evaluation
+    )
+    if (
+        not selected_indices
+        or min(selected_indices) < 0
+        or max(selected_indices) >= len(parser.image_names)
+    ):
+        raise ValueError("selected dataset indices are empty or outside the scene")
+    views = build_views(
+        scene, selected_indices, float(parser.scene_scale * 1.1), device
+    )
     model = OptGS(
         checkpoint=args.checkpoint,
         device=device,
@@ -230,14 +255,60 @@ def main() -> None:
             {"params": [image_warp], "lr": args.image_warp_lr},
         ]
     )
-    target = views.image.flatten(0, 1)
+    teacher = views.image.flatten(0, 1)
     raw = views.raw_image.flatten(0, 1)
+    if args.target_source == "sharp":
+        if not args.sharp_reference_dir:
+            raise ValueError("--target-source sharp requires --sharp-reference-dir")
+        reference_dir = Path(args.sharp_reference_dir)
+        references = []
+        for index in selected_indices:
+            name = Path(parser.image_names[index]).stem
+            matches = sorted(reference_dir.glob(f"{name}.*"))
+            if len(matches) != 1:
+                raise RuntimeError(
+                    f"expected exactly one sharp reference for {name}, found {matches}"
+                )
+            intrinsic = torch.from_numpy(parser.Ks_dict[parser.camera_ids[index]]).float()
+            references.append(
+                load_rgb(
+                    matches[0], intrinsic, scene["camera_preprocessors"][index]
+                )
+            )
+        target = torch.stack(references).to(device=device, dtype=raw.dtype)
+    elif args.target_source == "raw":
+        target = raw
+    else:
+        target = teacher
     mask = views.valid_mask.flatten(0, 1).bool()
     h, w = target.shape[-2:]
     best_photo = torch.full((count,), float("inf"), device=device)
     best_pose = torch.zeros_like(pose)
     best_exposure = torch.zeros_like(exposure)
     best_image_warp = torch.zeros_like(image_warp)
+
+    with torch.no_grad():
+        baseline_chunks = []
+        for start in range(0, count, args.batch_size):
+            stop = min(start + args.batch_size, count)
+            selected = torch.arange(start, stop, device=device)
+            baseline_chunks.append(
+                render_selected(
+                    model,
+                    gaussians,
+                    covariance,
+                    base_extrinsics,
+                    views,
+                    pose.detach(),
+                    selected,
+                    (h, w),
+                    args.gradient_route,
+                )
+            )
+        baseline_prediction = torch.cat(baseline_chunks)
+        baseline_raw_psnr = psnr(baseline_prediction, raw, mask)
+        baseline_teacher_psnr = psnr(baseline_prediction, teacher, mask)
+        baseline_target_psnr = psnr(baseline_prediction, target, mask)
 
     for step in range(args.steps):
         if args.sampling == "cyclic":
@@ -318,6 +389,7 @@ def main() -> None:
         prediction = torch.cat(predictions)
         raw_psnr = psnr(prediction, raw, mask)
         target_psnr = psnr(prediction, target, mask)
+        teacher_psnr = psnr(prediction, teacher, mask)
         rotation_deg = evaluation_pose[:, :3].norm(dim=-1) * (180.0 / torch.pi)
         translation = evaluation_pose[:, 3:].norm(dim=-1)
         image_rotation_deg = evaluation_image_warp[:, 0].abs() * (180.0 / torch.pi)
@@ -327,11 +399,22 @@ def main() -> None:
             "status": "train_view_camera_refinement_diagnostic",
             "scene": args.scene,
             "gradient_route": args.gradient_route,
+            "target_source": args.target_source,
+            "reference_used_for_diagnosis": args.target_source in {"raw", "sharp"},
+            "selected_indices": selected_indices,
             "steps": args.steps,
             "sampling": args.sampling,
             "retain_best": args.retain_best,
+            "baseline_raw_psnr": float(baseline_raw_psnr.mean()),
+            "baseline_teacher_psnr": float(baseline_teacher_psnr.mean()),
+            "baseline_target_psnr": float(baseline_target_psnr.mean()),
             "raw_psnr": float(raw_psnr.mean()),
             "training_target_psnr": float(target_psnr.mean()),
+            "teacher_psnr": float(teacher_psnr.mean()),
+            "raw_psnr_delta": float(raw_psnr.mean() - baseline_raw_psnr.mean()),
+            "teacher_psnr_delta": float(
+                teacher_psnr.mean() - baseline_teacher_psnr.mean()
+            ),
             "prediction_min_mean_max": [
                 float(prediction.min()), float(prediction.mean()), float(prediction.max())
             ],
@@ -355,6 +438,26 @@ def main() -> None:
             ],
             "exposure_bias_min_mean_max": [
                 float(evaluation_exposure[:, 1].min()), float(evaluation_exposure[:, 1].mean()), float(evaluation_exposure[:, 1].max())
+            ],
+            "per_view": [
+                {
+                    "name": Path(parser.image_names[selected_indices[index]]).stem,
+                    "baseline_raw_psnr": float(baseline_raw_psnr[index]),
+                    "refined_raw_psnr": float(raw_psnr[index]),
+                    "raw_psnr_delta": float(
+                        raw_psnr[index] - baseline_raw_psnr[index]
+                    ),
+                    "rotation_deg": float(rotation_deg[index]),
+                    "translation": float(translation[index]),
+                    "baseline_target_psnr": float(
+                        baseline_target_psnr[index]
+                    ),
+                    "refined_target_psnr": float(target_psnr[index]),
+                    "target_psnr_delta": float(
+                        target_psnr[index] - baseline_target_psnr[index]
+                    ),
+                }
+                for index in range(count)
             ],
         }
         if args.preview:

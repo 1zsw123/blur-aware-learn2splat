@@ -1,0 +1,110 @@
+{
+  "tum_fr1_desk": {
+    "dataset": "TUM fr1_desk (Unblur-SLAM/I2-SLAM mapping protocol)",
+    "benchmark_role": "official_benchmark",
+    "protocol_description": "optimize the 89 released I2-SLAM mapping keyframes and evaluate the 14 released authoritative sharp keyframes",
+    "data_dir": "/srv2/szha0669/blur_slam_exp/data/i2slam_trigsplat/tum_fr1_desk_officialkf_abl1",
+    "factor": 1,
+    "raw_dir": "/srv2/szha0669/blur_slam_exp/data/TUM_RGBD/rgbd_dataset_freiburg1_desk/rgb",
+    "raw_mode": "sorted_index",
+    "evssm_dir": "/srv2/szha0669/blur_slam_exp/data/turtle_bsd_deblurred_tum3/tum_fr1_desk",
+    "depth_dir": "/srv2/szha0669/blur_slam_exp/data/i2slam_trigsplat/tum_fr1_desk_officialkf_abl1/depth",
+    "sharp_json": "/srv2/szha0669/blur_slam_exp/outputs/logs/tum_fr1desk_officialkf_nima06_sharp_frames.json",
+    "sharp_supervision_policy": "evaluation_is_sharp",
+    "evaluation_manifest": {
+      "path": "/srv2/szha0669/blur_slam_exp/repos/learn2splat-official-space/experiments/blur_aware_cross_dataset/tum_fr1_desk_official_sharp_eval.json",
+      "label": "unblurslam_official_sharp_keyframes_14"
+    },
+    "camera_preprocess": {
+      "distortion": [
+        0.2624,
+        -0.9531,
+        -0.0054,
+        0.0026,
+        1.1633
+      ],
+      "resize": [
+        528,
+        400
+      ],
+      "crop": [
+        8,
+        8,
+        8,
+        8
+      ],
+      "undistort_depth": false
+    },
+    "teacher_model": "Turtle BSD_Deblur"
+  },
+  "tum_fr2_xyz": {
+    "dataset": "TUM fr2_xyz (Unblur-SLAM/I2-SLAM mapping protocol)",
+    "benchmark_role": "official_benchmark",
+    "protocol_description": "full 32 Hz stream is consumed by the SLAM tracker; reconstruction optimizes the exact 42 released I2-SLAM mapping keyframes and evaluates their authoritative sharp observations",
+    "data_dir": "/srv2/szha0669/blur_slam_exp/data/i2slam_trigsplat/tum_fr2_xyz_officialkf_abl1",
+    "factor": 1,
+    "raw_dir": "/srv2/szha0669/blur_slam_exp/data/TUM_RGBD/rgbd_dataset_freiburg2_xyz/rgb",
+    "raw_mode": "sorted_index",
+    "evssm_dir": "/srv2/szha0669/blur_slam_exp/data/turtle_bsd_deblurred_tum3/tum_fr2_xyz",
+    "depth_dir": "/srv2/szha0669/blur_slam_exp/data/i2slam_trigsplat/tum_fr2_xyz_officialkf_abl1/depth",
+    "sharp_json": "/srv2/szha0669/blur_slam_exp/outputs/logs/tum_fr2xyz_officialkf_nima06_sharp_frames.json",
+    "sharp_supervision_policy": "evaluation_is_sharp",
+    "evaluation_manifest": {
+      "path": "/srv2/szha0669/blur_slam_exp/repos/learn2splat-official-space/experiments/blur_aware_cross_dataset/tum_fr2_xyz_official_mapping_keyframes.json",
+      "label": "unblurslam_official_sharp_keyframes_42"
+    },
+    "camera_preprocess": {
+      "distortion": [
+        0.2312,
+        -0.7849,
+        -0.0033,
+        -0.0001,
+        0.9172
+      ],
+      "resize": [
+        528,
+        400
+      ],
+      "crop": [
+        8,
+        8,
+        8,
+        8
+      ],
+      "undistort_depth": false
+    },
+    "teacher_model": "Turtle BSD_Deblur"
+  },
+  "tum_fr3_office": {
+    "dataset": "TUM fr3_office (Unblur-SLAM/I2-SLAM mapping protocol)",
+    "benchmark_role": "official_benchmark_registered_subset",
+    "protocol_description": "optimize the 149/153 released I2-SLAM mapping keyframes present in the frozen reconstruction and evaluate the 55/57 authoritative sharp keyframes present there",
+    "data_dir": "/srv2/szha0669/blur_slam_exp/data/i2slam_trigsplat/tum_fr3_office_officialkf_abl1",
+    "factor": 1,
+    "raw_dir": "/srv2/szha0669/blur_slam_exp/data/TUM_RGBD/rgbd_dataset_freiburg3_long_office_household/rgb",
+    "raw_mode": "sorted_index",
+    "evssm_dir": "/srv2/szha0669/blur_slam_exp/data/turtle_bsd_deblurred_tum3/tum_fr3_office",
+    "depth_dir": "/srv2/szha0669/blur_slam_exp/data/i2slam_trigsplat/tum_fr3_office_officialkf_abl1/depth",
+    "sharp_json": "/srv2/szha0669/blur_slam_exp/outputs/logs/tum_fr3office_officialkf_nima06_sharp_frames.json",
+    "sharp_supervision_policy": "evaluation_is_sharp",
+    "evaluation_manifest": {
+      "path": "/srv2/szha0669/blur_slam_exp/repos/learn2splat-official-space/experiments/blur_aware_cross_dataset/tum_fr3_office_official_sharp_eval.json",
+      "label": "unblurslam_official_sharp_keyframes_55_of_57_registered"
+    },
+    "camera_preprocess": {
+      "distortion": [],
+      "resize": [
+        528,
+        400
+      ],
+      "crop": [
+        8,
+        8,
+        8,
+        8
+      ],
+      "undistort_depth": false
+    },
+    "teacher_model": "Turtle BSD_Deblur"
+  }
+}

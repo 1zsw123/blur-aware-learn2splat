@@ -174,11 +174,105 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--laplacian-support-mode",
+        choices=("union", "raw_neighborhood"),
+        default="union",
+        help=(
+            "Edge support used by surplus artifact rejection. union is the "
+            "exact rollback behavior; raw_neighborhood admits teacher detail "
+            "only near RAW evidence and rejects self-supported teacher ghosts."
+        ),
+    )
+    parser.add_argument(
         "--coupled-dual-bpn",
         action="store_true",
         help=(
             "Use a shared blur-mode kernel with ordered EVSSM/RAW strengths. "
             "Without this flag the original single-RAW-kernel objective is exact."
+        ),
+    )
+    parser.add_argument(
+        "--teacher-blur-model-selection",
+        action="store_true",
+        help=(
+            "Use per-view BIC/MDL evidence to enable the EVSSM reblur branch "
+            "only when it explains enough residual to justify its complexity."
+        ),
+    )
+    parser.add_argument(
+        "--bpn-kernel-size",
+        type=int,
+        default=9,
+        help="Odd BPN kernel width; the validated rollback value is 9.",
+    )
+    parser.add_argument(
+        "--bpn-kernel-dilation",
+        type=int,
+        default=2,
+        help="BPN kernel dilation; the validated rollback value is 2.",
+    )
+    parser.add_argument(
+        "--bpn-kernel-bases",
+        type=int,
+        default=1,
+        help=(
+            "Number of positive blur bases mixed over the image. One is the "
+            "exact global-kernel rollback; values above one model spatially "
+            "varying exposure blur without predicting per-pixel kernels."
+        ),
+    )
+    parser.add_argument(
+        "--exposure-trajectory-samples",
+        type=int,
+        default=1,
+        help=(
+            "Odd number of differentiable SE(3) shutter samples. One disables "
+            "the trajectory and exactly restores the image-space BPN path."
+        ),
+    )
+    parser.add_argument(
+        "--exposure-trajectory-learning-rate",
+        type=float,
+        default=2e-3,
+    )
+    parser.add_argument(
+        "--exposure-trajectory-max-rotation",
+        type=float,
+        default=0.05,
+        help="Maximum endpoint rotation in radians after tanh bounding.",
+    )
+    parser.add_argument(
+        "--exposure-trajectory-max-translation-fraction",
+        type=float,
+        default=0.05,
+        help="Maximum endpoint translation as a fraction of scene camera extent.",
+    )
+    parser.add_argument(
+        "--exposure-trajectory-motion-prior",
+        type=float,
+        default=1e-2,
+    )
+    parser.add_argument(
+        "--exposure-trajectory-center-prior",
+        type=float,
+        default=1e-1,
+        help="Symmetry prior keeping the shutter midpoint at the COLMAP pose.",
+    )
+    parser.add_argument(
+        "--exposure-center-supervision-weight",
+        type=float,
+        default=0.5,
+        help=(
+            "Reliability-weighted teacher anchor on the center-pose sharp render; "
+            "prevents shutter motion from absorbing all image residual."
+        ),
+    )
+    parser.add_argument(
+        "--latent-blur-assignment",
+        action="store_true",
+        help=(
+            "Jointly infer a per-frame sharp/blur observation assignment using "
+            "normalized MDL evidence; incompatible with supervision_fps."
         ),
     )
     parser.add_argument(
@@ -246,6 +340,24 @@ def parse_args() -> argparse.Namespace:
             "target-only local-state ablation."
         ),
     )
+    parser.add_argument(
+        "--legs-blur-negative-birth-veto",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "When enabled, the latest negative completed blur-quality reward "
+            "vetoes clone/split actions. Default None preserves the refiner config."
+        ),
+    )
+    parser.add_argument(
+        "--legs-blur-quality-gated-final-prune",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "When enabled, post-densification opacity cleanup is skipped while "
+            "the latest completed blur-quality reward is negative."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -258,6 +370,8 @@ def configure_legs_blur_ablation(refiner_cfg, args: argparse.Namespace) -> None:
             args.legs_blur_start_iter,
             args.legs_blur_ramp_iters,
             args.legs_local_objective,
+            args.legs_blur_negative_birth_veto,
+            args.legs_blur_quality_gated_final_prune,
         )
         if any(value is not None for value in overrides):
             raise ValueError("--legs-blur-* overrides require --adc legs_blur")
@@ -280,6 +394,12 @@ def configure_legs_blur_ablation(refiner_cfg, args: argparse.Namespace) -> None:
         refiner_cfg.blur_condition_ramp_iters = args.legs_blur_ramp_iters
     if args.legs_local_objective is not None:
         refiner_cfg.local_objective_conditioned = args.legs_local_objective
+    if args.legs_blur_negative_birth_veto is not None:
+        refiner_cfg.blur_negative_birth_veto = args.legs_blur_negative_birth_veto
+    if args.legs_blur_quality_gated_final_prune is not None:
+        refiner_cfg.blur_quality_gated_final_prune = (
+            args.legs_blur_quality_gated_final_prune
+        )
 
 
 def read_hold(data_dir: Path) -> int:
@@ -1646,12 +1766,37 @@ def main() -> None:
         objective = BlurAwareObjective(
             len(optimization_indices),
             BlurAwareObjectiveConfig(
+                kernel_size=args.bpn_kernel_size,
+                kernel_dilation=args.bpn_kernel_dilation,
+                kernel_bases=args.bpn_kernel_bases,
                 sharp_weight_in_sampler=(
                     requested_batch_strategy == "supervision_fps"
                 ),
                 laplacian_loss_weight=args.laplacian_loss_weight,
                 laplacian_loss_mode=args.laplacian_loss_mode,
+                laplacian_support_mode=args.laplacian_support_mode,
                 coupled_dual_bpn=args.coupled_dual_bpn,
+                teacher_blur_model_selection=args.teacher_blur_model_selection,
+                latent_blur_assignment=args.latent_blur_assignment,
+                exposure_trajectory_samples=args.exposure_trajectory_samples,
+                exposure_trajectory_learning_rate=(
+                    args.exposure_trajectory_learning_rate
+                ),
+                exposure_trajectory_max_rotation=(
+                    args.exposure_trajectory_max_rotation
+                ),
+                exposure_trajectory_max_translation_fraction=(
+                    args.exposure_trajectory_max_translation_fraction
+                ),
+                exposure_trajectory_motion_prior=(
+                    args.exposure_trajectory_motion_prior
+                ),
+                exposure_trajectory_center_prior=(
+                    args.exposure_trajectory_center_prior
+                ),
+                exposure_center_supervision_weight=(
+                    args.exposure_center_supervision_weight
+                ),
             ),
             known_sharp_mask=scene["known_sharp"][optimization_selection],
         )
@@ -2099,6 +2244,11 @@ def main() -> None:
             "lpips_network": None if args.skip_lpips else "alexnet-v0.1",
             "metric_batch_size": args.metric_batch_size,
         },
+        "latent_blur_assignment": (
+            None
+            if objective is None or not objective.cfg.latent_blur_assignment
+            else objective.latent_assignment_report(optimization_names)
+        ),
         "capacity_events": optgs.capacity_events,
         "metrics": metrics,
     }

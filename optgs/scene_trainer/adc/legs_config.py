@@ -39,3 +39,5 @@ class LeGSStrategyCfg(BaseStrategyCfg):
     blur_capacity_weight: float = 0.10
     blur_condition_start_iter: int = 2000
     blur_condition_ramp_iters: int = 3000
+    blur_negative_birth_veto: bool = False
+    blur_quality_gated_final_prune: bool = False

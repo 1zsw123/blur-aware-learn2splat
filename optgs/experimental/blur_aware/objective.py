@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Callable
 
 import torch
@@ -12,11 +12,15 @@ import torch.nn.functional as F
 from fused_ssim import FusedSSIMMap
 from torch import Tensor, nn
 
+from optgs.model.decoder.decoder import DecoderOutput
+from optgs.scene_trainer.common.gaussians import build_covariance
+
 
 @dataclass(frozen=True)
 class BlurAwareObjectiveConfig:
     kernel_size: int = 9
     kernel_dilation: int = 2
+    kernel_bases: int = 1
     camera_embedding_dim: int = 32
     bpn_learning_rate: float = 1e-3
     bpn_weight_decay: float = 1e-6
@@ -32,14 +36,37 @@ class BlurAwareObjectiveConfig:
     # Set to 0 for exact rollback to the reconstruction-only objective.
     laplacian_loss_weight: float = 0.1
     laplacian_loss_mode: str = "spatial"
+    laplacian_support_mode: str = "union"
     surplus_ema_decay: float = 0.95
     coupled_dual_bpn: bool = False
+    # Select the higher-complexity EVSSM reblur branch only when its normalized
+    # reconstruction gain exceeds a BIC/MDL parameter cost. This prevents the
+    # teacher BPN from silently saturating and removing the sharp-scene anchor.
+    teacher_blur_model_selection: bool = False
+    teacher_blur_temperature: float = 0.1
+    # Jointly infer whether each observation is better explained by a direct
+    # image model or by the higher-complexity BPN image-formation model.
+    latent_blur_assignment: bool = False
+    latent_temperature_start: float = 0.25
+    latent_temperature_end: float = 0.05
+    latent_ema_decay: float = 0.95
+    # A value of one is the exact legacy image-space BPN path. Odd values >= 3
+    # learn a per-observation SE(3) shutter path and integrate virtual renders.
+    exposure_trajectory_samples: int = 1
+    exposure_trajectory_learning_rate: float = 2e-3
+    exposure_trajectory_max_rotation: float = 0.05
+    exposure_trajectory_max_translation_fraction: float = 0.05
+    exposure_trajectory_motion_prior: float = 1e-2
+    exposure_trajectory_center_prior: float = 1e-1
+    exposure_center_supervision_weight: float = 0.5
 
     def __post_init__(self):
         if self.kernel_size < 3 or self.kernel_size % 2 == 0:
             raise ValueError("kernel_size must be odd and >= 3")
         if self.kernel_dilation < 1:
             raise ValueError("kernel_dilation must be >= 1")
+        if self.kernel_bases < 1:
+            raise ValueError("kernel_bases must be >= 1")
         if not 0.0 <= self.raw_ramp_start < self.raw_ramp_end <= 1.0:
             raise ValueError("raw ramp must satisfy 0 <= start < end <= 1")
         if self.sharp_supervision_weight < 1.0:
@@ -50,17 +77,58 @@ class BlurAwareObjectiveConfig:
             raise ValueError(
                 "laplacian_loss_mode must be 'spatial', 'energy', or 'surplus'"
             )
+        if self.laplacian_support_mode not in {"union", "raw_neighborhood"}:
+            raise ValueError(
+                "laplacian_support_mode must be 'union' or 'raw_neighborhood'"
+            )
         if not 0.0 <= self.surplus_ema_decay < 1.0:
             raise ValueError("surplus_ema_decay must satisfy 0 <= decay < 1")
+        if not 0.0 < self.latent_temperature_end <= self.latent_temperature_start:
+            raise ValueError("latent temperatures must satisfy 0 < end <= start")
+        if not 0.0 <= self.latent_ema_decay < 1.0:
+            raise ValueError("latent_ema_decay must satisfy 0 <= decay < 1")
+        if self.teacher_blur_temperature <= 0.0:
+            raise ValueError("teacher_blur_temperature must be positive")
+        if self.teacher_blur_model_selection and not self.coupled_dual_bpn:
+            raise ValueError(
+                "teacher blur model selection requires coupled_dual_bpn"
+            )
+        if self.latent_blur_assignment and self.sharp_weight_in_sampler:
+            raise ValueError(
+                "latent blur assignment requires loss-space weighting, not "
+                "a frozen sharp supervision sampler"
+            )
+        if self.exposure_trajectory_samples != 1 and (
+            self.exposure_trajectory_samples < 3
+            or self.exposure_trajectory_samples % 2 == 0
+        ):
+            raise ValueError(
+                "exposure_trajectory_samples must be one (disabled) or odd and >= 3"
+            )
+        if self.exposure_trajectory_learning_rate <= 0.0:
+            raise ValueError("exposure trajectory learning rate must be positive")
+        if self.exposure_trajectory_max_rotation <= 0.0:
+            raise ValueError("exposure trajectory max rotation must be positive")
+        if self.exposure_trajectory_max_translation_fraction <= 0.0:
+            raise ValueError(
+                "exposure trajectory max translation fraction must be positive"
+            )
+        if self.exposure_trajectory_motion_prior < 0.0:
+            raise ValueError("exposure trajectory motion prior must be non-negative")
+        if self.exposure_trajectory_center_prior < 0.0:
+            raise ValueError("exposure trajectory center prior must be non-negative")
+        if self.exposure_center_supervision_weight < 0.0:
+            raise ValueError("exposure center supervision weight must be non-negative")
 
 
 class FactorizedBlurFormation(nn.Module):
     """A low-rank BPN that cannot encode high-frequency texture as a kernel.
 
-    Each training view gets one positive, normalized blur kernel. A shared
-    low-resolution mask network decides where that kernel is active. This is
-    expressive enough for camera-motion and defocus blur while ruling out the
-    old per-pixel-kernel shortcut that copied scene edges into the blur field.
+    Each training view gets a small set of positive, normalized blur bases. A
+    shared low-resolution network decides where blur is active and, when more
+    than one basis is requested, mixes those bases spatially. This retains the
+    texture-copying guard of a factorized BPN while representing depth-varying
+    camera motion that a single global kernel cannot explain.
     """
 
     def __init__(self, num_views: int, cfg: BlurAwareObjectiveConfig):
@@ -68,23 +136,36 @@ class FactorizedBlurFormation(nn.Module):
         self.cfg = cfg
         d = cfg.camera_embedding_dim
         k2 = cfg.kernel_size**2
+        self.num_bases = cfg.kernel_bases
         self.camera_embedding = nn.Embedding(num_views, d)
         self.kernel_head = nn.Sequential(
             nn.Linear(d, 2 * d),
             nn.SiLU(),
-            nn.Linear(2 * d, k2),
+            nn.Linear(2 * d, self.num_bases * k2),
         )
+        mask_channels = 1 if self.num_bases == 1 else 1 + self.num_bases
         self.mask_net = nn.Sequential(
             nn.Conv2d(4, 16, 3, padding=1),
             nn.SiLU(),
             nn.Conv2d(16, 16, 3, padding=1),
             nn.SiLU(),
-            nn.Conv2d(16, 1, 1),
+            nn.Conv2d(16, mask_channels, 1),
         )
         nn.init.normal_(self.camera_embedding.weight, std=0.02)
         nn.init.zeros_(self.kernel_head[-1].weight)
         nn.init.constant_(self.kernel_head[-1].bias, -4.0)
-        self.kernel_head[-1].bias.data[k2 // 2] = 4.0
+        kernel_bias = self.kernel_head[-1].bias.data.view(self.num_bases, k2)
+        kernel_bias[:, k2 // 2] = 4.0
+        if self.num_bases > 1:
+            # Break the otherwise exact symmetry between identity-initialized
+            # bases with weak opposing horizontal motion hypotheses. The
+            # center remains dominant, so this does not inject initial blur.
+            radius = cfg.kernel_size // 2
+            offsets = torch.linspace(-radius, radius, self.num_bases).round().long()
+            for basis, offset in enumerate(offsets):
+                index = k2 // 2 + int(offset)
+                if index != k2 // 2:
+                    kernel_bias[basis, index] = 2.0
         nn.init.zeros_(self.mask_net[-1].weight)
         nn.init.constant_(self.mask_net[-1].bias, -2.0)
         self.strength_head: nn.Linear | None = None
@@ -105,12 +186,15 @@ class FactorizedBlurFormation(nn.Module):
         """Return coupled EVSSM/RAW kernels in Gaussian split-independent order."""
         indices = view_indices.reshape(-1).long()
         embedding = self.camera_embedding(indices)
-        base = torch.softmax(self.kernel_head(embedding), dim=-1)
-        identity = torch.zeros_like(base)
-        identity[:, base.shape[-1] // 2] = 1.0
+        logits = self.kernel_head(embedding).view(
+            indices.numel(), self.num_bases, self.cfg.kernel_size**2
+        )
+        base_bases = torch.softmax(logits, dim=-1)
+        identity_bases = torch.zeros_like(base_bases)
+        identity_bases[:, :, base_bases.shape[-1] // 2] = 1.0
         if self.strength_head is None:
-            teacher_strength = base.new_zeros(base.shape[0])
-            raw_strength = base.new_ones(base.shape[0])
+            teacher_strength = base_bases.new_zeros(base_bases.shape[0])
+            raw_strength = base_bases.new_ones(base_bases.shape[0])
         else:
             strength_logits = self.strength_head(embedding)
             teacher_strength = torch.sigmoid(strength_logits[:, 0])
@@ -120,33 +204,57 @@ class FactorizedBlurFormation(nn.Module):
             ) * raw_residual
 
         def mix(strength: Tensor) -> Tensor:
-            return identity + strength[:, None] * (base - identity)
+            return identity_bases + strength[:, None, None] * (
+                base_bases - identity_bases
+            )
+
+        teacher_bases = mix(teacher_strength)
+        raw_bases = mix(raw_strength)
+        # Uniform averages provide a stable per-view summary before the
+        # image-conditioned spatial mixture is available in forward().
+        base = base_bases.mean(dim=1)
+        teacher = teacher_bases.mean(dim=1)
+        raw = raw_bases.mean(dim=1)
 
         return {
             "base_kernels": base,
-            "teacher_kernels": mix(teacher_strength),
-            "raw_kernels": mix(raw_strength),
+            "teacher_kernels": teacher,
+            "raw_kernels": raw,
+            "base_kernel_bases": base_bases,
+            "teacher_kernel_bases": teacher_bases,
+            "raw_kernel_bases": raw_bases,
             "teacher_strength": teacher_strength,
             "raw_strength": raw_strength,
         }
 
-    def _apply_kernels(self, sharp: Tensor, kernels: Tensor) -> Tensor:
+    def _apply_kernel_bases(self, sharp: Tensor, kernels: Tensor) -> Tensor:
         count, channels, height, width = sharp.shape
-        kernel_2d = kernels.view(
-            count, 1, self.cfg.kernel_size, self.cfg.kernel_size
-        )
-        grouped_weight = kernel_2d.repeat_interleave(channels, dim=0)
-        grouped_input = sharp.reshape(1, count * channels, height, width)
         pad = (self.cfg.kernel_size // 2) * self.cfg.kernel_dilation
         grouped_input = F.pad(
-            grouped_input, (pad, pad, pad, pad), mode="reflect"
+            sharp.reshape(1, count * channels, height, width),
+            (pad, pad, pad, pad),
+            mode="reflect",
         )
-        return F.conv2d(
+        # Each (view, channel) is one convolution group with num_bases output
+        # channels. This evaluates every basis in one kernel launch without
+        # materializing a basis-expanded copy of the full-resolution input.
+        grouped_weight = kernels[:, None].expand(
+            count, channels, self.num_bases, self.cfg.kernel_size**2
+        ).reshape(
+            count * channels * self.num_bases,
+            1,
+            self.cfg.kernel_size,
+            self.cfg.kernel_size,
+        )
+        output = F.conv2d(
             grouped_input,
             grouped_weight,
             dilation=self.cfg.kernel_dilation,
             groups=count * channels,
-        ).reshape(count, channels, height, width)
+        )
+        return output.reshape(
+            count, channels, self.num_bases, height, width
+        ).permute(0, 2, 1, 3, 4)
 
     @staticmethod
     def _gray(images: Tensor) -> Tensor:
@@ -160,17 +268,41 @@ class FactorizedBlurFormation(nn.Module):
         raw: Tensor,
         target: Tensor,
         view_indices: Tensor,
+        raw_sharp: Tensor | None = None,
     ) -> tuple[Tensor, dict[str, Tensor]]:
         b, v, c, h, w = sharp.shape
         flat_count = b * v
         sharp_flat = sharp.reshape(flat_count, c, h, w)
         raw_flat = raw.reshape(flat_count, c, h, w)
         target_flat = target.reshape(flat_count, c, h, w)
-        family = self.kernel_family(view_indices)
-        raw_blurred = self._apply_kernels(sharp_flat, family["raw_kernels"])
-        teacher_blurred = self._apply_kernels(
-            sharp_flat, family["teacher_kernels"]
+        raw_source_flat = (
+            sharp_flat
+            if raw_sharp is None
+            else raw_sharp.reshape(flat_count, c, h, w)
         )
+        family = self.kernel_family(view_indices)
+        teacher_base_blurred_bases = self._apply_kernel_bases(
+            sharp_flat, family["base_kernel_bases"]
+        )
+        # The RAW and teacher kernels are exact convex combinations of the
+        # same learned base and the identity kernel. Use convolution linearity
+        # to form both responses from one base convolution.
+        sharp_bases = sharp_flat[:, None]
+        teacher_residual = teacher_base_blurred_bases - sharp_bases
+        if raw_sharp is None:
+            raw_base_blurred_bases = teacher_base_blurred_bases
+        else:
+            raw_base_blurred_bases = self._apply_kernel_bases(
+                raw_source_flat, family["base_kernel_bases"]
+            )
+        raw_source_bases = raw_source_flat[:, None]
+        raw_residual = raw_base_blurred_bases - raw_source_bases
+        raw_blurred_bases = raw_source_bases + family["raw_strength"][
+            :, None, None, None, None
+        ] * raw_residual
+        teacher_blurred_bases = sharp_bases + family["teacher_strength"][
+            :, None, None, None, None
+        ] * teacher_residual
 
         low_h, low_w = max(8, (h + 15) // 16), max(8, (w + 15) // 16)
         raw_gray = self._gray(raw_flat.detach())
@@ -187,20 +319,46 @@ class FactorizedBlurFormation(nn.Module):
             depth_max = depth_low.flatten(1).amax(dim=1).view(-1, 1, 1, 1)
             depth_low = (depth_low - depth_min) / (depth_max - depth_min + 1e-6)
         mask_input = torch.cat((raw_low, target_low, residual_low, depth_low), dim=1)
-        mask_low = torch.sigmoid(self.mask_net(mask_input))
+        mask_output = self.mask_net(mask_input)
+        mask_low = torch.sigmoid(mask_output[:, :1])
+        if self.num_bases == 1:
+            basis_weights_low = torch.ones_like(mask_low)
+        else:
+            basis_weights_low = torch.softmax(mask_output[:, 1:], dim=1)
         mask = F.interpolate(mask_low, (h, w), mode="bilinear", align_corners=False)
-        formed = mask * raw_blurred + (1.0 - mask) * sharp_flat
+        basis_weights = F.interpolate(
+            basis_weights_low, (h, w), mode="bilinear", align_corners=False
+        )
+        raw_blurred = (basis_weights[:, :, None] * raw_blurred_bases).sum(dim=1)
+        teacher_blurred = (
+            basis_weights[:, :, None] * teacher_blurred_bases
+        ).sum(dim=1)
+        formed = mask * raw_blurred + (1.0 - mask) * raw_source_flat
         teacher_formed = mask * teacher_blurred + (1.0 - mask) * sharp_flat
 
+        spatial_mass = basis_weights_low.flatten(2).mean(dim=-1)
+        for branch in ("base", "teacher", "raw"):
+            family[f"{branch}_kernels"] = (
+                spatial_mass[:, :, None] * family[f"{branch}_kernel_bases"]
+            ).sum(dim=1)
+
         kernels = family["raw_kernels"]
-        center_x = (family["base_kernels"] * self.kernel_x).sum(dim=-1)
-        center_y = (family["base_kernels"] * self.kernel_y).sum(dim=-1)
+        center_x = (family["base_kernel_bases"] * self.kernel_x).sum(dim=-1)
+        center_y = (family["base_kernel_bases"] * self.kernel_y).sum(dim=-1)
         center_loss = (center_x.square() + center_y.square()).mean()
         residual_scale = residual_low.flatten(1).quantile(0.9, dim=1).view(-1, 1, 1, 1)
         mask_target = (residual_low / (residual_scale + 1e-6)).clamp(0.0, 1.0)
         mask_loss = F.l1_loss(mask_low, mask_target)
         mask_tv = (mask_low[..., 1:, :] - mask_low[..., :-1, :]).abs().mean()
         mask_tv = mask_tv + (mask_low[..., :, 1:] - mask_low[..., :, :-1]).abs().mean()
+        if self.num_bases > 1:
+            basis_tv = (
+                basis_weights_low[..., 1:, :] - basis_weights_low[..., :-1, :]
+            ).abs().mean()
+            basis_tv = basis_tv + (
+                basis_weights_low[..., :, 1:] - basis_weights_low[..., :, :-1]
+            ).abs().mean()
+            mask_tv = mask_tv + basis_tv
         entropy = -(kernels * kernels.clamp_min(1e-8).log()).sum(dim=-1)
 
         return formed.view(b, v, c, h, w), {
@@ -209,6 +367,9 @@ class FactorizedBlurFormation(nn.Module):
             "teacher_formed": teacher_formed.view(b, v, c, h, w),
             "mask": mask.view(b, v, 1, h, w),
             "mask_low": mask_low,
+            "basis_weights": basis_weights.view(
+                b, v, self.num_bases, h, w
+            ),
             "center_loss": center_loss,
             "mask_loss": mask_loss,
             "mask_tv": mask_tv,
@@ -228,6 +389,14 @@ class BlurAwareObjective(nn.Module):
         super().__init__()
         self.cfg = cfg or BlurAwareObjectiveConfig()
         self.bpn = FactorizedBlurFormation(num_views, self.cfg)
+        self.exposure_trajectory = None
+        if self.cfg.exposure_trajectory_samples > 1:
+            # Independent opening/closing twists avoid the zero-gradient
+            # symmetry of a single +/- trajectory initialized at identity.
+            self.exposure_trajectory = nn.Parameter(
+                torch.zeros(num_views, 2, 6)
+            )
+        self.register_buffer("exposure_scene_extent", torch.tensor(1.0))
         if known_sharp_mask is None:
             known_sharp_mask = torch.zeros(num_views, dtype=torch.bool)
         known_sharp_mask = torch.as_tensor(known_sharp_mask, dtype=torch.bool)
@@ -237,6 +406,8 @@ class BlurAwareObjective(nn.Module):
         self.register_buffer("surplus_gain_ema", torch.zeros(num_views))
         self.register_buffer("surplus_gain_square_ema", torch.zeros(num_views))
         self.register_buffer("surplus_gain_updates", torch.zeros(num_views))
+        self.register_buffer("latent_sharp_probability", torch.full((num_views,), 0.5))
+        self.register_buffer("latent_assignment_updates", torch.zeros(num_views))
         self.num_steps = 1
         self.step = 0
         self._optimizer: torch.optim.Optimizer | None = None
@@ -250,14 +421,250 @@ class BlurAwareObjective(nn.Module):
     def configure_run(self, num_steps: int) -> None:
         self.num_steps = max(1, int(num_steps))
         if self._optimizer is None:
+            bpn_parameters = list(self.bpn.parameters())
+            groups = [{
+                "params": bpn_parameters,
+                "lr": self.cfg.bpn_learning_rate,
+            }]
+            if self.exposure_trajectory is not None:
+                groups.append({
+                    "params": [self.exposure_trajectory],
+                    "lr": self.cfg.exposure_trajectory_learning_rate,
+                    "weight_decay": 0.0,
+                })
             self._optimizer = torch.optim.AdamW(
-                self.parameters(),
-                lr=self.cfg.bpn_learning_rate,
+                groups,
                 weight_decay=self.cfg.bpn_weight_decay,
             )
 
     def trainable_parameters(self) -> list[nn.Parameter]:
         return [parameter for parameter in self.parameters() if parameter.requires_grad]
+
+    @property
+    def uses_exposure_trajectory(self) -> bool:
+        return self.exposure_trajectory is not None
+
+    @staticmethod
+    def _se3_matrix(twist: Tensor) -> Tensor:
+        """Convert one or more [rx, ry, rz, tx, ty, tz] twists to matrices."""
+        omega, translation = twist[..., :3], twist[..., 3:]
+        zero = torch.zeros_like(omega[..., 0])
+        skew = torch.stack(
+            (
+                zero,
+                -omega[..., 2],
+                omega[..., 1],
+                omega[..., 2],
+                zero,
+                -omega[..., 0],
+                -omega[..., 1],
+                omega[..., 0],
+                zero,
+            ),
+            dim=-1,
+        ).reshape(*omega.shape[:-1], 3, 3)
+        rotation = torch.matrix_exp(skew)
+        upper = torch.cat((rotation, translation.unsqueeze(-1)), dim=-1)
+        bottom = torch.zeros(
+            (*twist.shape[:-1], 1, 4), device=twist.device, dtype=twist.dtype
+        )
+        bottom[..., 0, 3] = 1.0
+        return torch.cat((upper, bottom), dim=-2)
+
+    def _bounded_exposure_endpoints(self, view_indices: Tensor) -> Tensor:
+        if self.exposure_trajectory is None:
+            raise RuntimeError("exposure trajectory is disabled")
+        endpoints = torch.tanh(
+            self.exposure_trajectory[view_indices.reshape(-1).long()]
+        )
+        rotation = endpoints[..., :3] * self.cfg.exposure_trajectory_max_rotation
+        translation_scale = (
+            self.cfg.exposure_trajectory_max_translation_fraction
+            * self.exposure_scene_extent
+        )
+        translation = endpoints[..., 3:] * translation_scale
+        return torch.cat((rotation, translation), dim=-1)
+
+    @staticmethod
+    def _transform_gaussians_for_camera_delta(
+        gaussians, covariance: Tensor, base_extrinsic: Tensor, camera_delta: Tensor
+    ):
+        # Rendering C @ D equals rendering C after applying
+        # H=C @ inv(D) @ inv(C) to world geometry. This routes camera motion
+        # through Gaussian tensors because FastGS has no camera-matrix gradient.
+        transform = (
+            base_extrinsic
+            @ torch.linalg.inv(camera_delta)
+            @ torch.linalg.inv(base_extrinsic)
+        )
+        rotation = transform[:3, :3]
+        translation = transform[:3, 3]
+        means = gaussians.means @ rotation.transpose(0, 1) + translation
+        covariances = rotation @ covariance @ rotation.transpose(0, 1)
+        return replace(gaussians, means=means, covariances=covariances)
+
+    def render_training_output(
+        self,
+        *,
+        renderer,
+        gaussians,
+        context,
+        start: int,
+        stop: int,
+        image_shape: tuple[int, int],
+    ) -> DecoderOutput:
+        """Render center-pose sharp color and a differentiable shutter integral."""
+        extrinsics = context["extrinsics"][:, start:stop]
+        intrinsics = context["intrinsics"][:, start:stop]
+        near = context["near"][:, start:stop]
+        far = context["far"][:, start:stop]
+        if self.exposure_trajectory is None or self._freeze_statistics_depth > 0:
+            # LeGS's local per-primitive state must retain the center/BPN/
+            # Laplacian residual. A scene-global shutter path can explain that
+            # residual without improving sharp geometry and would otherwise
+            # suppress the very clone/split decisions this state supervises.
+            return renderer.forward(
+                gaussians, extrinsics, intrinsics, near, far, image_shape
+            )
+        direct = context.get("direct_supervision")
+        if direct is not None and bool(direct[:, start:stop].all()):
+            return renderer.forward(
+                gaussians, extrinsics, intrinsics, near, far, image_shape
+            )
+        if extrinsics.shape[0] != 1:
+            raise ValueError("exposure trajectory currently requires scene batch size one")
+        if not hasattr(renderer.cfg, "use_covariances"):
+            raise ValueError(
+                "exposure trajectory requires a covariance-capable decoder"
+            )
+
+        center = renderer.forward(
+            gaussians, extrinsics, intrinsics, near, far, image_shape
+        )
+        rotations = F.normalize(gaussians.rotations_unnorm, dim=-1)
+        scales = gaussians.scales if gaussians.stores_activated else gaussians.scales.exp()
+        covariance = build_covariance(scales, rotations)
+        view_indices = context["index"][:, start:stop]
+        endpoints = self._bounded_exposure_endpoints(view_indices)
+        fractions = torch.linspace(
+            0.0,
+            1.0,
+            self.cfg.exposure_trajectory_samples,
+            device=extrinsics.device,
+            dtype=extrinsics.dtype,
+        )
+        view_count = stop - start
+        sample_count = len(fractions)
+        opening = endpoints[:, 0, None]
+        closing = endpoints[:, 1, None]
+        twists = torch.lerp(
+            opening,
+            closing,
+            fractions.view(1, sample_count, 1),
+        ).reshape(view_count * sample_count, 6)
+        camera_deltas = self._se3_matrix(twists)
+        base_extrinsics = extrinsics[0, :, None].expand(
+            view_count, sample_count, 4, 4
+        ).reshape(view_count * sample_count, 4, 4)
+        transforms = (
+            base_extrinsics
+            @ torch.linalg.inv(camera_deltas)
+            @ torch.linalg.inv(base_extrinsics)
+        )
+        rotations_world = transforms[:, :3, :3]
+        translations_world = transforms[:, :3, 3]
+        batch_count = view_count * sample_count
+        # True forward rendering uses moved cameras, preserving view-dependent
+        # spherical harmonics. FastGS does not expose camera-matrix gradients,
+        # so a detached-Gaussian equivalent transform supplies only the
+        # trajectory gradient through a straight-through surrogate below.
+        actual_extrinsics = (base_extrinsics @ camera_deltas.detach()).reshape(
+            1, batch_count, 4, 4
+        )
+
+        def repeat_views(values: Tensor) -> Tensor:
+            return values[:, :, None].expand(
+                1, view_count, sample_count, *values.shape[2:]
+            ).reshape(1, batch_count, *values.shape[2:])
+
+        actual_samples = renderer.forward(
+            gaussians,
+            actual_extrinsics,
+            repeat_views(intrinsics),
+            repeat_views(near),
+            repeat_views(far),
+            image_shape,
+        )
+
+        base_means = gaussians.means.detach().expand(batch_count, -1, -1)
+        transformed_means = (
+            base_means @ rotations_world.transpose(1, 2)
+            + translations_world[:, None]
+        )
+        base_covariance = covariance.detach().expand(batch_count, -1, -1, -1)
+        transformed_covariance = (
+            rotations_world[:, None]
+            @ base_covariance
+            @ rotations_world.transpose(1, 2)[:, None]
+        )
+
+        def expand_batch(value):
+            if value is None or not isinstance(value, Tensor):
+                return value
+            value = value.detach()
+            if value.ndim > 0 and value.shape[0] == 1:
+                return value.expand(batch_count, *value.shape[1:])
+            return value
+
+        transformed = replace(
+            gaussians,
+            means=transformed_means,
+            covariances=transformed_covariance,
+            harmonics=expand_batch(gaussians.harmonics),
+            opacities=expand_batch(gaussians.opacities),
+            scales=expand_batch(gaussians.scales),
+            rotations_unnorm=expand_batch(gaussians.rotations_unnorm),
+            rotations=expand_batch(gaussians.rotations),
+        )
+
+        def repeat_camera(values: Tensor) -> Tensor:
+            return values[0, :, None].expand(
+                view_count, sample_count, *values.shape[2:]
+            ).reshape(batch_count, 1, *values.shape[2:])
+
+        previous_covariance_mode = renderer.cfg.use_covariances
+        renderer.cfg.use_covariances = True
+        try:
+            samples = renderer.forward(
+                transformed,
+                repeat_camera(extrinsics),
+                repeat_camera(intrinsics),
+                repeat_camera(near),
+                repeat_camera(far),
+                image_shape,
+            )
+        finally:
+            renderer.cfg.use_covariances = previous_covariance_mode
+        surrogate_color = samples.color.reshape(
+            1, batch_count, *samples.color.shape[2:]
+        )
+        correct_color = actual_samples.color
+        exposure_color = correct_color + surrogate_color - surrogate_color.detach()
+        center.exposure_color = exposure_color.reshape(
+            view_count, sample_count, *samples.color.shape[2:]
+        ).mean(dim=1).unsqueeze(0)
+        return center
+
+    def _exposure_regularization(self, view_indices: Tensor) -> tuple[Tensor, Tensor]:
+        if self.exposure_trajectory is None:
+            zero = self.known_sharp_mask.new_zeros((), dtype=torch.float32)
+            return zero, zero
+        normalized = torch.tanh(
+            self.exposure_trajectory[view_indices.reshape(-1).long()]
+        )
+        motion = normalized.square().mean()
+        center = (normalized[:, 0] + normalized[:, 1]).square().mean()
+        return motion, center
 
     @contextmanager
     def frozen_observation(self, step: int | None = None):
@@ -314,6 +721,11 @@ class BlurAwareObjective(nn.Module):
     def begin_step(self, step: int | None, context) -> None:
         self.step = int(step or 0)
         self.train()
+        if self.exposure_trajectory is not None:
+            centers = context["extrinsics"][0, :, :3, 3].detach()
+            centered = centers - centers.median(dim=0).values
+            extent = centered.norm(dim=-1).quantile(0.9).clamp_min(1e-3)
+            self.exposure_scene_extent.copy_(extent)
         self._gradient_accumulator = [None for _ in self.trainable_parameters()]
         self._gradient_chunks = 0
 
@@ -531,10 +943,28 @@ class BlurAwareObjective(nn.Module):
         denominator = weight.sum(dim=(2, 3, 4)).clamp_min(1e-8)
         return (response.square() * weight).sum(dim=(2, 3, 4)) / denominator
 
-    @classmethod
+    def _surplus_support_evidence(
+        self,
+        teacher_response: Tensor,
+        raw_response: Tensor,
+    ) -> Tensor:
+        """Return detached edge evidence admitted by the surplus objective."""
+        raw_magnitude = raw_response.abs()
+        teacher_magnitude = teacher_response.abs()
+        if self.cfg.laplacian_support_mode == "union":
+            return torch.maximum(teacher_magnitude, raw_magnitude).detach()
+        raw_neighborhood = F.max_pool2d(
+            raw_magnitude.reshape(-1, 1, *raw_magnitude.shape[-2:]),
+            kernel_size=5,
+            stride=1,
+            padding=2,
+        ).view_as(raw_magnitude)
+        teacher_supported = torch.minimum(teacher_magnitude, raw_neighborhood)
+        return torch.maximum(raw_magnitude, teacher_supported).detach()
+
     @torch.no_grad()
     def measure_probe_surplus(
-        cls,
+        self,
         prediction: Tensor,
         raw: Tensor,
         target: Tensor,
@@ -549,9 +979,9 @@ class BlurAwareObjective(nn.Module):
         their teacher is authoritative, so PSNR rather than teacher surplus is
         the meaningful densification signal.
         """
-        prediction_pyramid = cls._laplacian_pyramid(prediction, valid_mask)
-        target_pyramid = cls._laplacian_pyramid(target.detach(), valid_mask)
-        raw_pyramid = cls._laplacian_pyramid(raw.detach(), valid_mask)
+        prediction_pyramid = self._laplacian_pyramid(prediction, valid_mask)
+        target_pyramid = self._laplacian_pyramid(target.detach(), valid_mask)
+        raw_pyramid = self._laplacian_pyramid(raw.detach(), valid_mask)
         scale_weights = prediction.new_tensor((1.0, 0.5, 0.25))
         scale_weights = scale_weights / scale_weights.sum()
         teacher_energies: list[Tensor] = []
@@ -560,18 +990,18 @@ class BlurAwareObjective(nn.Module):
         for (predicted, valid), (expected, _), (raw_response, _) in zip(
             prediction_pyramid, target_pyramid, raw_pyramid
         ):
-            evidence = torch.maximum(expected.abs(), raw_response.abs())
-            evidence_scale = cls._masked_mean_per_view(evidence, valid)
+            evidence = self._surplus_support_evidence(expected, raw_response)
+            evidence_scale = self._masked_mean_per_view(evidence, valid)
             evidence_scale = evidence_scale[..., None, None, None].clamp_min(1e-6)
             support = (1.0 - torch.exp(-evidence / evidence_scale)).detach()
             teacher_energies.append(
-                cls._masked_supported_energy(expected, support, valid)
+                self._masked_supported_energy(expected, support, valid)
             )
             render_energies.append(
-                cls._masked_supported_energy(predicted, support, valid)
+                self._masked_supported_energy(predicted, support, valid)
             )
             raw_energies.append(
-                cls._masked_supported_energy(raw_response, support, valid)
+                self._masked_supported_energy(raw_response, support, valid)
             )
 
         def multiscale_log_energy(energies: list[Tensor]) -> Tensor:
@@ -707,17 +1137,21 @@ class BlurAwareObjective(nn.Module):
         robust_epsilon = 1e-3
 
         supports = []
+        supported_magnitudes = []
         teacher_energies = []
         render_energies = []
         raw_energies = []
         for (predicted, valid), (expected, _), (raw_response, _) in zip(
             prediction_pyramid, reference_pyramid, raw_pyramid
         ):
-            evidence = torch.maximum(expected.abs(), raw_response.abs())
+            # RAW-neighborhood support preserves blur-amplitude recovery while
+            # preventing a displaced teacher edge from legalizing its own ghost.
+            evidence = self._surplus_support_evidence(expected, raw_response)
             evidence_scale = self._masked_mean_per_view(evidence, valid)
             evidence_scale = evidence_scale[..., None, None, None].clamp_min(1e-6)
             support = (1.0 - torch.exp(-evidence / evidence_scale)).detach()
             supports.append(support)
+            supported_magnitudes.append(evidence.detach())
             teacher_energies.append(
                 self._masked_supported_energy(expected, support, valid)
             )
@@ -758,11 +1192,18 @@ class BlurAwareObjective(nn.Module):
         floors = []
         overshoots = []
         artifacts = []
-        for ((predicted, valid), (expected, _), (raw_response, _), support) in zip(
+        for (
+            (predicted, valid),
+            (expected, _),
+            (raw_response, _),
+            support,
+            supported_magnitude,
+        ) in zip(
             prediction_pyramid,
             reference_pyramid,
             raw_pyramid,
             supports,
+            supported_magnitudes,
         ):
             desired_magnitude = expected.abs() * amplitude_multiplier
             aligned_prediction = expected.sign() * predicted
@@ -783,10 +1224,7 @@ class BlurAwareObjective(nn.Module):
                 self._masked_mean_per_view(support * overshoot_error, valid)
             )
 
-            supported_limit = (
-                torch.maximum(expected.abs(), raw_response.abs())
-                * amplitude_multiplier
-            )
+            supported_limit = supported_magnitude * amplitude_multiplier
             unsupported_excess = F.relu(predicted.abs() - supported_limit)
             artifact_error = torch.sqrt(
                 unsupported_excess.square() + robust_epsilon**2
@@ -979,6 +1417,126 @@ class BlurAwareObjective(nn.Module):
         )
         return weights / weights.mean(dim=1, keepdim=True).clamp_min(1e-8)
 
+    def _latent_temperature(self) -> float:
+        progress = min(1.0, max(0.0, self.step / max(1, self.num_steps - 1)))
+        start = self.cfg.latent_temperature_start
+        end = self.cfg.latent_temperature_end
+        return start * (end / start) ** progress
+
+    @torch.no_grad()
+    def _teacher_blur_assignment(
+        self,
+        direct_loss: Tensor,
+        blurred_loss: Tensor,
+        bpn_stats: dict[str, Tensor],
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Select direct or reblurred teacher supervision with an MDL test.
+
+        The direct hypothesis has no image-formation parameters. The reblurred
+        hypothesis pays for the spatially active, non-identity kernel mass.
+        Losses are compared in log space, matching the normalized BIC form
+        ``log(error) + k log(n) / n`` and avoiding a dataset-specific threshold.
+        """
+        if direct_loss.shape != blurred_loss.shape:
+            raise ValueError("teacher branch losses must share one shape")
+        kernels = bpn_stats["teacher_kernels"].detach()
+        center = kernels[:, kernels.shape[-1] // 2]
+        kernel_departure = (1.0 - center).clamp(0.0, 1.0)
+        mask_activity = bpn_stats["mask"].detach().mean(dim=(2, 3, 4)).reshape(-1)
+        effective_parameters = (
+            mask_activity
+            * kernel_departure
+            * float(kernels.shape[-1] - 1)
+        )
+        pixels = float(
+            bpn_stats["mask"].shape[-2] * bpn_stats["mask"].shape[-1] * 3
+        )
+        mdl_cost = effective_parameters * math.log(max(2.0, pixels)) / pixels
+        mdl_cost = mdl_cost.view_as(direct_loss)
+        evidence = (
+            torch.log(direct_loss.detach().clamp_min(1e-8))
+            - torch.log(blurred_loss.detach().clamp_min(1e-8))
+            - mdl_cost
+        )
+        posterior = torch.sigmoid(evidence / self.cfg.teacher_blur_temperature)
+        return posterior, evidence, mdl_cost
+
+    @torch.no_grad()
+    def _latent_assignment(
+        self,
+        direct_raw_loss: Tensor,
+        formed_raw_loss: Tensor,
+        bpn_stats: dict[str, Tensor],
+        view_indices: Tensor,
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        """Infer a per-view sharp posterior by normalized MDL model selection.
+
+        The direct hypothesis has no image-formation parameters.  The blur
+        hypothesis pays a BIC-style complexity cost proportional to the
+        spatially active, non-identity part of its kernel.  This keeps the
+        more expressive BPN from winning merely by containing the identity
+        model as a special case.
+        """
+        if direct_raw_loss.shape != formed_raw_loss.shape:
+            raise ValueError("latent assignment losses must share one shape")
+        flat_indices = view_indices.reshape(-1).long()
+        b, v = direct_raw_loss.shape
+        if flat_indices.numel() != b * v:
+            raise ValueError("view indices do not match latent assignment losses")
+
+        raw_kernels = bpn_stats["raw_kernels"]
+        center = raw_kernels[:, raw_kernels.shape[-1] // 2]
+        kernel_departure = (1.0 - center).clamp(0.0, 1.0)
+        mask_activity = bpn_stats["mask"].detach().mean(dim=(2, 3, 4)).reshape(-1)
+        effective_parameters = (
+            mask_activity * kernel_departure * float(raw_kernels.shape[-1] - 1)
+        )
+        pixels = float(bpn_stats["mask"].shape[-2] * bpn_stats["mask"].shape[-1] * 3)
+        mdl_cost = effective_parameters * math.log(max(2.0, pixels)) / (2.0 * pixels)
+        mdl_cost = mdl_cost.view(b, v)
+
+        evidence = (
+            torch.log(formed_raw_loss.detach().clamp_min(1e-8))
+            - torch.log(direct_raw_loss.detach().clamp_min(1e-8))
+            + mdl_cost
+        )
+        temperature = self._latent_temperature()
+        instantaneous = torch.sigmoid(evidence / temperature)
+        if self._freeze_statistics_depth == 0:
+            decay = self.cfg.latent_ema_decay
+            for index, value in zip(flat_indices, instantaneous.reshape(-1)):
+                idx = int(index)
+                if float(self.latent_assignment_updates[idx]) == 0.0:
+                    self.latent_sharp_probability[idx] = value
+                else:
+                    self.latent_sharp_probability[idx].mul_(decay).add_(
+                        value, alpha=1.0 - decay
+                    )
+                self.latent_assignment_updates[idx].add_(1.0)
+        posterior = self.latent_sharp_probability[flat_indices].view(b, v)
+        return posterior, {
+            "latent_instantaneous_probability": instantaneous,
+            "latent_sharp_probability": posterior,
+            "latent_evidence": evidence,
+            "latent_mdl_cost": mdl_cost,
+            "latent_temperature": evidence.new_full(evidence.shape, temperature),
+        }
+
+    def latent_assignment_report(self, names: list[str]) -> list[dict[str, object]]:
+        if len(names) != self.latent_sharp_probability.numel():
+            raise ValueError("latent assignment names do not match objective views")
+        probabilities = self.latent_sharp_probability.detach().cpu()
+        updates = self.latent_assignment_updates.detach().cpu()
+        return [
+            {
+                "name": name,
+                "sharp_probability": float(probability),
+                "updates": int(update),
+                "effective_weight": 1.0 + 9.0 * float(probability),
+            }
+            for name, probability, update in zip(names, probabilities, updates)
+        ]
+
     def compute_loss(
         self,
         *,
@@ -1114,12 +1672,14 @@ class BlurAwareObjective(nn.Module):
             }
             return loss
 
+        exposure_color = output_renderer.exposure_color
         formed, bpn_stats = self.bpn(
             output_renderer.color,
             output_renderer.depth,
             raw,
             target,
             view_indices,
+            raw_sharp=exposure_color,
         )
 
         teacher_prediction = (
@@ -1136,10 +1696,38 @@ class BlurAwareObjective(nn.Module):
                 output_renderer.color,
                 teacher_prediction,
             )
-        direct_loss = self._per_view_loss(
+        blurred_teacher_loss = self._per_view_loss(
             teacher_prediction, target, with_ssim, valid
         )
+        direct_teacher_loss = self._per_view_loss(
+            output_renderer.color, target, with_ssim, valid
+        )
+        teacher_blur_posterior = None
+        teacher_blur_evidence = None
+        teacher_blur_mdl_cost = None
+        if self.cfg.teacher_blur_model_selection:
+            (
+                teacher_blur_posterior,
+                teacher_blur_evidence,
+                teacher_blur_mdl_cost,
+            ) = self._teacher_blur_assignment(
+                direct_teacher_loss,
+                blurred_teacher_loss,
+                bpn_stats,
+            )
+            direct_loss = (
+                (1.0 - teacher_blur_posterior) * direct_teacher_loss
+                + teacher_blur_posterior * blurred_teacher_loss
+            )
+        else:
+            direct_loss = blurred_teacher_loss
         raw_loss = self._per_view_loss(formed, raw, with_ssim, valid)
+        direct_raw_prediction = (
+            output_renderer.color if exposure_color is None else exposure_color
+        )
+        direct_raw_loss = self._per_view_loss(
+            direct_raw_prediction, raw, with_ssim, valid
+        )
         laplacian_per_view, laplacian_stats = self._laplacian_objective(
             output_renderer.color,
             raw,
@@ -1151,30 +1739,74 @@ class BlurAwareObjective(nn.Module):
         )
         effective_confidence = laplacian_stats["effective_confidence"]
         gate = self._raw_gate()
-        raw_weight = (
-            (~direct_supervision).float()
-            * (1.0 - effective_confidence)
-            * gate
-        )
-        direct_weight = 1.0 - raw_weight
-        supervision_weight = (
-            self._supervision_weights(known_sharp) * supervision_confidence
-        )
-        per_view = supervision_weight * (
-            direct_weight * direct_loss + raw_weight * raw_loss
-        )
-        laplacian_per_view = supervision_confidence * laplacian_per_view
+        latent_stats = None
+        if self.cfg.latent_blur_assignment:
+            sharp_probability, latent_stats = self._latent_assignment(
+                direct_raw_loss,
+                raw_loss,
+                bpn_stats,
+                view_indices,
+            )
+            # A trusted sharp observation uses RAW directly.  A blurry
+            # observation combines its fixed teacher with RAW image formation;
+            # normalization keeps the branch scale independent of the ramp.
+            blur_denominator = (effective_confidence + gate).clamp_min(1e-6)
+            blur_branch = (
+                effective_confidence * direct_loss + gate * raw_loss
+            ) / blur_denominator
+            reconstruction_branch = (
+                sharp_probability * direct_raw_loss
+                + (1.0 - sharp_probability) * blur_branch
+            )
+            supervision_weight = 1.0 + (
+                self.cfg.sharp_supervision_weight - 1.0
+            ) * sharp_probability
+            supervision_weight = supervision_weight / supervision_weight.mean(
+                dim=1, keepdim=True
+            ).clamp_min(1e-8)
+            supervision_weight = supervision_weight * supervision_confidence
+            per_view = supervision_weight * reconstruction_branch
+            laplacian_per_view = (
+                supervision_confidence
+                * (1.0 - sharp_probability)
+                * laplacian_per_view
+            )
+            direct_weight = sharp_probability
+            raw_weight = 1.0 - sharp_probability
+        else:
+            raw_weight = (
+                (~direct_supervision).float()
+                * (1.0 - effective_confidence)
+                * gate
+            )
+            direct_weight = 1.0 - raw_weight
+            supervision_weight = (
+                self._supervision_weights(known_sharp) * supervision_confidence
+            )
+            per_view = supervision_weight * (
+                direct_weight * direct_loss + raw_weight * raw_loss
+            )
+            laplacian_per_view = supervision_confidence * laplacian_per_view
 
         if reduction == "mean":
             reconstruction = per_view.mean()
             laplacian_loss = laplacian_per_view.mean()
+            exposure_center_loss = (
+                supervision_confidence * confidence * direct_teacher_loss
+            ).mean()
         elif reduction == "sum":
             pixels = target.shape[2] * target.shape[3] * target.shape[4]
             reconstruction = per_view.sum() * pixels
             laplacian_loss = laplacian_per_view.sum() * pixels
+            exposure_center_loss = (
+                supervision_confidence * confidence * direct_teacher_loss
+            ).sum() * pixels
         elif reduction == "mean_pixels_sum_views":
             reconstruction = per_view.sum(dim=1).mean()
             laplacian_loss = laplacian_per_view.sum(dim=1).mean()
+            exposure_center_loss = (
+                supervision_confidence * confidence * direct_teacher_loss
+            ).sum(dim=1).mean()
         else:
             raise ValueError(f"Unknown reduction: {reduction!r}")
 
@@ -1183,16 +1815,38 @@ class BlurAwareObjective(nn.Module):
             + self.cfg.mask_regularization * bpn_stats["mask_loss"]
             + self.cfg.mask_tv_regularization * bpn_stats["mask_tv"]
         )
+        exposure_motion, exposure_center = self._exposure_regularization(
+            view_indices
+        )
+        exposure_regularization = (
+            self.cfg.exposure_trajectory_motion_prior * exposure_motion
+            + self.cfg.exposure_trajectory_center_prior * exposure_center
+        )
         loss = (
             reconstruction
             + self.cfg.laplacian_loss_weight * laplacian_loss
-            + gate * regularization
+            + gate
+            * regularization
+            * (
+                float((1.0 - direct_weight.detach()).mean())
+                if self.cfg.latent_blur_assignment
+                else 1.0
+            )
+            + gate * exposure_regularization
+            + (
+                self.cfg.exposure_center_supervision_weight
+                * exposure_center_loss
+                if exposure_color is not None
+                else 0.0
+            )
         )
         self.last_diagnostics = {
             "step": float(self.step),
             "raw_gate": float(gate),
             "loss": float(loss.detach()),
             "direct_loss": float(direct_loss.detach().mean()),
+            "direct_teacher_loss": float(direct_teacher_loss.detach().mean()),
+            "blurred_teacher_loss": float(blurred_teacher_loss.detach().mean()),
             "raw_loss": float(raw_loss.detach().mean()),
             "direct_weight": float(direct_weight.detach().mean()),
             "raw_weight": float(raw_weight.detach().mean()),
@@ -1210,6 +1864,11 @@ class BlurAwareObjective(nn.Module):
             "mask_loss": float(bpn_stats["mask_loss"].detach()),
             "center_loss": float(bpn_stats["center_loss"].detach()),
             "bpn_bypassed": 0.0,
+            "exposure_trajectory_enabled": float(exposure_color is not None),
+            "exposure_motion": float(exposure_motion.detach()),
+            "exposure_center_drift": float(exposure_center.detach()),
+            "exposure_regularization": float(exposure_regularization.detach()),
+            "exposure_center_loss": float(exposure_center_loss.detach()),
             "laplacian_loss": float(laplacian_loss.detach()),
             "laplacian_teacher_gain": float(
                 laplacian_stats["laplacian_teacher_gain"].detach().mean()
@@ -1244,6 +1903,39 @@ class BlurAwareObjective(nn.Module):
                 laplacian_stats["sharp_anchor_coverage"].detach().mean()
             ),
         }
+        if latent_stats is not None:
+            self.last_diagnostics.update(
+                {
+                    "latent_sharp_probability": float(
+                        latent_stats["latent_sharp_probability"].mean()
+                    ),
+                    "latent_sharp_probability_min": float(
+                        latent_stats["latent_sharp_probability"].min()
+                    ),
+                    "latent_sharp_probability_max": float(
+                        latent_stats["latent_sharp_probability"].max()
+                    ),
+                    "latent_evidence": float(latent_stats["latent_evidence"].mean()),
+                    "latent_mdl_cost": float(latent_stats["latent_mdl_cost"].mean()),
+                    "latent_temperature": float(
+                        latent_stats["latent_temperature"].mean()
+                    ),
+                }
+            )
+        if teacher_blur_posterior is not None:
+            self.last_diagnostics.update(
+                {
+                    "teacher_blur_posterior": float(
+                        teacher_blur_posterior.mean()
+                    ),
+                    "teacher_blur_evidence": float(
+                        teacher_blur_evidence.mean()
+                    ),
+                    "teacher_blur_mdl_cost": float(
+                        teacher_blur_mdl_cost.mean()
+                    ),
+                }
+            )
         return loss
 
     def export_config(self) -> dict:

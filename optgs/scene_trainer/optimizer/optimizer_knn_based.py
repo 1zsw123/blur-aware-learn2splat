@@ -2211,13 +2211,26 @@ class KnnBasedOptimizer(LearnedOptimizer[KnnBasedOptimizerCfg]):
                 )
 
                 # render input views, calculate inner loss and backprop to get gradients
-                context_render_output = renderer.forward_batch_subset(
-                    tmp_gaussians,
-                    context,
-                    start=start,
-                    end=stop,
-                    image_shape=(h, w),
-                )
+                if (
+                    input_objective is not None
+                    and input_objective.uses_exposure_trajectory
+                ):
+                    context_render_output = input_objective.render_training_output(
+                        renderer=renderer,
+                        gaussians=tmp_gaussians,
+                        context=context,
+                        start=start,
+                        stop=stop,
+                        image_shape=(h, w),
+                    )
+                else:
+                    context_render_output = renderer.forward_batch_subset(
+                        tmp_gaussians,
+                        context,
+                        start=start,
+                        end=stop,
+                        image_shape=(h, w),
+                    )
 
                 inputs = [means, scales, rotations_unnorm, opacities_raw, shs]
 

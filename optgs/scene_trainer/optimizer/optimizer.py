@@ -567,6 +567,12 @@ class Optimizer(nn.Module, ABC, Generic[T]):
                     "blur_net_action_direction": float(
                         adc_state.last_blur_net_action_direction
                     ),
+                    "blur_birth_veto_count": int(
+                        adc_state.last_blur_birth_veto_count
+                    ),
+                    "blur_final_prune_skip_count": int(
+                        adc_state.blur_final_prune_skip_count
+                    ),
                     "ppo_updates": int(controller.update_count),
                     "policy_loss": float(controller.last_policy_loss),
                     "policy_entropy": float(controller.last_entropy),

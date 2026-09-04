@@ -1,0 +1,146 @@
+{
+  "exblur_bench": {
+    "dataset": "ExBlur-NeRF",
+    "data_dir": "/srv2/szha0669/blur_slam_exp/data/exblurnerf_learn2splat_70k_v2/bench",
+    "factor": 1,
+    "raw_dir": "/srv2/szha0669/blur_slam_exp/data/exblurnerf/exblur_release/bench/images",
+    "raw_mode": "stem",
+    "evssm_dir": "/srv2/szha0669/blur_slam_exp/data/evssm_deblurred_exblurnerf/bench",
+    "sharp_json": "/srv2/szha0669/blur_slam_exp/outputs/logs/bench_exblur_nima06_sharp_frames.json",
+    "sharp_supervision_policy": "sharp_json_only",
+    "evaluation_direct_supervision": true,
+    "exclude_evaluation_from_optimization": false,
+    "require_sharp_evaluation_targets": true,
+    "protocol_description": "all ExBlur input views optimized; official hold views use authoritative direct sharp supervision and evaluation; w10 remains restricted to NIMA>0.6",
+    "evaluation_manifest": {
+      "path": "/srv2/szha0669/blur_slam_exp/outputs/logs/exblur8_official_protocol_s1/bench_official_test.json",
+      "label": "unblurslam_exblur_official_test"
+    }
+  },
+  "exblur_camellia": {
+    "dataset": "ExBlur-NeRF",
+    "data_dir": "/srv2/szha0669/blur_slam_exp/data/exblurnerf_learn2splat_70k_v2/camellia",
+    "factor": 1,
+    "raw_dir": "/srv2/szha0669/blur_slam_exp/data/exblurnerf/exblur_release/camellia/images",
+    "raw_mode": "stem",
+    "evssm_dir": "/srv2/szha0669/blur_slam_exp/data/evssm_deblurred_exblurnerf/camellia",
+    "sharp_json": "/srv2/szha0669/blur_slam_exp/outputs/logs/camellia_exblur_nima06_sharp_frames.json",
+    "sharp_supervision_policy": "sharp_json_only",
+    "evaluation_direct_supervision": true,
+    "exclude_evaluation_from_optimization": false,
+    "require_sharp_evaluation_targets": true,
+    "protocol_description": "all ExBlur input views optimized; official hold views use authoritative direct sharp supervision and evaluation; w10 remains restricted to NIMA>0.6",
+    "evaluation_manifest": {
+      "path": "/srv2/szha0669/blur_slam_exp/outputs/logs/exblur8_official_protocol_s1/camellia_official_test.json",
+      "label": "unblurslam_exblur_official_test"
+    }
+  },
+  "exblur_dragon": {
+    "dataset": "ExBlur-NeRF",
+    "data_dir": "/srv2/szha0669/blur_slam_exp/data/exblurnerf_learn2splat_70k_v2/dragon",
+    "factor": 1,
+    "raw_dir": "/srv2/szha0669/blur_slam_exp/data/exblurnerf/exblur_release/dragon/images",
+    "raw_mode": "stem",
+    "evssm_dir": "/srv2/szha0669/blur_slam_exp/data/evssm_deblurred_exblurnerf/dragon",
+    "sharp_json": "/srv2/szha0669/blur_slam_exp/outputs/logs/dragon_exblur_nima06_sharp_frames.json",
+    "sharp_supervision_policy": "sharp_json_only",
+    "evaluation_direct_supervision": true,
+    "exclude_evaluation_from_optimization": false,
+    "require_sharp_evaluation_targets": true,
+    "protocol_description": "all ExBlur input views optimized; official hold views use authoritative direct sharp supervision and evaluation; w10 remains restricted to NIMA>0.6",
+    "evaluation_manifest": {
+      "path": "/srv2/szha0669/blur_slam_exp/outputs/logs/exblur8_official_protocol_s1/dragon_official_test.json",
+      "label": "unblurslam_exblur_official_test"
+    }
+  },
+  "exblur_jars": {
+    "dataset": "ExBlur-NeRF",
+    "data_dir": "/srv2/szha0669/blur_slam_exp/data/exblurnerf_learn2splat_70k_v2/jars",
+    "factor": 1,
+    "raw_dir": "/srv2/szha0669/blur_slam_exp/data/exblurnerf/exblur_release/jars/images",
+    "raw_mode": "stem",
+    "evssm_dir": "/srv2/szha0669/blur_slam_exp/data/evssm_deblurred_exblurnerf/jars",
+    "sharp_json": "/srv2/szha0669/blur_slam_exp/outputs/logs/jars_exblur_nima06_sharp_frames.json",
+    "sharp_supervision_policy": "sharp_json_only",
+    "evaluation_direct_supervision": true,
+    "exclude_evaluation_from_optimization": false,
+    "require_sharp_evaluation_targets": true,
+    "protocol_description": "all ExBlur input views optimized; official hold views use authoritative direct sharp supervision and evaluation; w10 remains restricted to NIMA>0.6",
+    "evaluation_manifest": {
+      "path": "/srv2/szha0669/blur_slam_exp/outputs/logs/exblur8_official_protocol_s1/jars_official_test.json",
+      "label": "unblurslam_exblur_official_test"
+    }
+  },
+  "exblur_jars2": {
+    "dataset": "ExBlur-NeRF",
+    "data_dir": "/srv2/szha0669/blur_slam_exp/data/exblurnerf_learn2splat_70k_v2/jars2",
+    "factor": 1,
+    "raw_dir": "/srv2/szha0669/blur_slam_exp/data/exblurnerf/exblur_release/jars2/images",
+    "raw_mode": "stem",
+    "evssm_dir": "/srv2/szha0669/blur_slam_exp/data/evssm_deblurred_exblurnerf/jars2",
+    "sharp_json": "/srv2/szha0669/blur_slam_exp/outputs/logs/jars2_exblur_nima06_sharp_frames.json",
+    "sharp_supervision_policy": "sharp_json_only",
+    "evaluation_direct_supervision": true,
+    "exclude_evaluation_from_optimization": false,
+    "require_sharp_evaluation_targets": true,
+    "protocol_description": "all ExBlur input views optimized; official hold views use authoritative direct sharp supervision and evaluation; w10 remains restricted to NIMA>0.6",
+    "evaluation_manifest": {
+      "path": "/srv2/szha0669/blur_slam_exp/outputs/logs/exblur8_official_protocol_s1/jars2_official_test.json",
+      "label": "unblurslam_exblur_official_test"
+    }
+  },
+  "exblur_postbox": {
+    "dataset": "ExBlur-NeRF",
+    "data_dir": "/srv2/szha0669/blur_slam_exp/data/exblurnerf_learn2splat_70k_v2/postbox",
+    "factor": 1,
+    "raw_dir": "/srv2/szha0669/blur_slam_exp/data/exblurnerf/exblur_release/postbox/images",
+    "raw_mode": "stem",
+    "evssm_dir": "/srv2/szha0669/blur_slam_exp/data/evssm_deblurred_exblurnerf/postbox",
+    "sharp_json": "/srv2/szha0669/blur_slam_exp/outputs/logs/postbox_exblur_nima06_sharp_frames.json",
+    "sharp_supervision_policy": "sharp_json_only",
+    "evaluation_direct_supervision": true,
+    "exclude_evaluation_from_optimization": false,
+    "require_sharp_evaluation_targets": true,
+    "protocol_description": "all ExBlur input views optimized; official hold views use authoritative direct sharp supervision and evaluation; w10 remains restricted to NIMA>0.6",
+    "evaluation_manifest": {
+      "path": "/srv2/szha0669/blur_slam_exp/outputs/logs/exblur8_official_protocol_s1/postbox_official_test.json",
+      "label": "unblurslam_exblur_official_test"
+    }
+  },
+  "exblur_stone_lantern": {
+    "dataset": "ExBlur-NeRF",
+    "data_dir": "/srv2/szha0669/blur_slam_exp/data/exblurnerf_learn2splat_70k_v2/stone_lantern",
+    "factor": 1,
+    "raw_dir": "/srv2/szha0669/blur_slam_exp/data/exblurnerf/exblur_release/stone_lantern/images",
+    "raw_mode": "stem",
+    "evssm_dir": "/srv2/szha0669/blur_slam_exp/data/evssm_deblurred_exblurnerf/stone_lantern",
+    "sharp_json": "/srv2/szha0669/blur_slam_exp/outputs/logs/stone_lantern_exblur_nima06_sharp_frames.json",
+    "sharp_supervision_policy": "sharp_json_only",
+    "evaluation_direct_supervision": true,
+    "exclude_evaluation_from_optimization": false,
+    "require_sharp_evaluation_targets": true,
+    "protocol_description": "all ExBlur input views optimized; official hold views use authoritative direct sharp supervision and evaluation; w10 remains restricted to NIMA>0.6",
+    "evaluation_manifest": {
+      "path": "/srv2/szha0669/blur_slam_exp/outputs/logs/exblur8_official_protocol_s1/stone_lantern_official_test.json",
+      "label": "unblurslam_exblur_official_test"
+    }
+  },
+  "exblur_sunflowers": {
+    "dataset": "ExBlur-NeRF",
+    "data_dir": "/srv2/szha0669/blur_slam_exp/data/exblurnerf_learn2splat_70k_v2/sunflowers",
+    "factor": 1,
+    "raw_dir": "/srv2/szha0669/blur_slam_exp/data/exblurnerf/exblur_release/sunflowers/images",
+    "raw_mode": "stem",
+    "evssm_dir": "/srv2/szha0669/blur_slam_exp/data/evssm_deblurred_exblurnerf/sunflowers",
+    "sharp_json": "/srv2/szha0669/blur_slam_exp/outputs/logs/sunflowers_exblur_nima06_sharp_frames.json",
+    "sharp_supervision_policy": "sharp_json_only",
+    "evaluation_direct_supervision": true,
+    "exclude_evaluation_from_optimization": false,
+    "require_sharp_evaluation_targets": true,
+    "protocol_description": "all ExBlur input views optimized; official hold views use authoritative direct sharp supervision and evaluation; w10 remains restricted to NIMA>0.6",
+    "evaluation_manifest": {
+      "path": "/srv2/szha0669/blur_slam_exp/outputs/logs/exblur8_official_protocol_s1/sunflowers_official_test.json",
+      "label": "unblurslam_exblur_official_test"
+    }
+  }
+}

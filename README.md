@@ -54,6 +54,12 @@ are recorded in
 The exact current stack, module boundaries, rollback matrix, and three-domain
 matched smoke results are also summarized in Chinese in
 [`CURRENT_ARCHITECTURE_ZH.md`](experiments/blur_aware_cross_dataset/CURRENT_ARCHITECTURE_ZH.md).
+The current PRISM3D eight-scene result, root-cause audit, and matched 50K
+longitudinal/Laplacian ablation are recorded in
+[`PRISM3D_DILATION2_FIX_E8_RESULTS.md`](experiments/blur_aware_cross_dataset/PRISM3D_DILATION2_FIX_E8_RESULTS.md),
+[`PRISM3D_RESIDUAL_ROOT_CAUSE.md`](experiments/blur_aware_cross_dataset/PRISM3D_RESIDUAL_ROOT_CAUSE.md),
+and
+[`PRISM3D_50K_LONGITUDINAL_AND_LAPLACIAN_S2.md`](experiments/blur_aware_cross_dataset/PRISM3D_50K_LONGITUDINAL_AND_LAPLACIAN_S2.md).
 Dataset paths are intentionally external; pass a local JSON file with
 `--scene-config` and a released Learn2Splat checkpoint with `--checkpoint`.
 
